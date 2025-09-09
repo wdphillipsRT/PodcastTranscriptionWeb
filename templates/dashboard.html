@@ -85,6 +85,12 @@
                         <p class="card-text small">
                             Episodes: {{ podcast.episodes|length }}
                         </p>
+                        <div class="d-flex justify-content-end">
+                            <a href="{{ url_for('podcast_episodes', podcast_id=podcast.id) }}" 
+                               class="btn btn-outline-primary btn-sm">
+                                <i class="fas fa-list"></i> View Episodes
+                            </a>
+                        </div>
                     </div>
                 </div>
             </div>

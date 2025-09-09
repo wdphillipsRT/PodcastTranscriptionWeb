@@ -1,0 +1,411 @@
+{% extends "base.html" %}
+
+{% block title %}{{ podcast.name }} Episodes - Podcast Transcription Service{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col-12">
+        <nav aria-label="breadcrumb">
+            <ol class="breadcrumb">
+                <li class="breadcrumb-item">
+                    <a href="{{ url_for('dashboard') }}">Dashboard</a>
+                </li>
+                <li class="breadcrumb-item active">{{ podcast.name }}</li>
+            </ol>
+        </nav>
+        
+        <div class="d-flex justify-content-between align-items-center">
+            <h2>
+                <i class="fas fa-podcast text-primary"></i>
+                {{ podcast.name }}
+            </h2>
+            <div class="text-muted small">
+                Added {{ podcast.created_at.strftime('%Y-%m-%d') }}
+            </div>
+        </div>
+        
+        {% if podcast.description %}
+        <p class="text-muted">{{ podcast.description[:200] }}{% if podcast.description|length > 200 %}...{% endif %}</p>
+        {% endif %}
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">
+                    <i class="fas fa-list"></i>
+                    Episodes ({{ episodes|length }})
+                </h5>
+                <div>
+                    <button class="btn btn-outline-primary btn-sm" onclick="refreshEpisodes()">
+                        <i class="fas fa-sync-alt"></i> Refresh
+                    </button>
+                </div>
+            </div>
+            
+            {% if episodes %}
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th style="width: 40%">Title</th>
+                            <th style="width: 15%">Published</th>
+                            <th style="width: 10%">Status</th>
+                            <th style="width: 10%">Transcript</th>
+                            <th style="width: 10%">Summary</th>
+                            <th style="width: 15%">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for episode in episodes %}
+                        <tr id="episode-{{ episode.id }}">
+                            <td>
+                                <strong>{{ episode.title[:60] }}{% if episode.title|length > 60 %}...{% endif %}</strong>
+                                {% if episode.description %}
+                                <br>
+                                <small class="text-muted">
+                                    {{ episode.description[:100] }}{% if episode.description|length > 100 %}...{% endif %}
+                                </small>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if episode.published_at %}
+                                {{ episode.published_at.strftime('%Y-%m-%d') }}
+                                {% else %}
+                                N/A
+                                {% endif %}
+                            </td>
+                            <td>
+                                <span class="status-badge" data-episode-id="{{ episode.id }}">
+                                    {% if episode.status == 'completed' %}
+                                    <span class="badge bg-success">Completed</span>
+                                    {% elif episode.status == 'processing' %}
+                                    <span class="badge bg-warning">Processing</span>
+                                    {% elif episode.status == 'failed' %}
+                                    <span class="badge bg-danger">Failed</span>
+                                    {% else %}
+                                    <span class="badge bg-secondary">Pending</span>
+                                    {% endif %}
+                                </span>
+                            </td>
+                            <td class="transcript-status" data-episode-id="{{ episode.id }}">
+                                {% if episode.transcript_path %}
+                                <i class="fas fa-check-circle text-success" title="Available"></i>
+                                {% else %}
+                                <i class="fas fa-times-circle text-muted" title="Not available"></i>
+                                {% endif %}
+                            </td>
+                            <td class="summary-status" data-episode-id="{{ episode.id }}">
+                                {% if episode.summary_path %}
+                                <i class="fas fa-check-circle text-success" title="Available"></i>
+                                {% else %}
+                                <i class="fas fa-times-circle text-muted" title="Not available"></i>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <div class="btn-group btn-group-sm" role="group">
+                                    <button class="btn btn-outline-primary" 
+                                            onclick="viewEpisodeDetails({{ episode.id }})"
+                                            title="View Details">
+                                        <i class="fas fa-eye"></i>
+                                    </button>
+                                    
+                                    {% if episode.status != 'processing' %}
+                                    <button class="btn btn-outline-success" 
+                                            onclick="triggerTranscription({{ episode.id }})"
+                                            title="Trigger Transcription"
+                                            {% if episode.status == 'completed' %}disabled{% endif %}>
+                                        <i class="fas fa-microphone"></i>
+                                    </button>
+                                    
+                                    <button class="btn btn-outline-info" 
+                                            onclick="triggerSummary({{ episode.id }})"
+                                            title="Trigger Summary"
+                                            {% if not episode.transcript_path %}disabled{% endif %}>
+                                        <i class="fas fa-file-alt"></i>
+                                    </button>
+                                    {% else %}
+                                    <button class="btn btn-outline-secondary" disabled>
+                                        <i class="fas fa-spinner fa-spin"></i>
+                                    </button>
+                                    {% endif %}
+                                </div>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="card-body text-center py-5">
+                <i class="fas fa-music fa-3x text-muted mb-3"></i>
+                <h5 class="text-muted">No Episodes Found</h5>
+                <p class="text-muted">
+                    No episodes have been discovered for this podcast yet. 
+                    This could mean the RSS feed is empty or there was an issue fetching episodes.
+                </p>
+                <button class="btn btn-primary" onclick="refreshEpisodes()">
+                    <i class="fas fa-sync-alt"></i> Try Refreshing
+                </button>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- Episode Details Modal -->
+<div class="modal fade" id="episodeDetailsModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="episodeDetailsTitle">Episode Details</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="episodeDetailsBody">
+                <div class="text-center">
+                    <div class="spinner-border" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let refreshInterval;
+
+// Auto-refresh page every 30 seconds when episodes are processing
+function setupAutoRefresh() {
+    const processingBadges = document.querySelectorAll('.badge.bg-warning');
+    if (processingBadges.length > 0) {
+        if (!refreshInterval) {
+            refreshInterval = setInterval(refreshEpisodeStatuses, 30000);
+        }
+    } else {
+        if (refreshInterval) {
+            clearInterval(refreshInterval);
+            refreshInterval = null;
+        }
+    }
+}
+
+// Refresh episode statuses via AJAX
+async function refreshEpisodeStatuses() {
+    const episodeRows = document.querySelectorAll('[data-episode-id]');
+    
+    for (const element of episodeRows) {
+        const episodeId = element.getAttribute('data-episode-id');
+        if (!episodeId) continue;
+        
+        try {
+            const response = await fetch(`/api/episodes/${episodeId}`);
+            if (response.ok) {
+                const episode = await response.json();
+                updateEpisodeStatus(episodeId, episode);
+            }
+        } catch (error) {
+            console.error(`Error refreshing episode ${episodeId}:`, error);
+        }
+    }
+    
+    setupAutoRefresh(); // Re-evaluate if we need to keep refreshing
+}
+
+function updateEpisodeStatus(episodeId, episode) {
+    // Update status badge
+    const statusBadge = document.querySelector(`.status-badge[data-episode-id="${episodeId}"] .badge`);
+    if (statusBadge) {
+        statusBadge.className = 'badge ' + 
+            (episode.status === 'completed' ? 'bg-success' :
+             episode.status === 'processing' ? 'bg-warning' :
+             episode.status === 'failed' ? 'bg-danger' : 'bg-secondary');
+        statusBadge.textContent = episode.status.charAt(0).toUpperCase() + episode.status.slice(1);
+    }
+    
+    // Update transcript status
+    const transcriptStatus = document.querySelector(`.transcript-status[data-episode-id="${episodeId}"] i`);
+    if (transcriptStatus) {
+        if (episode.transcript_path) {
+            transcriptStatus.className = 'fas fa-check-circle text-success';
+            transcriptStatus.title = 'Available';
+        } else {
+            transcriptStatus.className = 'fas fa-times-circle text-muted';
+            transcriptStatus.title = 'Not available';
+        }
+    }
+    
+    // Update summary status
+    const summaryStatus = document.querySelector(`.summary-status[data-episode-id="${episodeId}"] i`);
+    if (summaryStatus) {
+        if (episode.summary_path) {
+            summaryStatus.className = 'fas fa-check-circle text-success';
+            summaryStatus.title = 'Available';
+        } else {
+            summaryStatus.className = 'fas fa-times-circle text-muted';
+            summaryStatus.title = 'Not available';
+        }
+    }
+    
+    // Update action buttons based on status
+    const row = document.getElementById(`episode-${episodeId}`);
+    if (row) {
+        const transcriptBtn = row.querySelector('button[title="Trigger Transcription"]');
+        const summaryBtn = row.querySelector('button[title="Trigger Summary"]');
+        
+        if (transcriptBtn) {
+            transcriptBtn.disabled = (episode.status === 'completed' || episode.status === 'processing');
+        }
+        
+        if (summaryBtn) {
+            summaryBtn.disabled = (!episode.transcript_path || episode.status === 'processing');
+        }
+    }
+}
+
+function refreshEpisodes() {
+    location.reload();
+}
+
+async function viewEpisodeDetails(episodeId) {
+    const modal = new bootstrap.Modal(document.getElementById('episodeDetailsModal'));
+    const title = document.getElementById('episodeDetailsTitle');
+    const body = document.getElementById('episodeDetailsBody');
+    
+    title.textContent = 'Loading...';
+    body.innerHTML = '<div class="text-center"><div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div></div>';
+    
+    modal.show();
+    
+    try {
+        const response = await fetch(`/api/episodes/${episodeId}`);
+        const episode = await response.json();
+        
+        title.textContent = episode.title;
+        
+        let content = `
+            <div class="mb-3">
+                <h6>Status</h6>
+                <span class="badge ${episode.status === 'completed' ? 'bg-success' : 
+                                   episode.status === 'processing' ? 'bg-warning' : 
+                                   episode.status === 'failed' ? 'bg-danger' : 'bg-secondary'}">
+                    ${episode.status.charAt(0).toUpperCase() + episode.status.slice(1)}
+                </span>
+            </div>
+        `;
+        
+        if (episode.description) {
+            content += `<div class="mb-3"><h6>Description</h6><p>${episode.description}</p></div>`;
+        }
+        
+        if (episode.published_at) {
+            content += `<div class="mb-3"><h6>Published</h6><p>${new Date(episode.published_at).toLocaleDateString()}</p></div>`;
+        }
+        
+        content += '<div class="row">';
+        
+        content += '<div class="col-md-6">';
+        content += '<h6>Transcript</h6>';
+        if (episode.transcript_path) {
+            content += '<p class="text-success"><i class="fas fa-check-circle"></i> Available - Emailed to you</p>';
+        } else {
+            content += '<p class="text-muted"><i class="fas fa-times-circle"></i> Not available</p>';
+        }
+        content += '</div>';
+        
+        content += '<div class="col-md-6">';
+        content += '<h6>Summary</h6>';
+        if (episode.summary_path) {
+            content += '<p class="text-success"><i class="fas fa-check-circle"></i> Available - Emailed to you</p>';
+        } else {
+            content += '<p class="text-muted"><i class="fas fa-times-circle"></i> Not available</p>';
+        }
+        content += '</div>';
+        
+        content += '</div>';
+        
+        body.innerHTML = content;
+        
+    } catch (error) {
+        body.innerHTML = '<div class="alert alert-danger">Error loading episode details</div>';
+    }
+}
+
+async function triggerTranscription(episodeId) {
+    const button = event.target.closest('button');
+    const originalContent = button.innerHTML;
+    
+    button.disabled = true;
+    button.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+    
+    try {
+        const response = await fetch(`/api/episodes/${episodeId}/trigger-transcription`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            // Update status immediately
+            const statusBadge = document.querySelector(`.status-badge[data-episode-id="${episodeId}"] .badge`);
+            if (statusBadge) {
+                statusBadge.className = 'badge bg-warning';
+                statusBadge.textContent = 'Processing';
+            }
+            
+            alert('Transcription started! The page will auto-refresh to show progress.');
+            setupAutoRefresh();
+        } else {
+            alert('Error: ' + result.error);
+        }
+    } catch (error) {
+        alert('Network error occurred');
+    } finally {
+        button.disabled = false;
+        button.innerHTML = originalContent;
+    }
+}
+
+async function triggerSummary(episodeId) {
+    const button = event.target.closest('button');
+    const originalContent = button.innerHTML;
+    
+    button.disabled = true;
+    button.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+    
+    try {
+        const response = await fetch(`/api/episodes/${episodeId}/trigger-summary`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            alert('Summary generation started! You will be notified via email when complete.');
+        } else {
+            alert('Error: ' + result.error);
+        }
+    } catch (error) {
+        alert('Network error occurred');
+    } finally {
+        button.disabled = false;
+        button.innerHTML = originalContent;
+    }
+}
+
+// Initialize auto-refresh on page load
+document.addEventListener('DOMContentLoaded', function() {
+    setupAutoRefresh();
+});
+</script>
+{% endblock %}

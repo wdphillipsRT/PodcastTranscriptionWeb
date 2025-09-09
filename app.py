@@ -224,6 +224,22 @@ def stripe_webhook():
     
     return jsonify({'success': True})
 
+@app.route('/podcast/<int:podcast_id>/episodes')
+@login_required
+def podcast_episodes(podcast_id):
+    podcast = Podcast.query.filter_by(
+        id=podcast_id, 
+        user_id=current_user.id
+    ).first_or_404()
+    
+    episodes = Episode.query.filter_by(podcast_id=podcast_id)\
+        .order_by(Episode.published_at.desc()).all()
+    
+    return render_template('episodes.html', 
+                         podcast=podcast, 
+                         episodes=episodes, 
+                         user=current_user)
+
 @app.route('/api/episodes/<int:episode_id>')
 @login_required
 def get_episode(episode_id):
@@ -235,11 +251,53 @@ def get_episode(episode_id):
     return jsonify({
         'id': episode.id,
         'title': episode.title,
+        'description': episode.description,
         'transcript_path': episode.transcript_path,
         'summary_path': episode.summary_path,
         'status': episode.status,
+        'published_at': episode.published_at.isoformat() if episode.published_at else None,
         'created_at': episode.created_at.isoformat() if episode.created_at else None
     })
+
+@app.route('/api/episodes/<int:episode_id>/trigger-transcription', methods=['POST'])
+@login_required
+def trigger_transcription(episode_id):
+    episode = Episode.query.join(Podcast).filter(
+        Episode.id == episode_id,
+        Podcast.user_id == current_user.id
+    ).first_or_404()
+    
+    if episode.status == 'completed':
+        return jsonify({'error': 'Episode already processed'}), 400
+    
+    # Import tasks here to avoid circular imports
+    from tasks import process_episode
+    
+    # Reset episode status and trigger processing
+    episode.status = 'pending'
+    db.session.commit()
+    
+    process_episode.delay(episode_id)
+    
+    return jsonify({'success': True, 'message': 'Transcription triggered'})
+
+@app.route('/api/episodes/<int:episode_id>/trigger-summary', methods=['POST'])
+@login_required
+def trigger_summary(episode_id):
+    episode = Episode.query.join(Podcast).filter(
+        Episode.id == episode_id,
+        Podcast.user_id == current_user.id
+    ).first_or_404()
+    
+    if not episode.transcript_path:
+        return jsonify({'error': 'Episode must be transcribed first'}), 400
+    
+    # Import tasks here to avoid circular imports  
+    from tasks import summarize_episode
+    
+    summarize_episode.delay(episode_id)
+    
+    return jsonify({'success': True, 'message': 'Summary triggered'})
 
 if __name__ == '__main__':
     with app.app_context():
