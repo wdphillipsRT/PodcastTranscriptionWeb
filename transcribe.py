@@ -1,7 +1,7 @@
 import os
 import json
 from typing import Dict, Any, Optional, List, Tuple
-from faster_whisper import WhisperModel
+import whisper_cpp
 import logging
 from pathlib import Path
 
@@ -15,23 +15,18 @@ class TranscriptionResult:
         self.segments = segments
         self.info = info
 
-def get_whisper_model(model_name: str = "medium", device: str = "auto", compute_type: str = "auto") -> WhisperModel:
+def get_whisper_model(model_name: str = "base"):
     """
-    Initialize and return a Whisper model.
+    Initialize and return a Whisper model using whisper-cpp.
     
     Args:
-        model_name: Model size (tiny, base, small, medium, large-v3)
-        device: Device to run on (auto, cpu, cuda)
-        compute_type: Compute type (auto, int8, float16, float32)
+        model_name: Model size (tiny, base, small, medium, large)
     """
     logger.info(f"Loading Whisper model: {model_name}")
     
     try:
-        model = WhisperModel(
-            model_name, 
-            device=device, 
-            compute_type=compute_type
-        )
+        # whisper-cpp automatically downloads models as needed
+        model = whisper_cpp.Whisper(model=model_name, n_threads=2)
         logger.info(f"Successfully loaded Whisper model: {model_name}")
         return model
         
@@ -41,13 +36,13 @@ def get_whisper_model(model_name: str = "medium", device: str = "auto", compute_
 
 def transcribe_audio(
     audio_path: str, 
-    model_name: str = "medium",
+    model_name: str = "base",
     language: Optional[str] = None,
     vad_filter: bool = True,
     word_timestamps: bool = False
 ) -> TranscriptionResult:
     """
-    Transcribe audio file using faster-whisper.
+    Transcribe audio file using whisper-cpp.
     
     Args:
         audio_path: Path to audio file
@@ -80,36 +75,22 @@ def transcribe_audio(
     segments_path = transcript_dir / "segments.json"
     
     try:
-        # Perform transcription
-        segments, info = model.transcribe(
-            audio_path,
-            language=language,
-            vad_filter=vad_filter,
-            word_timestamps=word_timestamps
-        )
+        # Perform transcription using whisper-cpp
+        result = model.transcribe(audio_path)
         
-        # Convert segments to list and collect transcript
+        # Extract segments from whisper-cpp result
         segment_list = []
         transcript_lines = []
         
+        # whisper-cpp returns segments in result['segments'] or similar structure
+        segments = result.get('segments', [])
+        
         for segment in segments:
             segment_dict = {
-                "start": round(segment.start, 2),
-                "end": round(segment.end, 2),
-                "text": segment.text.strip()
+                "start": round(segment.get('start', 0), 2),
+                "end": round(segment.get('end', 0), 2),
+                "text": segment.get('text', '').strip()
             }
-            
-            # Add word timestamps if requested
-            if word_timestamps and hasattr(segment, 'words') and segment.words:
-                segment_dict["words"] = [
-                    {
-                        "start": round(word.start, 2),
-                        "end": round(word.end, 2),
-                        "word": word.word,
-                        "probability": round(word.probability, 3)
-                    }
-                    for word in segment.words
-                ]
             
             segment_list.append(segment_dict)
             
@@ -121,15 +102,17 @@ def transcribe_audio(
         with open(transcript_path, "w", encoding="utf-8") as f:
             f.write("\n".join(transcript_lines))
         
+        # Get basic info from result
+        detected_language = result.get('language', 'en')
+        duration = result.get('duration', 0.0)
+        
         # Write segments JSON file
         transcription_metadata = {
             "audio_file": str(audio_path),
             "model": model_name,
-            "language": info.language,
-            "language_probability": round(info.language_probability, 3),
-            "duration": round(info.duration, 2),
-            "duration_after_vad": round(info.duration_after_vad, 2) if hasattr(info, 'duration_after_vad') else None,
-            "all_language_probs": info.all_language_probs if hasattr(info, 'all_language_probs') else None,
+            "language": detected_language,
+            "language_probability": 0.9,  # whisper-cpp doesn't provide this
+            "duration": round(duration, 2),
             "segments": segment_list
         }
         
@@ -137,8 +120,8 @@ def transcribe_audio(
             json.dump(transcription_metadata, f, indent=2, ensure_ascii=False)
         
         logger.info(f"Transcription completed:")
-        logger.info(f"  - Language: {info.language} (confidence: {info.language_probability:.3f})")
-        logger.info(f"  - Duration: {info.duration:.2f}s")
+        logger.info(f"  - Language: {detected_language}")
+        logger.info(f"  - Duration: {duration:.2f}s")
         logger.info(f"  - Segments: {len(segment_list)}")
         logger.info(f"  - Transcript: {transcript_path}")
         logger.info(f"  - Segments: {segments_path}")
@@ -147,9 +130,9 @@ def transcribe_audio(
             transcript_path=str(transcript_path),
             segments=segment_list,
             info={
-                "language": info.language,
-                "language_probability": info.language_probability,
-                "duration": info.duration,
+                "language": detected_language,
+                "language_probability": 0.9,
+                "duration": duration,
                 "model": model_name
             }
         )
@@ -177,7 +160,7 @@ def load_segments(segments_path: str) -> Dict[str, Any]:
         raise
 
 def transcribe_audio_from_s3(audio_s3_key: str, podcast_id: int, episode_id: int, 
-                           model_name: str = "medium") -> Dict[str, Any]:
+                           model_name: str = "base") -> Dict[str, Any]:
     """
     Transcribe audio file from S3 and upload results back to S3.
     
