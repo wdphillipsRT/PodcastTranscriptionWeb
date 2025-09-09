@@ -37,6 +37,13 @@ def _compress_audio_for_api(audio_path: str) -> str:
         # If ffmpeg not available, try pydub as fallback
         try:
             from pydub import AudioSegment
+            from pydub.utils import which
+            
+            # Check if ffmpeg/ffprobe are available for pydub
+            if not which("ffmpeg") or not which("ffprobe"):
+                logger.warning("ffmpeg/ffprobe not available for pydub")
+                return audio_path
+                
             logger.info("Using pydub for audio compression")
             
             # Load audio with pydub
@@ -51,9 +58,9 @@ def _compress_audio_for_api(audio_path: str) -> str:
             logger.info(f"Compressed audio using pydub from {os.path.getsize(audio_path) / (1024*1024):.1f}MB to {os.path.getsize(compressed_path) / (1024*1024):.1f}MB")
             return compressed_path
             
-        except ImportError:
-            logger.warning("Neither ffmpeg nor pydub available for compression")
-            # Last resort: return original and let API reject it
+        except (ImportError, Exception) as e:
+            logger.warning(f"Pydub compression failed: {e}")
+            # Last resort: return original and let API reject it with a better error message
             return audio_path
 
 class TranscriptionResult:
@@ -126,10 +133,19 @@ def transcribe_audio(
         
         if file_size > max_size:
             logger.warning(f"Audio file is {file_size / (1024*1024):.1f}MB, exceeding OpenAI's 25MB limit")
-            # For now, we'll compress the audio to reduce file size
+            # Try to compress the audio to reduce file size
             compressed_path = _compress_audio_for_api(audio_path)
-            logger.info(f"Compressed audio to {os.path.getsize(compressed_path) / (1024*1024):.1f}MB")
-            upload_path = compressed_path
+            compressed_size = os.path.getsize(compressed_path) if os.path.exists(compressed_path) else file_size
+            
+            if compressed_path != audio_path and compressed_size <= max_size:
+                logger.info(f"Successfully compressed audio to {compressed_size / (1024*1024):.1f}MB")
+                upload_path = compressed_path
+            elif compressed_path != audio_path:
+                logger.warning(f"Compressed audio is still {compressed_size / (1024*1024):.1f}MB, exceeding 25MB limit")
+                upload_path = compressed_path  # Try anyway, might work
+            else:
+                logger.error(f"Cannot compress audio file. Size {file_size / (1024*1024):.1f}MB exceeds OpenAI API limit of 25MB")
+                raise ValueError(f"Audio file too large ({file_size / (1024*1024):.1f}MB) for OpenAI Whisper API. Maximum size is 25MB. Please use a smaller audio file or consider splitting it into segments.")
         else:
             upload_path = audio_path
         
