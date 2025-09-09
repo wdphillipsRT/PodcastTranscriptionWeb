@@ -47,7 +47,7 @@ def queue_podcast_processing(self, podcast_id: int):
                         guid=item['guid'],
                         title=item['title'],
                         description=item.get('description', ''),
-                        audio_url=item['url'],
+                        audio_url=item['audio_url'],
                         published_at=item['published'],
                         status='pending',
                         created_at=datetime.now(timezone.utc)
