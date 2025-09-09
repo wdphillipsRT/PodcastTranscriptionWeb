@@ -1,0 +1,96 @@
+{
+  "name": "Podcast Transcription Web Service",
+  "description": "AI-powered podcast transcription and summarization service with Stripe payments",
+  "repository": "https://github.com/your-username/PodcastTranscriptionWeb",
+  "logo": "https://cdn.jsdelivr.net/gh/twitter/twemoji@13.0.1/assets/svg/1f399.svg",
+  "keywords": ["python", "flask", "podcast", "transcription", "ai", "stripe", "celery"],
+  "stack": "heroku-20",
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "env": {
+    "SECRET_KEY": {
+      "description": "Flask secret key for sessions",
+      "generator": "secret"
+    },
+    "FLASK_ENV": {
+      "description": "Flask environment",
+      "value": "production"
+    },
+    "PYTHONPATH": {
+      "description": "Python path for imports",
+      "value": "/app"
+    },
+    "WHISPER_MODEL": {
+      "description": "OpenAI Whisper model size",
+      "value": "medium"
+    },
+    "OPENAI_MODEL": {
+      "description": "OpenAI model for summarization",
+      "value": "gpt-4o-mini"
+    },
+    "DEFAULT_SUMMARY_PROVIDER": {
+      "description": "Default AI provider for summaries",
+      "value": "openai"
+    },
+    "MAX_CONCURRENT": {
+      "description": "Maximum concurrent background tasks",
+      "value": "2"
+    },
+    "LOG_LEVEL": {
+      "description": "Application log level",
+      "value": "INFO"
+    },
+    "OPENAI_API_KEY": {
+      "description": "OpenAI API key for transcription and summarization",
+      "required": true
+    },
+    "STRIPE_PUBLISHABLE_KEY": {
+      "description": "Stripe publishable key",
+      "required": true
+    },
+    "STRIPE_SECRET_KEY": {
+      "description": "Stripe secret key",
+      "required": true
+    },
+    "STRIPE_WEBHOOK_SECRET": {
+      "description": "Stripe webhook secret for signature verification",
+      "required": true
+    },
+    "STRIPE_PRICE_ID": {
+      "description": "Stripe subscription price ID",
+      "required": true
+    },
+    "MAILGUN_API_KEY": {
+      "description": "Mailgun API key for email delivery",
+      "required": true
+    },
+    "MAILGUN_DOMAIN": {
+      "description": "Verified Mailgun domain",
+      "required": true
+    }
+  },
+  "addons": [
+    {
+      "plan": "heroku-postgresql:mini"
+    },
+    {
+      "plan": "heroku-redis:mini"
+    }
+  ],
+  "scripts": {
+    "postdeploy": "python migrations.py"
+  },
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "basic"
+    },
+    "worker": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  }
+}

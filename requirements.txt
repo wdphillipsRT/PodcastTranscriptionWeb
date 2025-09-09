@@ -1,0 +1,39 @@
+# Core podcast processing dependencies
+feedparser>=6.0.10
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+pydantic>=2.0.0
+python-dateutil>=2.8.0
+tqdm>=4.65.0
+tenacity>=8.2.0
+pandas>=2.0.0
+rich>=13.0.0
+rapidfuzz>=3.0.0
+faster-whisper>=0.9.0
+openai>=1.0.0
+httpx>=0.24.0
+python-dotenv>=1.0.0
+
+# Flask web application dependencies
+Flask>=2.3.0
+Flask-SQLAlchemy>=3.0.0
+Flask-Login>=0.6.0
+psycopg2-binary>=2.9.0
+
+# Background task processing
+celery>=5.3.0
+redis>=4.6.0
+
+# Payment processing
+stripe>=5.5.0
+
+# Email functionality (using requests for Mailgun API)
+
+# Production server
+gunicorn>=21.0.0
+
+# Database migrations
+Flask-Migrate>=4.0.0
+
+# Environment and configuration
+python-decouple>=3.8

@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h2 class="text-center mb-4">Subscription</h2>
+        
+        {% if user.has_active_subscription() %}
+        <div class="alert alert-success text-center">
+            <i class="fas fa-check-circle fa-2x mb-2"></i>
+            <h4>Active Subscription</h4>
+            <p class="mb-0">You have an active subscription. You can add podcasts and process episodes.</p>
+        </div>
+        
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="fas fa-info-circle"></i> Subscription Details</h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-6">
+                        <strong>Status:</strong> {{ user.subscription.status.title() }}
+                    </div>
+                    <div class="col-md-6">
+                        <strong>Since:</strong> {{ user.subscription.created_at.strftime('%Y-%m-%d') }}
+                    </div>
+                </div>
+                {% if user.subscription.current_period_end %}
+                <div class="row mt-2">
+                    <div class="col-md-6">
+                        <strong>Current Period Ends:</strong> {{ user.subscription.current_period_end.strftime('%Y-%m-%d') }}
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        
+        {% else %}
+        <div class="card">
+            <div class="card-header text-center">
+                <h4>Premium Subscription</h4>
+            </div>
+            <div class="card-body text-center">
+                <div class="pricing-plan">
+                    <h2 class="text-primary mb-3">$9.99 <small class="text-muted">/month</small></h2>
+                    
+                    <ul class="list-unstyled mb-4">
+                        <li class="mb-2">
+                            <i class="fas fa-check text-success"></i>
+                            Unlimited podcast subscriptions
+                        </li>
+                        <li class="mb-2">
+                            <i class="fas fa-check text-success"></i>
+                            Automatic transcription with Whisper AI
+                        </li>
+                        <li class="mb-2">
+                            <i class="fas fa-check text-success"></i>
+                            AI-powered summaries and key takeaways
+                        </li>
+                        <li class="mb-2">
+                            <i class="fas fa-check text-success"></i>
+                            Email delivery of transcripts and summaries
+                        </li>
+                        <li class="mb-2">
+                            <i class="fas fa-check text-success"></i>
+                            Support for Apple Podcasts and RSS feeds
+                        </li>
+                        <li class="mb-2">
+                            <i class="fas fa-check text-success"></i>
+                            24/7 automated processing
+                        </li>
+                    </ul>
+                    
+                    <button id="subscribe-button" class="btn btn-primary btn-lg">
+                        <i class="fas fa-credit-card"></i>
+                        Subscribe Now
+                    </button>
+                    
+                    <p class="small text-muted mt-3">
+                        Secure payment powered by Stripe. Cancel anytime.
+                    </p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mt-4">
+            <div class="card-header">
+                <h5><i class="fas fa-question-circle"></i> Frequently Asked Questions</h5>
+            </div>
+            <div class="card-body">
+                <div class="accordion" id="faqAccordion">
+                    <div class="accordion-item">
+                        <h2 class="accordion-header" id="faq1">
+                            <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapse1">
+                                How does the transcription work?
+                            </button>
+                        </h2>
+                        <div id="collapse1" class="accordion-collapse collapse" data-bs-parent="#faqAccordion">
+                            <div class="accordion-body">
+                                We use OpenAI's Whisper AI model to provide highly accurate transcriptions of your podcast episodes. The process is completely automated.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="accordion-item">
+                        <h2 class="accordion-header" id="faq2">
+                            <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapse2">
+                                What podcast sources are supported?
+                            </button>
+                        </h2>
+                        <div id="collapse2" class="accordion-collapse collapse" data-bs-parent="#faqAccordion">
+                            <div class="accordion-body">
+                                We support Apple Podcasts URLs and direct RSS feed URLs. Simply paste the URL and we'll automatically resolve and process the episodes.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="accordion-item">
+                        <h2 class="accordion-header" id="faq3">
+                            <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapse3">
+                                Can I cancel anytime?
+                            </button>
+                        </h2>
+                        <div id="collapse3" class="accordion-collapse collapse" data-bs-parent="#faqAccordion">
+                            <div class="accordion-body">
+                                Yes, you can cancel your subscription at any time through your Stripe customer portal. You'll continue to have access until your current billing period ends.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% if not user.has_active_subscription() %}
+<script src="https://js.stripe.com/v3/"></script>
+<script>
+document.getElementById('subscribe-button').addEventListener('click', async function() {
+    const button = this;
+    button.disabled = true;
+    button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+    
+    try {
+        const response = await fetch('/create-checkout-session', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            }
+        });
+        
+        const data = await response.json();
+        
+        if (response.ok) {
+            window.location.href = data.checkout_url;
+        } else {
+            alert('Error: ' + data.error);
+        }
+    } catch (error) {
+        alert('Network error occurred');
+    } finally {
+        button.disabled = false;
+        button.innerHTML = '<i class="fas fa-credit-card"></i> Subscribe Now';
+    }
+});
+</script>
+{% endif %}
+{% endblock %}
