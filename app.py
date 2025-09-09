@@ -14,12 +14,16 @@ load_dotenv()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-in-production')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'postgresql://localhost/podcast_transcription')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Fix DATABASE_URL for SQLAlchemy 1.4+
-if 'postgresql://' in app.config['SQLALCHEMY_DATABASE_URI']:
-    app.config['SQLALCHEMY_DATABASE_URI'] = app.config['SQLALCHEMY_DATABASE_URI'].replace('postgresql://', 'postgresql+psycopg2://')
+# Fix DATABASE_URL for SQLAlchemy 1.4+ and Heroku
+database_url = os.environ.get('DATABASE_URL', 'postgresql://localhost/podcast_transcription')
+if database_url.startswith('postgres://'):
+    database_url = database_url.replace('postgres://', 'postgresql+psycopg2://', 1)
+elif database_url.startswith('postgresql://') and '+psycopg2' not in database_url:
+    database_url = database_url.replace('postgresql://', 'postgresql+psycopg2://', 1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Import models and initialize db
 from models import db, User, Subscription, Podcast, Episode, ProcessingJob, EmailNotification
