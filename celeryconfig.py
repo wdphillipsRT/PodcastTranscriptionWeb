@@ -1,11 +1,22 @@
 import os
+import ssl
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Broker settings
-broker_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-result_backend = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+# Broker settings with SSL configuration for Heroku Redis
+redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+broker_url = redis_url
+result_backend = redis_url
+
+# SSL configuration for Heroku Redis (rediss://)
+if redis_url.startswith('rediss://'):
+    broker_use_ssl = {
+        'ssl_cert_reqs': ssl.CERT_NONE
+    }
+    redis_backend_use_ssl = {
+        'ssl_cert_reqs': ssl.CERT_NONE
+    }
 
 # Task settings
 task_serializer = 'json'
