@@ -1,7 +1,7 @@
 import os
 import json
 from typing import Dict, Any, Optional, List, Tuple
-import whisper_cpp
+import whisper
 import logging
 from pathlib import Path
 
@@ -15,9 +15,9 @@ class TranscriptionResult:
         self.segments = segments
         self.info = info
 
-def get_whisper_model(model_name: str = "base"):
+def get_whisper_model(model_name: str = "tiny"):
     """
-    Initialize and return a Whisper model using whisper-cpp.
+    Initialize and return a Whisper model with memory optimizations.
     
     Args:
         model_name: Model size (tiny, base, small, medium, large)
@@ -25,8 +25,8 @@ def get_whisper_model(model_name: str = "base"):
     logger.info(f"Loading Whisper model: {model_name}")
     
     try:
-        # whisper-cpp automatically downloads models as needed
-        model = whisper_cpp.Whisper(model=model_name, n_threads=2)
+        # Use tiny model for better memory efficiency
+        model = whisper.load_model(model_name, device="cpu")
         logger.info(f"Successfully loaded Whisper model: {model_name}")
         return model
         
@@ -36,13 +36,13 @@ def get_whisper_model(model_name: str = "base"):
 
 def transcribe_audio(
     audio_path: str, 
-    model_name: str = "base",
+    model_name: str = "tiny",
     language: Optional[str] = None,
     vad_filter: bool = True,
     word_timestamps: bool = False
 ) -> TranscriptionResult:
     """
-    Transcribe audio file using whisper-cpp.
+    Transcribe audio file using OpenAI Whisper with memory optimization.
     
     Args:
         audio_path: Path to audio file
@@ -75,14 +75,19 @@ def transcribe_audio(
     segments_path = transcript_dir / "segments.json"
     
     try:
-        # Perform transcription using whisper-cpp
-        result = model.transcribe(audio_path)
+        # Perform transcription using OpenAI Whisper
+        # Use fp16=False to reduce memory usage
+        result = model.transcribe(
+            audio_path,
+            language=language,
+            fp16=False,  # Use fp32 to reduce memory
+            verbose=False  # Reduce output verbosity
+        )
         
-        # Extract segments from whisper-cpp result
+        # Extract segments from result
         segment_list = []
         transcript_lines = []
         
-        # whisper-cpp returns segments in result['segments'] or similar structure
         segments = result.get('segments', [])
         
         for segment in segments:
@@ -104,15 +109,14 @@ def transcribe_audio(
         
         # Get basic info from result
         detected_language = result.get('language', 'en')
-        duration = result.get('duration', 0.0)
         
         # Write segments JSON file
         transcription_metadata = {
             "audio_file": str(audio_path),
             "model": model_name,
             "language": detected_language,
-            "language_probability": 0.9,  # whisper-cpp doesn't provide this
-            "duration": round(duration, 2),
+            "language_probability": 0.9,
+            "duration": 0.0,  # OpenAI Whisper doesn't provide duration
             "segments": segment_list
         }
         
@@ -121,7 +125,6 @@ def transcribe_audio(
         
         logger.info(f"Transcription completed:")
         logger.info(f"  - Language: {detected_language}")
-        logger.info(f"  - Duration: {duration:.2f}s")
         logger.info(f"  - Segments: {len(segment_list)}")
         logger.info(f"  - Transcript: {transcript_path}")
         logger.info(f"  - Segments: {segments_path}")
@@ -132,7 +135,7 @@ def transcribe_audio(
             info={
                 "language": detected_language,
                 "language_probability": 0.9,
-                "duration": duration,
+                "duration": 0.0,
                 "model": model_name
             }
         )
@@ -160,7 +163,7 @@ def load_segments(segments_path: str) -> Dict[str, Any]:
         raise
 
 def transcribe_audio_from_s3(audio_s3_key: str, podcast_id: int, episode_id: int, 
-                           model_name: str = "base") -> Dict[str, Any]:
+                           model_name: str = "tiny") -> Dict[str, Any]:
     """
     Transcribe audio file from S3 and upload results back to S3.
     
