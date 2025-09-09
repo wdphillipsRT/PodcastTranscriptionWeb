@@ -83,21 +83,39 @@ def transcribe_audio(
     
     try:
         # Perform transcription using faster-whisper
-        # Configure transcription parameters with memory optimization
+        # Configure transcription parameters with maximum memory optimization
         segments, info = model.transcribe(
             audio_path,
             language=language,
             word_timestamps=word_timestamps,
             vad_filter=vad_filter,
             without_timestamps=False,
-            beam_size=1,  # Use beam size 1 for minimal memory usage
-            best_of=1     # Single candidate to reduce memory
+            beam_size=1,          # Use beam size 1 for minimal memory usage
+            best_of=1,           # Single candidate to reduce memory
+            patience=1.0,        # Lower patience for faster processing
+            length_penalty=1.0,  # Default length penalty
+            repetition_penalty=1.0,  # Default repetition penalty
+            no_repeat_ngram_size=0,  # Disable n-gram repetition penalty
+            temperature=0.0,     # Deterministic output
+            compression_ratio_threshold=2.4,  # Skip segments with low compression
+            log_prob_threshold=-1.0,  # Accept lower probability segments
+            no_speech_threshold=0.6,  # Standard no-speech threshold
+            condition_on_previous_text=False,  # Don't condition on previous text
+            prompt_reset_on_temperature=0.5,   # Reset prompt threshold
+            initial_prompt=None,  # No initial prompt
+            prefix=None,         # No prefix
+            suppress_blank=True, # Suppress blank outputs
+            suppress_tokens=[-1], # Suppress specific tokens
+            prepend_punctuations="\"'"¿([{-",  # Standard punctuation
+            append_punctuations="\"'.。,，!！?？:：")]}、", # Standard punctuation
+            clip_timestamps="0"  # Clip timestamps to start
         )
         
-        # Extract segments from generator
+        # Process segments one at a time to minimize memory usage
         segment_list = []
         transcript_lines = []
         
+        # Use generator to avoid loading all segments into memory at once
         for segment in segments:
             segment_dict = {
                 "start": round(segment.start, 2),

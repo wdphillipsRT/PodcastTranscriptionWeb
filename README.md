@@ -7,7 +7,7 @@ A comprehensive web application that automatically downloads, transcribes, and s
 - **🔐 User Authentication**: Secure user registration and login
 - **💳 Stripe Integration**: Monthly subscription payments  
 - **🎙️ Podcast Management**: Add podcasts via Apple Podcasts URLs or RSS feeds
-- **🤖 AI Transcription**: High-quality transcription using OpenAI's Whisper
+- **🤖 AI Transcription**: High-quality transcription using faster-whisper (whisper.cpp)
 - **📝 AI Summarization**: Intelligent summaries with key takeaways and quotes
 - **📧 Email Notifications**: Automatic delivery of transcripts and summaries via Mailgun
 - **🔄 Background Processing**: Async task processing with Celery and Redis
@@ -22,7 +22,7 @@ A comprehensive web application that automatically downloads, transcribes, and s
 - **Task Queue**: Celery with Redis
 - **Payments**: Stripe Checkout and webhooks
 - **Email**: Mailgun API
-- **AI Services**: OpenAI Whisper (transcription) and GPT models (summarization)
+- **AI Services**: faster-whisper/whisper.cpp (transcription) and GPT models (summarization)
 - **Deployment**: Heroku with multiple worker dynos
 
 ## 🚀 Quick Start
@@ -120,7 +120,7 @@ A comprehensive web application that automatically downloads, transcribes, and s
 | `STRIPE_PRICE_ID` | Stripe subscription price ID | Yes |
 | `MAILGUN_API_KEY` | Mailgun API key | Yes |
 | `MAILGUN_DOMAIN` | Mailgun domain | Yes |
-| `WHISPER_MODEL` | Whisper model size | No (default: medium) |
+| `WHISPER_MODEL` | faster-whisper model size | No (default: medium) |
 | `OPENAI_MODEL` | OpenAI model for summaries | No (default: gpt-4o-mini) |
 | `MAX_CONCURRENT` | Max concurrent tasks | No (default: 2) |
 
@@ -154,7 +154,7 @@ The app uses Celery for background task processing:
 
 ### Queue Structure
 - **downloads**: Audio file downloading
-- **transcription**: Whisper transcription processing  
+- **transcription**: faster-whisper transcription processing  
 - **summarization**: AI summary generation
 - **emails**: Email notifications
 
@@ -277,8 +277,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 🙏 Acknowledgments
 
-- OpenAI for Whisper and GPT models
-- The faster-whisper project for efficient inference
+- OpenAI for GPT models
+- faster-whisper project for efficient whisper.cpp transcription inference
 - Stripe for payment processing
 - Mailgun for email delivery
 - Heroku for cloud hosting
