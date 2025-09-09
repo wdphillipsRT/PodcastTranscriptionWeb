@@ -7,6 +7,55 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+def _compress_audio_for_api(audio_path: str) -> str:
+    """
+    Compress audio file to fit within OpenAI API's 25MB limit.
+    Uses ffmpeg if available, otherwise reduces quality.
+    """
+    import subprocess
+    import tempfile
+    
+    # Create compressed version with lower bitrate
+    compressed_path = audio_path.replace('.mp3', '_compressed.mp3')
+    
+    try:
+        # Use ffmpeg to compress audio if available
+        subprocess.run([
+            'ffmpeg', '-i', audio_path, 
+            '-acodec', 'mp3', 
+            '-ab', '64k',  # Lower bitrate for smaller size
+            '-ar', '16000',  # Lower sample rate
+            '-ac', '1',      # Mono channel
+            '-y',            # Overwrite output
+            compressed_path
+        ], check=True, capture_output=True)
+        
+        logger.info(f"Compressed audio using ffmpeg from {os.path.getsize(audio_path) / (1024*1024):.1f}MB to {os.path.getsize(compressed_path) / (1024*1024):.1f}MB")
+        return compressed_path
+        
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # If ffmpeg not available, try pydub as fallback
+        try:
+            from pydub import AudioSegment
+            logger.info("Using pydub for audio compression")
+            
+            # Load audio with pydub
+            audio = AudioSegment.from_mp3(audio_path)
+            
+            # Compress: lower bitrate, sample rate, and make mono
+            compressed_audio = audio.set_frame_rate(16000).set_channels(1)
+            
+            # Export with lower bitrate
+            compressed_audio.export(compressed_path, format="mp3", bitrate="64k")
+            
+            logger.info(f"Compressed audio using pydub from {os.path.getsize(audio_path) / (1024*1024):.1f}MB to {os.path.getsize(compressed_path) / (1024*1024):.1f}MB")
+            return compressed_path
+            
+        except ImportError:
+            logger.warning("Neither ffmpeg nor pydub available for compression")
+            # Last resort: return original and let API reject it
+            return audio_path
+
 class TranscriptionResult:
     """Container for transcription results."""
     
@@ -71,8 +120,21 @@ def transcribe_audio(
     segments_path = transcript_dir / "segments.json"
     
     try:
+        # Check file size - OpenAI API has a 25MB limit
+        file_size = os.path.getsize(audio_path)
+        max_size = 25 * 1024 * 1024  # 25MB in bytes
+        
+        if file_size > max_size:
+            logger.warning(f"Audio file is {file_size / (1024*1024):.1f}MB, exceeding OpenAI's 25MB limit")
+            # For now, we'll compress the audio to reduce file size
+            compressed_path = _compress_audio_for_api(audio_path)
+            logger.info(f"Compressed audio to {os.path.getsize(compressed_path) / (1024*1024):.1f}MB")
+            upload_path = compressed_path
+        else:
+            upload_path = audio_path
+        
         # Read audio file for API upload
-        with open(audio_path, "rb") as audio_file:
+        with open(upload_path, "rb") as audio_file:
             # Call OpenAI Whisper API
             transcript_response = client.audio.transcriptions.create(
                 model="whisper-1",  # OpenAI's Whisper model
@@ -81,6 +143,10 @@ def transcribe_audio(
                 response_format="verbose_json" if word_timestamps else "json",
                 timestamp_granularities=["segment"] if word_timestamps else None
             )
+        
+        # Clean up compressed file if we created one
+        if file_size > max_size and upload_path != audio_path and os.path.exists(upload_path):
+            os.unlink(upload_path)
         
         # Extract transcript text and segments
         transcript_text = transcript_response.text
