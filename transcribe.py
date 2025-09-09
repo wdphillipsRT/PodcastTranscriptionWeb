@@ -106,8 +106,8 @@ def transcribe_audio(
             prefix=None,         # No prefix
             suppress_blank=True, # Suppress blank outputs
             suppress_tokens=[-1], # Suppress specific tokens
-            prepend_punctuations="\"'"¿([{-",  # Standard punctuation
-            append_punctuations="\"'.。,，!！?？:：")]}、", # Standard punctuation
+            prepend_punctuations="\"'([{-",  # Standard punctuation
+            append_punctuations="\"'.,:)]}!?", # Standard punctuation
             clip_timestamps="0"  # Clip timestamps to start
         )
         
