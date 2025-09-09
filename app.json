@@ -24,8 +24,8 @@
       "value": "/app"
     },
     "WHISPER_MODEL": {
-      "description": "faster-whisper model size",
-      "value": "medium"
+      "description": "OpenAI Whisper model (whisper-1)",
+      "value": "whisper-1"
     },
     "OPENAI_MODEL": {
       "description": "OpenAI model for summarization",
@@ -44,7 +44,7 @@
       "value": "INFO"
     },
     "OPENAI_API_KEY": {
-      "description": "OpenAI API key for summarization",
+      "description": "OpenAI API key for Whisper transcription and GPT summarization",
       "required": true
     },
     "STRIPE_PUBLISHABLE_KEY": {

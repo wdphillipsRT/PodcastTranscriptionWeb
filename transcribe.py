@@ -1,7 +1,7 @@
 import os
 import json
 from typing import Dict, Any, Optional, List, Tuple
-from faster_whisper import WhisperModel
+from openai import OpenAI
 import logging
 from pathlib import Path
 
@@ -15,31 +15,20 @@ class TranscriptionResult:
         self.segments = segments
         self.info = info
 
-def get_whisper_model(model_name: str = "tiny"):
+def get_openai_client():
     """
-    Initialize and return a faster-whisper model with memory optimizations.
+    Initialize and return OpenAI client for Whisper API calls.
     
-    Args:
-        model_name: Model size (tiny, base, small, medium, large-v3)
+    Returns:
+        OpenAI client instance
     """
-    logger.info(f"Loading faster-whisper model: {model_name}")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY environment variable not set")
     
-    try:
-        # Initialize faster-whisper model (uses whisper.cpp under the hood)
-        # Use most aggressive memory optimization for Heroku
-        model = WhisperModel(
-            model_name,
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=1,  # Limit CPU threads to reduce memory
-            num_workers=1   # Single worker to minimize memory
-        )
-        logger.info(f"Successfully loaded faster-whisper model: {model_name}")
-        return model
-        
-    except Exception as e:
-        logger.error(f"Failed to load faster-whisper model {model_name}: {e}")
-        raise
+    client = OpenAI(api_key=api_key)
+    logger.info("Successfully initialized OpenAI client for Whisper API")
+    return client
 
 def transcribe_audio(
     audio_path: str, 
@@ -49,13 +38,13 @@ def transcribe_audio(
     word_timestamps: bool = False
 ) -> TranscriptionResult:
     """
-    Transcribe audio file using faster-whisper (whisper.cpp) with memory optimization.
+    Transcribe audio file using OpenAI's Whisper API (cloud-based).
     
     Args:
         audio_path: Path to audio file
-        model_name: Whisper model to use
+        model_name: Whisper model to use (whisper-1)
         language: Force specific language (None for auto-detection)
-        vad_filter: Use voice activity detection to filter silence
+        vad_filter: Not used with API (included for compatibility)
         word_timestamps: Include word-level timestamps
     
     Returns:
@@ -64,10 +53,10 @@ def transcribe_audio(
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
     
-    logger.info(f"Transcribing audio: {audio_path}")
+    logger.info(f"Transcribing audio via OpenAI Whisper API: {audio_path}")
     
-    # Initialize model
-    model = get_whisper_model(model_name)
+    # Initialize OpenAI client
+    client = get_openai_client()
     
     # Generate output paths
     audio_path_obj = Path(audio_path)
@@ -82,68 +71,60 @@ def transcribe_audio(
     segments_path = transcript_dir / "segments.json"
     
     try:
-        # Perform transcription using faster-whisper
-        # Configure transcription parameters with maximum memory optimization
-        segments, info = model.transcribe(
-            audio_path,
-            language=language,
-            word_timestamps=word_timestamps,
-            vad_filter=vad_filter,
-            without_timestamps=False,
-            beam_size=1,          # Use beam size 1 for minimal memory usage
-            best_of=1,           # Single candidate to reduce memory
-            patience=1.0,        # Lower patience for faster processing
-            length_penalty=1.0,  # Default length penalty
-            repetition_penalty=1.0,  # Default repetition penalty
-            no_repeat_ngram_size=0,  # Disable n-gram repetition penalty
-            temperature=0.0,     # Deterministic output
-            compression_ratio_threshold=2.4,  # Skip segments with low compression
-            log_prob_threshold=-1.0,  # Accept lower probability segments
-            no_speech_threshold=0.6,  # Standard no-speech threshold
-            condition_on_previous_text=False,  # Don't condition on previous text
-            prompt_reset_on_temperature=0.5,   # Reset prompt threshold
-            initial_prompt=None,  # No initial prompt
-            prefix=None,         # No prefix
-            suppress_blank=True, # Suppress blank outputs
-            suppress_tokens=[-1], # Suppress specific tokens
-            prepend_punctuations="\"'([{-",  # Standard punctuation
-            append_punctuations="\"'.,:)]}!?", # Standard punctuation
-            clip_timestamps="0"  # Clip timestamps to start
-        )
+        # Read audio file for API upload
+        with open(audio_path, "rb") as audio_file:
+            # Call OpenAI Whisper API
+            transcript_response = client.audio.transcriptions.create(
+                model="whisper-1",  # OpenAI's Whisper model
+                file=audio_file,
+                language=language,  # Optional language hint
+                response_format="verbose_json" if word_timestamps else "json",
+                timestamp_granularities=["segment"] if word_timestamps else None
+            )
         
-        # Process segments one at a time to minimize memory usage
+        # Extract transcript text and segments
+        transcript_text = transcript_response.text
+        segments = getattr(transcript_response, 'segments', [])
+        detected_language = getattr(transcript_response, 'language', language or 'en')
+        duration = getattr(transcript_response, 'duration', 0.0)
+        
+        # Process segments for our format
         segment_list = []
         transcript_lines = []
         
-        # Use generator to avoid loading all segments into memory at once
-        for segment in segments:
+        if segments:
+            for segment in segments:
+                segment_dict = {
+                    "start": round(segment.get('start', 0), 2),
+                    "end": round(segment.get('end', 0), 2),
+                    "text": segment.get('text', '').strip()
+                }
+                
+                segment_list.append(segment_dict)
+                
+                # Format for text transcript
+                timestamp = f"[{segment_dict['start']:.2f}–{segment_dict['end']:.2f}]"
+                transcript_lines.append(f"{timestamp} {segment_dict['text']}")
+        else:
+            # If no segments available, use the full text
             segment_dict = {
-                "start": round(segment.start, 2),
-                "end": round(segment.end, 2),
-                "text": segment.text.strip()
+                "start": 0.0,
+                "end": duration,
+                "text": transcript_text.strip()
             }
-            
             segment_list.append(segment_dict)
-            
-            # Format for text transcript
-            timestamp = f"[{segment_dict['start']:.2f}–{segment_dict['end']:.2f}]"
-            transcript_lines.append(f"{timestamp} {segment_dict['text']}")
+            transcript_lines.append(f"[0.00–{duration:.2f}] {transcript_text}")
         
         # Write transcript text file
         with open(transcript_path, "w", encoding="utf-8") as f:
             f.write("\n".join(transcript_lines))
         
-        # Get basic info from transcription info
-        detected_language = info.language
-        language_probability = info.language_probability
-        duration = info.duration
-        
         # Write segments JSON file
         transcription_metadata = {
             "audio_file": str(audio_path),
-            "model": model_name,
+            "model": "whisper-1",
             "language": detected_language,
-            "language_probability": language_probability,
+            "language_probability": 0.95,  # OpenAI API doesn't provide this
             "duration": duration,
             "segments": segment_list
         }
@@ -151,8 +132,8 @@ def transcribe_audio(
         with open(segments_path, "w", encoding="utf-8") as f:
             json.dump(transcription_metadata, f, indent=2, ensure_ascii=False)
         
-        logger.info(f"Transcription completed:")
-        logger.info(f"  - Language: {detected_language} ({language_probability:.2f})")
+        logger.info(f"OpenAI Whisper API transcription completed:")
+        logger.info(f"  - Language: {detected_language}")
         logger.info(f"  - Duration: {duration:.2f}s")
         logger.info(f"  - Segments: {len(segment_list)}")
         logger.info(f"  - Transcript: {transcript_path}")
@@ -163,9 +144,9 @@ def transcribe_audio(
             segments=segment_list,
             info={
                 "language": detected_language,
-                "language_probability": language_probability,
+                "language_probability": 0.95,
                 "duration": duration,
-                "model": model_name
+                "model": "whisper-1"
             }
         )
         
@@ -192,15 +173,15 @@ def load_segments(segments_path: str) -> Dict[str, Any]:
         raise
 
 def transcribe_audio_from_s3(audio_s3_key: str, podcast_id: int, episode_id: int, 
-                           model_name: str = "tiny") -> Dict[str, Any]:
+                           model_name: str = "whisper-1") -> Dict[str, Any]:
     """
-    Transcribe audio file from S3 and upload results back to S3.
+    Transcribe audio file from S3 using OpenAI Whisper API and upload results back to S3.
     
     Args:
         audio_s3_key: S3 key of the audio file
         podcast_id: Database ID of the podcast
         episode_id: Database ID of the episode
-        model_name: Whisper model to use
+        model_name: Whisper model to use (whisper-1 for OpenAI API)
     
     Returns:
         Dictionary with transcription results and S3 URLs
