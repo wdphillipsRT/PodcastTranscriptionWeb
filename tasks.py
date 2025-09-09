@@ -108,11 +108,13 @@ def process_episode(self, episode_id: int):
 
 @celery_app.task(bind=True)
 def download_episode(self, episode_id: int, job_id: int):
-    """Download audio file for an episode."""
+    """Download audio file for an episode and upload to S3."""
     from app import app, db
     from models import Episode, ProcessingJob
     from episode_fetcher import download_audio
-    from storage import get_file_paths
+    from s3_utils import get_s3_manager
+    import tempfile
+    import os
     
     with app.app_context():
         episode = Episode.query.get(episode_id)
@@ -126,31 +128,65 @@ def download_episode(self, episode_id: int, job_id: int):
             job.status = 'processing'
             db.session.commit()
             
-            # Get file paths
-            paths = get_file_paths(episode.podcast.name, episode.guid)
+            s3_manager = get_s3_manager()
             
-            # Download audio
-            success = download_audio(episode.audio_url, paths['audio'])
+            # Create temporary file for download
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_file:
+                temp_audio_path = tmp_file.name
             
-            if success:
-                episode.audio_path = str(paths['audio'])
-                job.status = 'completed'
-                job.completed_at = datetime.now(timezone.utc)
+            try:
+                # Download audio to temporary location
+                logger.info(f"Downloading audio from: {episode.audio_url}")
+                download_result = download_audio(episode.audio_url, temp_audio_path)
                 
-                # Queue transcription
-                transcribe_job = ProcessingJob(
-                    episode_id=episode_id,
-                    job_type='transcribe',
-                    started_at=datetime.now(timezone.utc)
-                )
-                db.session.add(transcribe_job)
-                db.session.commit()
+                if download_result and os.path.exists(temp_audio_path) and os.path.getsize(temp_audio_path) > 0:
+                    # Generate S3 key for audio file
+                    audio_filename = f"{episode.guid}.mp3"
+                    s3_key = s3_manager.generate_s3_key(
+                        episode.podcast_id, 
+                        episode.id, 
+                        'audio', 
+                        audio_filename
+                    )
+                    
+                    # Upload to S3
+                    logger.info(f"Uploading audio to S3: {s3_key}")
+                    s3_url = s3_manager.upload_file(
+                        temp_audio_path, 
+                        s3_key, 
+                        content_type='audio/mpeg'
+                    )
+                    
+                    if s3_url:
+                        episode.audio_path = s3_url  # Store S3 URL instead of local path
+                        job.status = 'completed'
+                        job.completed_at = datetime.now(timezone.utc)
+                        
+                        logger.info(f"Successfully uploaded audio to: {s3_url}")
+                        
+                        # Queue transcription
+                        transcribe_job = ProcessingJob(
+                            episode_id=episode_id,
+                            job_type='transcribe',
+                            started_at=datetime.now(timezone.utc)
+                        )
+                        db.session.add(transcribe_job)
+                        db.session.commit()
+                        
+                        transcribe_episode.delay(episode_id, transcribe_job.id)
+                    else:
+                        job.status = 'failed'
+                        job.error_message = 'Failed to upload audio to S3'
+                        episode.status = 'failed'
+                else:
+                    job.status = 'failed'
+                    job.error_message = 'Download failed or file is empty'
+                    episode.status = 'failed'
                 
-                transcribe_episode.delay(episode_id, transcribe_job.id)
-            else:
-                job.status = 'failed'
-                job.error_message = 'Download failed'
-                episode.status = 'failed'
+            finally:
+                # Clean up temporary file
+                if os.path.exists(temp_audio_path):
+                    os.unlink(temp_audio_path)
             
             db.session.commit()
             
@@ -164,11 +200,11 @@ def download_episode(self, episode_id: int, job_id: int):
 
 @celery_app.task(bind=True)
 def transcribe_episode(self, episode_id: int, job_id: int):
-    """Transcribe audio file for an episode."""
+    """Transcribe audio file for an episode using S3 storage."""
     from app import app, db
     from models import Episode, ProcessingJob
-    from transcribe import transcribe_audio
-    from storage import get_file_paths
+    from transcribe import transcribe_audio_from_s3
+    from s3_utils import get_s3_manager, extract_s3_key_from_url
     
     with app.app_context():
         episode = Episode.query.get(episode_id)
@@ -182,22 +218,38 @@ def transcribe_episode(self, episode_id: int, job_id: int):
             job.status = 'processing'
             db.session.commit()
             
-            # Get file paths
-            paths = get_file_paths(episode.podcast.name, episode.guid)
+            s3_manager = get_s3_manager()
             
-            # Transcribe audio
+            if not episode.audio_path:
+                raise ValueError("No audio file available for transcription")
+            
+            # Extract S3 key from audio URL
+            audio_s3_key = extract_s3_key_from_url(episode.audio_path)
+            if not audio_s3_key:
+                raise ValueError(f"Invalid S3 URL for audio: {episode.audio_path}")
+            
+            # Transcribe audio from S3
             whisper_model = os.environ.get('WHISPER_MODEL', 'medium')
-            result = transcribe_audio(str(paths['audio']), whisper_model)
+            logger.info(f"Starting transcription with model: {whisper_model}")
+            
+            result = transcribe_audio_from_s3(
+                audio_s3_key, 
+                episode.podcast_id, 
+                episode.id, 
+                whisper_model
+            )
             
             if result:
-                episode.transcript_path = str(paths['transcript'])
+                episode.transcript_path = result['transcript_s3_url']
                 episode.whisper_model = whisper_model
-                episode.language = result.language
-                episode.language_probability = result.language_probability
-                episode.duration_seconds = int(result.duration)
+                episode.language = result.get('language')
+                episode.language_probability = result.get('language_probability')
+                episode.duration_seconds = int(result.get('duration', 0))
                 
                 job.status = 'completed'
                 job.completed_at = datetime.now(timezone.utc)
+                
+                logger.info(f"Transcription completed for episode {episode_id}")
                 
                 # Send transcript ready email
                 send_transcript_email.delay(episode_id)

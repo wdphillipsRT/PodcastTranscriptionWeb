@@ -176,6 +176,96 @@ def load_segments(segments_path: str) -> Dict[str, Any]:
         logger.error(f"Failed to load segments from {segments_path}: {e}")
         raise
 
+def transcribe_audio_from_s3(audio_s3_key: str, podcast_id: int, episode_id: int, 
+                           model_name: str = "medium") -> Dict[str, Any]:
+    """
+    Transcribe audio file from S3 and upload results back to S3.
+    
+    Args:
+        audio_s3_key: S3 key of the audio file
+        podcast_id: Database ID of the podcast
+        episode_id: Database ID of the episode
+        model_name: Whisper model to use
+    
+    Returns:
+        Dictionary with transcription results and S3 URLs
+    """
+    from s3_utils import get_s3_manager
+    import tempfile
+    import json
+    
+    s3_manager = get_s3_manager()
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_audio_path = os.path.join(temp_dir, "audio.mp3")
+        
+        try:
+            # Download audio from S3 to temporary location
+            logger.info(f"Downloading audio from S3: {audio_s3_key}")
+            if not s3_manager.download_file(audio_s3_key, temp_audio_path):
+                raise Exception("Failed to download audio from S3")
+            
+            # Transcribe the audio
+            logger.info(f"Transcribing audio with model: {model_name}")
+            result = transcribe_audio(temp_audio_path, model_name)
+            
+            if not result:
+                raise Exception("Transcription failed")
+            
+            # Upload transcript text to S3
+            transcript_s3_key = s3_manager.generate_s3_key(
+                podcast_id, episode_id, 'transcripts', 'transcript.txt'
+            )
+            
+            # Read the transcript content
+            with open(result.transcript_path, 'r', encoding='utf-8') as f:
+                transcript_content = f.read()
+            
+            transcript_s3_url = s3_manager.upload_text_content(
+                transcript_content, 
+                transcript_s3_key, 
+                'text/plain'
+            )
+            
+            if not transcript_s3_url:
+                raise Exception("Failed to upload transcript to S3")
+            
+            # Upload segments JSON to S3
+            segments_s3_key = s3_manager.generate_s3_key(
+                podcast_id, episode_id, 'transcripts', 'segments.json'
+            )
+            
+            segments_data = {
+                "model": model_name,
+                "language": result.info.get("language"),
+                "language_probability": result.info.get("language_probability"),
+                "duration": result.info.get("duration"),
+                "segments": result.segments
+            }
+            
+            segments_s3_url = s3_manager.upload_text_content(
+                json.dumps(segments_data, indent=2, ensure_ascii=False),
+                segments_s3_key,
+                'application/json'
+            )
+            
+            logger.info(f"Transcription completed and uploaded to S3:")
+            logger.info(f"  - Transcript: {transcript_s3_url}")
+            logger.info(f"  - Segments: {segments_s3_url}")
+            
+            return {
+                "transcript_s3_url": transcript_s3_url,
+                "segments_s3_url": segments_s3_url,
+                "language": result.info.get("language"),
+                "language_probability": result.info.get("language_probability"),
+                "duration": result.info.get("duration"),
+                "segments": result.segments
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in S3 transcription: {e}")
+            raise
+
 def get_transcript_summary_stats(transcript_path: str) -> Dict[str, Any]:
     """Get basic statistics about a transcript."""
     try:

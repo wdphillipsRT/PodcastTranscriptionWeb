@@ -37,3 +37,6 @@ Flask-Migrate>=4.0.0
 
 # Environment and configuration
 python-decouple>=3.8
+
+# AWS S3 storage
+boto3>=1.34.0
