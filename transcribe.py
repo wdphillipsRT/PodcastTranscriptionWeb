@@ -1,7 +1,7 @@
 import os
 import json
 from typing import Dict, Any, Optional, List, Tuple
-import whisper
+from faster_whisper import WhisperModel
 import logging
 from pathlib import Path
 
@@ -17,21 +17,28 @@ class TranscriptionResult:
 
 def get_whisper_model(model_name: str = "tiny"):
     """
-    Initialize and return a Whisper model with memory optimizations.
+    Initialize and return a faster-whisper model with memory optimizations.
     
     Args:
-        model_name: Model size (tiny, base, small, medium, large)
+        model_name: Model size (tiny, base, small, medium, large-v3)
     """
-    logger.info(f"Loading Whisper model: {model_name}")
+    logger.info(f"Loading faster-whisper model: {model_name}")
     
     try:
-        # Use tiny model for better memory efficiency
-        model = whisper.load_model(model_name, device="cpu")
-        logger.info(f"Successfully loaded Whisper model: {model_name}")
+        # Initialize faster-whisper model (uses whisper.cpp under the hood)
+        # Use most aggressive memory optimization for Heroku
+        model = WhisperModel(
+            model_name,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=1,  # Limit CPU threads to reduce memory
+            num_workers=1   # Single worker to minimize memory
+        )
+        logger.info(f"Successfully loaded faster-whisper model: {model_name}")
         return model
         
     except Exception as e:
-        logger.error(f"Failed to load Whisper model {model_name}: {e}")
+        logger.error(f"Failed to load faster-whisper model {model_name}: {e}")
         raise
 
 def transcribe_audio(
@@ -42,7 +49,7 @@ def transcribe_audio(
     word_timestamps: bool = False
 ) -> TranscriptionResult:
     """
-    Transcribe audio file using OpenAI Whisper with memory optimization.
+    Transcribe audio file using faster-whisper (whisper.cpp) with memory optimization.
     
     Args:
         audio_path: Path to audio file
@@ -75,26 +82,27 @@ def transcribe_audio(
     segments_path = transcript_dir / "segments.json"
     
     try:
-        # Perform transcription using OpenAI Whisper
-        # Use fp16=False to reduce memory usage
-        result = model.transcribe(
+        # Perform transcription using faster-whisper
+        # Configure transcription parameters with memory optimization
+        segments, info = model.transcribe(
             audio_path,
             language=language,
-            fp16=False,  # Use fp32 to reduce memory
-            verbose=False  # Reduce output verbosity
+            word_timestamps=word_timestamps,
+            vad_filter=vad_filter,
+            without_timestamps=False,
+            beam_size=1,  # Use beam size 1 for minimal memory usage
+            best_of=1     # Single candidate to reduce memory
         )
         
-        # Extract segments from result
+        # Extract segments from generator
         segment_list = []
         transcript_lines = []
         
-        segments = result.get('segments', [])
-        
         for segment in segments:
             segment_dict = {
-                "start": round(segment.get('start', 0), 2),
-                "end": round(segment.get('end', 0), 2),
-                "text": segment.get('text', '').strip()
+                "start": round(segment.start, 2),
+                "end": round(segment.end, 2),
+                "text": segment.text.strip()
             }
             
             segment_list.append(segment_dict)
@@ -107,16 +115,18 @@ def transcribe_audio(
         with open(transcript_path, "w", encoding="utf-8") as f:
             f.write("\n".join(transcript_lines))
         
-        # Get basic info from result
-        detected_language = result.get('language', 'en')
+        # Get basic info from transcription info
+        detected_language = info.language
+        language_probability = info.language_probability
+        duration = info.duration
         
         # Write segments JSON file
         transcription_metadata = {
             "audio_file": str(audio_path),
             "model": model_name,
             "language": detected_language,
-            "language_probability": 0.9,
-            "duration": 0.0,  # OpenAI Whisper doesn't provide duration
+            "language_probability": language_probability,
+            "duration": duration,
             "segments": segment_list
         }
         
@@ -124,7 +134,8 @@ def transcribe_audio(
             json.dump(transcription_metadata, f, indent=2, ensure_ascii=False)
         
         logger.info(f"Transcription completed:")
-        logger.info(f"  - Language: {detected_language}")
+        logger.info(f"  - Language: {detected_language} ({language_probability:.2f})")
+        logger.info(f"  - Duration: {duration:.2f}s")
         logger.info(f"  - Segments: {len(segment_list)}")
         logger.info(f"  - Transcript: {transcript_path}")
         logger.info(f"  - Segments: {segments_path}")
@@ -134,8 +145,8 @@ def transcribe_audio(
             segments=segment_list,
             info={
                 "language": detected_language,
-                "language_probability": 0.9,
-                "duration": 0.0,
+                "language_probability": language_probability,
+                "duration": duration,
                 "model": model_name
             }
         )
