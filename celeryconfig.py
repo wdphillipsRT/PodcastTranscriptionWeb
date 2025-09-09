@@ -32,6 +32,8 @@ worker_max_tasks_per_child = 1000
 
 # Task routing
 task_routes = {
+    'tasks.queue_podcast_processing': {'queue': 'downloads'},
+    'tasks.process_episode': {'queue': 'downloads'},
     'tasks.download_episode': {'queue': 'downloads'},
     'tasks.transcribe_episode': {'queue': 'transcription'},
     'tasks.summarize_episode': {'queue': 'summarization'},
