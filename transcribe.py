@@ -1,67 +1,48 @@
 import os
 import json
+import time
 from typing import Dict, Any, Optional, List, Tuple
-from openai import OpenAI
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
 import logging
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-def _compress_audio_for_api(audio_path: str) -> str:
+def _convert_audio_for_transcribe(audio_path: str) -> str:
     """
-    Compress audio file to fit within OpenAI API's 25MB limit.
-    Uses ffmpeg if available, otherwise reduces quality.
+    Convert audio file to format compatible with Amazon Transcribe.
+    Amazon Transcribe supports: mp3, mp4, wav, flac, ogg, amr, webm, m4a
     """
     import subprocess
     import tempfile
     
-    # Create compressed version with lower bitrate
-    compressed_path = audio_path.replace('.mp3', '_compressed.mp3')
+    # Check if file is already in a supported format
+    supported_formats = ['.mp3', '.mp4', '.wav', '.flac', '.ogg', '.amr', '.webm', '.m4a']
+    file_ext = os.path.splitext(audio_path)[1].lower()
+    
+    if file_ext in supported_formats:
+        return audio_path
+    
+    # Convert to mp3 if not in supported format
+    converted_path = audio_path.replace(file_ext, '.mp3')
     
     try:
-        # Use ffmpeg to compress audio if available
+        # Use ffmpeg to convert audio
         subprocess.run([
             'ffmpeg', '-i', audio_path, 
             '-acodec', 'mp3', 
-            '-ab', '64k',  # Lower bitrate for smaller size
-            '-ar', '16000',  # Lower sample rate
-            '-ac', '1',      # Mono channel
             '-y',            # Overwrite output
-            compressed_path
+            converted_path
         ], check=True, capture_output=True)
         
-        logger.info(f"Compressed audio using ffmpeg from {os.path.getsize(audio_path) / (1024*1024):.1f}MB to {os.path.getsize(compressed_path) / (1024*1024):.1f}MB")
-        return compressed_path
+        logger.info(f"Converted audio from {file_ext} to mp3: {converted_path}")
+        return converted_path
         
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # If ffmpeg not available, try pydub as fallback
-        try:
-            from pydub import AudioSegment
-            from pydub.utils import which
-            
-            # Check if ffmpeg/ffprobe are available for pydub
-            if not which("ffmpeg") or not which("ffprobe"):
-                logger.warning("ffmpeg/ffprobe not available for pydub")
-                return audio_path
-                
-            logger.info("Using pydub for audio compression")
-            
-            # Load audio with pydub
-            audio = AudioSegment.from_mp3(audio_path)
-            
-            # Compress: lower bitrate, sample rate, and make mono
-            compressed_audio = audio.set_frame_rate(16000).set_channels(1)
-            
-            # Export with lower bitrate
-            compressed_audio.export(compressed_path, format="mp3", bitrate="64k")
-            
-            logger.info(f"Compressed audio using pydub from {os.path.getsize(audio_path) / (1024*1024):.1f}MB to {os.path.getsize(compressed_path) / (1024*1024):.1f}MB")
-            return compressed_path
-            
-        except (ImportError, Exception) as e:
-            logger.warning(f"Pydub compression failed: {e}")
-            # Last resort: return original and let API reject it with a better error message
-            return audio_path
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.warning(f"Audio conversion failed: {e}")
+        # Return original file and let Transcribe handle it
+        return audio_path
 
 class TranscriptionResult:
     """Container for transcription results."""
@@ -71,36 +52,41 @@ class TranscriptionResult:
         self.segments = segments
         self.info = info
 
-def get_openai_client():
+def get_transcribe_client():
     """
-    Initialize and return OpenAI client for Whisper API calls.
+    Initialize and return Amazon Transcribe client.
     
     Returns:
-        OpenAI client instance
+        boto3 Transcribe client instance
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY environment variable not set")
-    
-    client = OpenAI(api_key=api_key)
-    logger.info("Successfully initialized OpenAI client for Whisper API")
-    return client
+    try:
+        # Get AWS region from environment or default to us-west-2
+        region = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-west-2"))
+        
+        client = boto3.client('transcribe', region_name=region)
+        logger.info(f"Successfully initialized Amazon Transcribe client in region: {region}")
+        return client
+        
+    except NoCredentialsError:
+        raise ValueError("AWS credentials not found. Please configure AWS credentials using environment variables, AWS credentials file, or IAM role.")
+    except Exception as e:
+        raise ValueError(f"Failed to initialize Amazon Transcribe client: {e}")
 
 def transcribe_audio(
     audio_path: str, 
-    model_name: str = "tiny",
+    model_name: str = "basic",
     language: Optional[str] = None,
     vad_filter: bool = True,
     word_timestamps: bool = False
 ) -> TranscriptionResult:
     """
-    Transcribe audio file using OpenAI's Whisper API (cloud-based).
+    Transcribe audio file using Amazon Transcribe service.
     
     Args:
         audio_path: Path to audio file
-        model_name: Whisper model to use (whisper-1)
-        language: Force specific language (None for auto-detection)
-        vad_filter: Not used with API (included for compatibility)
+        model_name: Transcribe model to use ("basic" or "enhanced")
+        language: Language code (e.g., "en-US", "es-ES", None for auto-detection)
+        vad_filter: Not used with Transcribe (included for compatibility)
         word_timestamps: Include word-level timestamps
     
     Returns:
@@ -109,10 +95,13 @@ def transcribe_audio(
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
     
-    logger.info(f"Transcribing audio via OpenAI Whisper API: {audio_path}")
+    logger.info(f"Transcribing audio via Amazon Transcribe: {audio_path}")
     
-    # Initialize OpenAI client
-    client = get_openai_client()
+    # Initialize Transcribe client
+    client = get_transcribe_client()
+    
+    # Convert audio to supported format if needed
+    processed_audio_path = _convert_audio_for_transcribe(audio_path)
     
     # Generate output paths
     audio_path_obj = Path(audio_path)
@@ -127,75 +116,135 @@ def transcribe_audio(
     segments_path = transcript_dir / "segments.json"
     
     try:
-        # Check file size - OpenAI API has a 25MB limit
-        file_size = os.path.getsize(audio_path)
-        max_size = 25 * 1024 * 1024  # 25MB in bytes
+        from s3_utils import get_s3_manager
+        import uuid
         
-        if file_size > max_size:
-            logger.warning(f"Audio file is {file_size / (1024*1024):.1f}MB, exceeding OpenAI's 25MB limit")
-            # Try to compress the audio to reduce file size
-            compressed_path = _compress_audio_for_api(audio_path)
-            compressed_size = os.path.getsize(compressed_path) if os.path.exists(compressed_path) else file_size
-            
-            if compressed_path != audio_path and compressed_size <= max_size:
-                logger.info(f"Successfully compressed audio to {compressed_size / (1024*1024):.1f}MB")
-                upload_path = compressed_path
-            elif compressed_path != audio_path:
-                logger.warning(f"Compressed audio is still {compressed_size / (1024*1024):.1f}MB, exceeding 25MB limit")
-                upload_path = compressed_path  # Try anyway, might work
-            else:
-                logger.error(f"Cannot compress audio file. Size {file_size / (1024*1024):.1f}MB exceeds OpenAI API limit of 25MB")
-                raise ValueError(f"Audio file too large ({file_size / (1024*1024):.1f}MB) for OpenAI Whisper API. Maximum size is 25MB. Please use a smaller audio file or consider splitting it into segments.")
-        else:
-            upload_path = audio_path
+        s3_manager = get_s3_manager()
         
-        # Read audio file for API upload
-        with open(upload_path, "rb") as audio_file:
-            # Call OpenAI Whisper API
-            transcript_response = client.audio.transcriptions.create(
-                model="whisper-1",  # OpenAI's Whisper model
-                file=audio_file,
-                language=language,  # Optional language hint
-                response_format="verbose_json" if word_timestamps else "json",
-                timestamp_granularities=["segment"] if word_timestamps else None
+        # Generate unique job name
+        job_name = f"transcribe-{uuid.uuid4().hex[:8]}-{int(time.time())}"
+        
+        # Upload audio to S3 for Transcribe processing
+        audio_s3_key = f"transcribe-temp/{job_name}.mp3"
+        with open(processed_audio_path, 'rb') as f:
+            audio_content = f.read()
+        
+        audio_s3_uri = s3_manager.upload_binary_content(
+            audio_content, 
+            audio_s3_key, 
+            'audio/mpeg'
+        )
+        
+        if not audio_s3_uri:
+            raise Exception("Failed to upload audio to S3 for transcription")
+        
+        # Start transcription job
+        job_config = {
+            'TranscriptionJobName': job_name,
+            'LanguageCode': language or 'en-US',
+            'MediaFormat': 'mp3',
+            'Media': {
+                'MediaFileUri': audio_s3_uri
+            },
+            'OutputBucketName': s3_manager.bucket_name,
+            'OutputKey': f"transcribe-results/{job_name}/"
+        }
+        
+        # Add advanced settings
+        settings = {}
+        if word_timestamps:
+            settings['ShowSpeakerLabels'] = False  # Can be enabled if needed
+            settings['MaxSpeakerLabels'] = 2       # Adjust as needed
+        
+        if model_name == "enhanced":
+            job_config['ModelSettings'] = {
+                'LanguageModelName': 'enhanced'  # Use enhanced model if available
+            }
+        
+        if settings:
+            job_config['Settings'] = settings
+        
+        # Auto-detect language if not specified
+        if not language:
+            job_config['IdentifyLanguage'] = True
+            job_config.pop('LanguageCode')  # Remove language code for auto-detection
+        
+        logger.info(f"Starting Amazon Transcribe job: {job_name}")
+        response = client.start_transcription_job(**job_config)
+        
+        # Wait for job completion
+        logger.info("Waiting for transcription job to complete...")
+        while True:
+            status_response = client.get_transcription_job(
+                TranscriptionJobName=job_name
             )
+            
+            status = status_response['TranscriptionJob']['TranscriptionJobStatus']
+            logger.info(f"Transcription job status: {status}")
+            
+            if status == 'COMPLETED':
+                break
+            elif status == 'FAILED':
+                failure_reason = status_response['TranscriptionJob'].get('FailureReason', 'Unknown error')
+                raise Exception(f"Transcription job failed: {failure_reason}")
+            
+            # Wait before checking again
+            time.sleep(10)
         
-        # Clean up compressed file if we created one
-        if file_size > max_size and upload_path != audio_path and os.path.exists(upload_path):
-            os.unlink(upload_path)
+        # Get the transcription results
+        job_details = status_response['TranscriptionJob']
+        results_uri = job_details['Transcript']['TranscriptFileUri']
+        detected_language = job_details.get('LanguageCode', language or 'en-US')
         
-        # Extract transcript text and segments
-        transcript_text = transcript_response.text
-        segments = getattr(transcript_response, 'segments', [])
-        detected_language = getattr(transcript_response, 'language', language or 'en')
-        duration = getattr(transcript_response, 'duration', 0.0)
+        # Download and parse results
+        import requests
+        results_response = requests.get(results_uri)
+        results_response.raise_for_status()
+        transcription_data = results_response.json()
         
-        # Process segments for our format
+        # Extract transcript and segments
+        transcript_text = transcription_data['results']['transcripts'][0]['transcript']
+        items = transcription_data['results']['items']
+        
+        # Process segments - group by speaker or time intervals
         segment_list = []
         transcript_lines = []
+        current_segment = {"start": 0.0, "end": 0.0, "text": ""}
+        segment_duration = 30.0  # Group words into 30-second segments
         
-        if segments:
-            for segment in segments:
-                segment_dict = {
-                    "start": round(segment.get('start', 0), 2),
-                    "end": round(segment.get('end', 0), 2),
-                    "text": segment.get('text', '').strip()
-                }
+        for item in items:
+            if item['type'] == 'pronunciation':
+                start_time = float(item['start_time'])
+                end_time = float(item['end_time'])
+                content = item['alternatives'][0]['content']
                 
-                segment_list.append(segment_dict)
-                
-                # Format for text transcript
-                timestamp = f"[{segment_dict['start']:.2f}–{segment_dict['end']:.2f}]"
-                transcript_lines.append(f"{timestamp} {segment_dict['text']}")
-        else:
-            # If no segments available, use the full text
-            segment_dict = {
-                "start": 0.0,
-                "end": duration,
-                "text": transcript_text.strip()
-            }
-            segment_list.append(segment_dict)
-            transcript_lines.append(f"[0.00–{duration:.2f}] {transcript_text}")
+                # Start new segment if we've exceeded duration or this is the first item
+                if not current_segment["text"] or start_time - current_segment["start"] > segment_duration:
+                    if current_segment["text"]:
+                        segment_list.append(current_segment.copy())
+                        timestamp = f"[{current_segment['start']:.2f}–{current_segment['end']:.2f}]"
+                        transcript_lines.append(f"{timestamp} {current_segment['text'].strip()}")
+                    
+                    current_segment = {
+                        "start": start_time,
+                        "end": end_time,
+                        "text": content
+                    }
+                else:
+                    current_segment["end"] = end_time
+                    current_segment["text"] += " " + content
+            elif item['type'] == 'punctuation':
+                if current_segment["text"]:
+                    current_segment["text"] += item['alternatives'][0]['content']
+        
+        # Add the last segment
+        if current_segment["text"]:
+            segment_list.append(current_segment)
+            timestamp = f"[{current_segment['start']:.2f}–{current_segment['end']:.2f}]"
+            transcript_lines.append(f"{timestamp} {current_segment['text'].strip()}")
+        
+        # Get duration from the last item
+        duration = float(items[-1]['end_time']) if items and 'end_time' in items[-1] else 0.0
         
         # Write transcript text file
         with open(transcript_path, "w", encoding="utf-8") as f:
@@ -204,9 +253,9 @@ def transcribe_audio(
         # Write segments JSON file
         transcription_metadata = {
             "audio_file": str(audio_path),
-            "model": "whisper-1",
+            "model": f"amazon-transcribe-{model_name}",
             "language": detected_language,
-            "language_probability": 0.95,  # OpenAI API doesn't provide this
+            "language_probability": 0.99,  # Transcribe is generally very confident
             "duration": duration,
             "segments": segment_list
         }
@@ -214,7 +263,20 @@ def transcribe_audio(
         with open(segments_path, "w", encoding="utf-8") as f:
             json.dump(transcription_metadata, f, indent=2, ensure_ascii=False)
         
-        logger.info(f"OpenAI Whisper API transcription completed:")
+        # Clean up temporary files
+        try:
+            # Delete transcription job
+            client.delete_transcription_job(TranscriptionJobName=job_name)
+            # Clean up S3 files
+            s3_manager.delete_file(audio_s3_key)
+        except Exception as e:
+            logger.warning(f"Failed to clean up transcription job resources: {e}")
+        
+        # Clean up converted audio file if we created one
+        if processed_audio_path != audio_path and os.path.exists(processed_audio_path):
+            os.unlink(processed_audio_path)
+        
+        logger.info(f"Amazon Transcribe transcription completed:")
         logger.info(f"  - Language: {detected_language}")
         logger.info(f"  - Duration: {duration:.2f}s")
         logger.info(f"  - Segments: {len(segment_list)}")
@@ -226,9 +288,9 @@ def transcribe_audio(
             segments=segment_list,
             info={
                 "language": detected_language,
-                "language_probability": 0.95,
+                "language_probability": 0.99,
                 "duration": duration,
-                "model": "whisper-1"
+                "model": f"amazon-transcribe-{model_name}"
             }
         )
         
@@ -255,15 +317,15 @@ def load_segments(segments_path: str) -> Dict[str, Any]:
         raise
 
 def transcribe_audio_from_s3(audio_s3_key: str, podcast_id: int, episode_id: int, 
-                           model_name: str = "whisper-1") -> Dict[str, Any]:
+                           model_name: str = "basic") -> Dict[str, Any]:
     """
-    Transcribe audio file from S3 using OpenAI Whisper API and upload results back to S3.
+    Transcribe audio file from S3 using Amazon Transcribe and upload results back to S3.
     
     Args:
         audio_s3_key: S3 key of the audio file
         podcast_id: Database ID of the podcast
         episode_id: Database ID of the episode
-        model_name: Whisper model to use (whisper-1 for OpenAI API)
+        model_name: Transcribe model to use ("basic" or "enhanced")
     
     Returns:
         Dictionary with transcription results and S3 URLs
@@ -271,78 +333,184 @@ def transcribe_audio_from_s3(audio_s3_key: str, podcast_id: int, episode_id: int
     from s3_utils import get_s3_manager
     import tempfile
     import json
+    import uuid
     
     s3_manager = get_s3_manager()
+    client = get_transcribe_client()
     
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_audio_path = os.path.join(temp_dir, "audio.mp3")
+    try:
+        # Generate unique job name
+        job_name = f"transcribe-s3-{uuid.uuid4().hex[:8]}-{int(time.time())}"
         
+        # Get S3 URI for the audio file
+        audio_s3_uri = f"s3://{s3_manager.bucket_name}/{audio_s3_key}"
+        
+        # Determine audio format from file extension
+        file_ext = os.path.splitext(audio_s3_key)[1].lower()
+        format_map = {
+            '.mp3': 'mp3', '.mp4': 'mp4', '.wav': 'wav', '.flac': 'flac',
+            '.ogg': 'ogg', '.amr': 'amr', '.webm': 'webm', '.m4a': 'm4a'
+        }
+        media_format = format_map.get(file_ext, 'mp3')  # Default to mp3
+        
+        # Start transcription job directly from S3
+        job_config = {
+            'TranscriptionJobName': job_name,
+            'LanguageCode': 'en-US',  # Default to English, can be made configurable
+            'MediaFormat': media_format,
+            'Media': {
+                'MediaFileUri': audio_s3_uri
+            },
+            'OutputBucketName': s3_manager.bucket_name,
+            'OutputKey': f"transcribe-results/{job_name}/"
+        }
+        
+        # Add model settings for enhanced model
+        if model_name == "enhanced":
+            job_config['ModelSettings'] = {
+                'LanguageModelName': 'enhanced'
+            }
+        
+        # Enable language auto-detection
+        job_config['IdentifyLanguage'] = True
+        job_config.pop('LanguageCode')  # Remove for auto-detection
+        
+        logger.info(f"Starting Amazon Transcribe job for S3 file: {audio_s3_key}")
+        response = client.start_transcription_job(**job_config)
+        
+        # Wait for job completion
+        logger.info("Waiting for transcription job to complete...")
+        while True:
+            status_response = client.get_transcription_job(
+                TranscriptionJobName=job_name
+            )
+            
+            status = status_response['TranscriptionJob']['TranscriptionJobStatus']
+            logger.info(f"Transcription job status: {status}")
+            
+            if status == 'COMPLETED':
+                break
+            elif status == 'FAILED':
+                failure_reason = status_response['TranscriptionJob'].get('FailureReason', 'Unknown error')
+                raise Exception(f"Transcription job failed: {failure_reason}")
+            
+            # Wait before checking again
+            time.sleep(10)
+        
+        # Get the transcription results
+        job_details = status_response['TranscriptionJob']
+        results_uri = job_details['Transcript']['TranscriptFileUri']
+        detected_language = job_details.get('LanguageCode', 'en-US')
+        
+        # Download and parse results
+        import requests
+        results_response = requests.get(results_uri)
+        results_response.raise_for_status()
+        transcription_data = results_response.json()
+        
+        # Extract transcript and segments
+        transcript_text = transcription_data['results']['transcripts'][0]['transcript']
+        items = transcription_data['results']['items']
+        
+        # Process segments - group by time intervals
+        segment_list = []
+        transcript_lines = []
+        current_segment = {"start": 0.0, "end": 0.0, "text": ""}
+        segment_duration = 30.0  # Group words into 30-second segments
+        
+        for item in items:
+            if item['type'] == 'pronunciation':
+                start_time = float(item['start_time'])
+                end_time = float(item['end_time'])
+                content = item['alternatives'][0]['content']
+                
+                # Start new segment if we've exceeded duration or this is the first item
+                if not current_segment["text"] or start_time - current_segment["start"] > segment_duration:
+                    if current_segment["text"]:
+                        segment_list.append(current_segment.copy())
+                        timestamp = f"[{current_segment['start']:.2f}–{current_segment['end']:.2f}]"
+                        transcript_lines.append(f"{timestamp} {current_segment['text'].strip()}")
+                    
+                    current_segment = {
+                        "start": start_time,
+                        "end": end_time,
+                        "text": content
+                    }
+                else:
+                    current_segment["end"] = end_time
+                    current_segment["text"] += " " + content
+            elif item['type'] == 'punctuation':
+                if current_segment["text"]:
+                    current_segment["text"] += item['alternatives'][0]['content']
+        
+        # Add the last segment
+        if current_segment["text"]:
+            segment_list.append(current_segment)
+            timestamp = f"[{current_segment['start']:.2f}–{current_segment['end']:.2f}]"
+            transcript_lines.append(f"{timestamp} {current_segment['text'].strip()}")
+        
+        # Get duration from the last item
+        duration = float(items[-1]['end_time']) if items and 'end_time' in items[-1] else 0.0
+        
+        # Upload transcript text to S3
+        transcript_s3_key = s3_manager.generate_s3_key(
+            podcast_id, episode_id, 'transcripts', 'transcript.txt'
+        )
+        
+        transcript_content = "\n".join(transcript_lines)
+        transcript_s3_url = s3_manager.upload_text_content(
+            transcript_content, 
+            transcript_s3_key, 
+            'text/plain'
+        )
+        
+        if not transcript_s3_url:
+            raise Exception("Failed to upload transcript to S3")
+        
+        # Upload segments JSON to S3
+        segments_s3_key = s3_manager.generate_s3_key(
+            podcast_id, episode_id, 'transcripts', 'segments.json'
+        )
+        
+        segments_data = {
+            "model": f"amazon-transcribe-{model_name}",
+            "language": detected_language,
+            "language_probability": 0.99,
+            "duration": duration,
+            "segments": segment_list
+        }
+        
+        segments_s3_url = s3_manager.upload_text_content(
+            json.dumps(segments_data, indent=2, ensure_ascii=False),
+            segments_s3_key,
+            'application/json'
+        )
+        
+        # Clean up transcription job
         try:
-            # Download audio from S3 to temporary location
-            logger.info(f"Downloading audio from S3: {audio_s3_key}")
-            if not s3_manager.download_file(audio_s3_key, temp_audio_path):
-                raise Exception("Failed to download audio from S3")
-            
-            # Transcribe the audio
-            logger.info(f"Transcribing audio with model: {model_name}")
-            result = transcribe_audio(temp_audio_path, model_name)
-            
-            if not result:
-                raise Exception("Transcription failed")
-            
-            # Upload transcript text to S3
-            transcript_s3_key = s3_manager.generate_s3_key(
-                podcast_id, episode_id, 'transcripts', 'transcript.txt'
-            )
-            
-            # Read the transcript content
-            with open(result.transcript_path, 'r', encoding='utf-8') as f:
-                transcript_content = f.read()
-            
-            transcript_s3_url = s3_manager.upload_text_content(
-                transcript_content, 
-                transcript_s3_key, 
-                'text/plain'
-            )
-            
-            if not transcript_s3_url:
-                raise Exception("Failed to upload transcript to S3")
-            
-            # Upload segments JSON to S3
-            segments_s3_key = s3_manager.generate_s3_key(
-                podcast_id, episode_id, 'transcripts', 'segments.json'
-            )
-            
-            segments_data = {
-                "model": model_name,
-                "language": result.info.get("language"),
-                "language_probability": result.info.get("language_probability"),
-                "duration": result.info.get("duration"),
-                "segments": result.segments
-            }
-            
-            segments_s3_url = s3_manager.upload_text_content(
-                json.dumps(segments_data, indent=2, ensure_ascii=False),
-                segments_s3_key,
-                'application/json'
-            )
-            
-            logger.info(f"Transcription completed and uploaded to S3:")
-            logger.info(f"  - Transcript: {transcript_s3_url}")
-            logger.info(f"  - Segments: {segments_s3_url}")
-            
-            return {
-                "transcript_s3_url": transcript_s3_url,
-                "segments_s3_url": segments_s3_url,
-                "language": result.info.get("language"),
-                "language_probability": result.info.get("language_probability"),
-                "duration": result.info.get("duration"),
-                "segments": result.segments
-            }
-            
+            client.delete_transcription_job(TranscriptionJobName=job_name)
         except Exception as e:
-            logger.error(f"Error in S3 transcription: {e}")
-            raise
+            logger.warning(f"Failed to clean up transcription job: {e}")
+        
+        logger.info(f"Amazon Transcribe S3 transcription completed:")
+        logger.info(f"  - Language: {detected_language}")
+        logger.info(f"  - Duration: {duration:.2f}s")
+        logger.info(f"  - Segments: {len(segment_list)}")
+        logger.info(f"  - Transcript: {transcript_s3_url}")
+        logger.info(f"  - Segments: {segments_s3_url}")
+        
+        return {
+            "transcript_s3_url": transcript_s3_url,
+            "segments_s3_url": segments_s3_url,
+            "language": detected_language,
+            "language_probability": 0.99,
+            "duration": duration,
+            "segments": segment_list
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in S3 transcription with Amazon Transcribe: {e}")
+        raise
 
 def get_transcript_summary_stats(transcript_path: str) -> Dict[str, Any]:
     """Get basic statistics about a transcript."""

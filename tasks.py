@@ -229,14 +229,14 @@ def transcribe_episode(self, episode_id: int, job_id: int):
                 raise ValueError(f"Invalid S3 URL for audio: {episode.audio_path}")
             
             # Transcribe audio from S3
-            whisper_model = os.environ.get('WHISPER_MODEL', 'tiny')
-            logger.info(f"Starting transcription with model: {whisper_model}")
+            transcribe_model = os.environ.get('TRANSCRIBE_MODEL', 'basic')
+            logger.info(f"Starting transcription with Amazon Transcribe model: {transcribe_model}")
             
             result = transcribe_audio_from_s3(
                 audio_s3_key, 
                 episode.podcast_id, 
                 episode.id, 
-                whisper_model
+                transcribe_model
             )
             
             if result:
