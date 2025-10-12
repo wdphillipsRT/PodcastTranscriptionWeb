@@ -60,13 +60,12 @@ This is the simplest way to run the application locally using SQLite.
 
    Open your web browser and navigate to:
    ```
-   http://127.0.0.1:5000
+   http://127.0.0.1:5000          # From the same machine
+   http://localhost:5000           # From the same machine
+   http://192.168.68.107:5000     # From any device on your network
    ```
 
-   or
-   ```
-   http://localhost:5000
-   ```
+   **Note:** The application is configured to be accessible from other computers on your local network. See `NETWORK_ACCESS.md` for details.
 
 ### Option 2: Production-Style with Gunicorn
 
