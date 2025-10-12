@@ -4,7 +4,6 @@ from flask_login import LoginManager, UserMixin, login_user, logout_user, login_
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timezone
 import os
-import stripe
 import requests
 from dotenv import load_dotenv
 import logging
@@ -26,17 +25,13 @@ app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Import models and initialize db
-from models import db, User, Subscription, Podcast, Episode, ProcessingJob, EmailNotification
+from models import db, User, Podcast, Episode, ProcessingJob, EmailNotification
 db.init_app(app)
 
 # Initialize other extensions
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
-
-# Configure Stripe
-stripe.api_key = os.environ.get('STRIPE_SECRET_KEY')
-STRIPE_PUBLISHABLE_KEY = os.environ.get('STRIPE_PUBLISHABLE_KEY')
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -119,9 +114,6 @@ def dashboard():
 @app.route('/add-podcast', methods=['POST'])
 @login_required
 def add_podcast():
-    if not current_user.has_active_subscription():
-        return jsonify({'error': 'Active subscription required'}), 403
-    
     data = request.get_json()
     podcast_url = data.get('url')
     name = data.get('name')
@@ -156,73 +148,6 @@ def add_podcast():
     except Exception as e:
         logger.error(f"Error adding podcast: {e}")
         return jsonify({'error': 'Failed to add podcast'}), 500
-
-@app.route('/subscription')
-@login_required
-def subscription():
-    return render_template('subscription.html', 
-                         stripe_key=STRIPE_PUBLISHABLE_KEY,
-                         user=current_user)
-
-@app.route('/create-checkout-session', methods=['POST'])
-@login_required
-def create_checkout_session():
-    try:
-        checkout_session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
-            line_items=[{
-                'price': os.environ.get('STRIPE_PRICE_ID'),
-                'quantity': 1,
-            }],
-            mode='subscription',
-            success_url=url_for('subscription_success', _external=True),
-            cancel_url=url_for('subscription', _external=True),
-            client_reference_id=str(current_user.id),
-        )
-        return jsonify({'checkout_url': checkout_session.url})
-    except Exception as e:
-        logger.error(f"Error creating checkout session: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/subscription/success')
-@login_required
-def subscription_success():
-    flash('Subscription activated successfully!')
-    return redirect(url_for('dashboard'))
-
-@app.route('/webhook/stripe', methods=['POST'])
-def stripe_webhook():
-    payload = request.get_data()
-    sig_header = request.headers.get('Stripe-Signature')
-    endpoint_secret = os.environ.get('STRIPE_WEBHOOK_SECRET')
-    
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return jsonify({'error': 'Invalid payload'}), 400
-    
-    if event['type'] == 'checkout.session.completed':
-        session = event['data']['object']
-        user_id = int(session['client_reference_id'])
-        subscription_id = session['subscription']
-        
-        user = User.query.get(user_id)
-        if user:
-            subscription = Subscription(
-                user_id=user_id,
-                stripe_subscription_id=subscription_id,
-                status='active',
-                created_at=datetime.now(timezone.utc)
-            )
-            db.session.add(subscription)
-            db.session.commit()
-            
-            # Send welcome email
-            from tasks import send_welcome_email
-            send_welcome_email.delay(user.email)
-    
-    return jsonify({'success': True})
 
 @app.route('/podcast/<int:podcast_id>/episodes')
 @login_required

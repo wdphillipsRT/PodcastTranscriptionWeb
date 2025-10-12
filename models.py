@@ -7,38 +7,18 @@ db = SQLAlchemy()
 
 class User(UserMixin, db.Model):
     __tablename__ = 'users'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-    
+
     # Relationships
     podcasts = db.relationship('Podcast', backref='user', lazy=True, cascade='all, delete-orphan')
-    subscription = db.relationship('Subscription', backref='user', lazy=True, uselist=False)
-    
-    def has_active_subscription(self):
-        return self.subscription and self.subscription.status == 'active'
-    
+
     def __repr__(self):
         return f'<User {self.email}>'
-
-class Subscription(db.Model):
-    __tablename__ = 'subscriptions'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    stripe_subscription_id = db.Column(db.String(255), unique=True, nullable=False)
-    stripe_customer_id = db.Column(db.String(255))
-    status = db.Column(db.String(50), nullable=False)  # active, canceled, past_due, etc.
-    current_period_start = db.Column(db.DateTime(timezone=True))
-    current_period_end = db.Column(db.DateTime(timezone=True))
-    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-    
-    def __repr__(self):
-        return f'<Subscription {self.stripe_subscription_id}>'
 
 class Podcast(db.Model):
     __tablename__ = 'podcasts'

@@ -26,9 +26,6 @@ psycopg2-binary>=2.9.0
 celery>=5.3.0
 redis>=4.6.0
 
-# Payment processing
-stripe>=5.5.0
-
 # Email functionality (using requests for Mailgun API)
 
 # Production server

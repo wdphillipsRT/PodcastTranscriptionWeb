@@ -5,7 +5,6 @@ A comprehensive web application that automatically downloads, transcribes, and s
 ## ✨ Features
 
 - **🔐 User Authentication**: Secure user registration and login
-- **💳 Stripe Integration**: Monthly subscription payments  
 - **🎙️ Podcast Management**: Add podcasts via Apple Podcasts URLs or RSS feeds
 - **🤖 AI Transcription**: High-quality transcription using OpenAI Whisper API
 - **📝 AI Summarization**: Intelligent summaries with key takeaways and quotes
@@ -13,17 +12,17 @@ A comprehensive web application that automatically downloads, transcribes, and s
 - **🔄 Background Processing**: Async task processing with Celery and Redis
 - **☁️ Heroku Ready**: Production deployment configuration included
 - **📱 Responsive UI**: Mobile-friendly Bootstrap interface
+- **🆓 Free to Use**: No subscription or payment required
 
 ## 🏗️ Architecture
 
 - **Frontend**: Flask with Bootstrap 5 and vanilla JavaScript
 - **Backend**: Flask with SQLAlchemy ORM
-- **Database**: PostgreSQL (Heroku Postgres)
+- **Database**: PostgreSQL (Heroku Postgres) or SQLite (local development)
 - **Task Queue**: Celery with Redis
-- **Payments**: Stripe Checkout and webhooks
 - **Email**: Mailgun API
 - **AI Services**: OpenAI Whisper API (transcription) and GPT models (summarization)
-- **Deployment**: Heroku with multiple worker dynos
+- **Deployment**: Heroku with multiple worker dynos or Docker
 
 ## 🚀 Quick Start
 
@@ -110,28 +109,17 @@ A comprehensive web application that automatically downloads, transcribes, and s
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `DATABASE_URL` | PostgreSQL connection string | Yes |
+| `DATABASE_URL` | Database connection string | Yes |
 | `REDIS_URL` | Redis connection string | Yes |
 | `SECRET_KEY` | Flask secret key | Yes |
 | `OPENAI_API_KEY` | OpenAI API key | Yes |
-| `STRIPE_PUBLISHABLE_KEY` | Stripe publishable key | Yes |
-| `STRIPE_SECRET_KEY` | Stripe secret key | Yes |
-| `STRIPE_WEBHOOK_SECRET` | Stripe webhook secret | Yes |
-| `STRIPE_PRICE_ID` | Stripe subscription price ID | Yes |
-| `MAILGUN_API_KEY` | Mailgun API key | Yes |
-| `MAILGUN_DOMAIN` | Mailgun domain | Yes |
+| `MAILGUN_API_KEY` | Mailgun API key | No |
+| `MAILGUN_DOMAIN` | Mailgun domain | No |
 | `WHISPER_MODEL` | OpenAI Whisper model (whisper-1) | No (default: whisper-1) |
 | `OPENAI_MODEL` | OpenAI model for summaries | No (default: gpt-4o-mini) |
 | `MAX_CONCURRENT` | Max concurrent tasks | No (default: 2) |
 
-### Stripe Setup
-
-1. Create a Stripe account and get your API keys
-2. Create a subscription product and price in Stripe Dashboard
-3. Set up a webhook endpoint pointing to `/webhook/stripe`
-4. Configure webhook to listen for `checkout.session.completed` events
-
-### Mailgun Setup
+### Mailgun Setup (Optional)
 
 1. Create a Mailgun account and verify your domain
 2. Get your API key and domain from Mailgun dashboard
@@ -139,10 +127,9 @@ A comprehensive web application that automatically downloads, transcribes, and s
 
 ## 📊 Database Schema
 
-The application uses PostgreSQL with the following main tables:
+The application uses PostgreSQL or SQLite with the following main tables:
 
 - **users**: User accounts and authentication
-- **subscriptions**: Stripe subscription data
 - **podcasts**: User's podcast subscriptions
 - **episodes**: Individual podcast episodes
 - **processing_jobs**: Background task tracking
@@ -214,9 +201,8 @@ celery -A tasks.celery_app flower
 ## 🎯 Usage Flow
 
 1. **User Registration**: Create account with email/password
-2. **Subscription**: Pay via Stripe Checkout
-3. **Add Podcasts**: Paste Apple Podcasts or RSS feed URLs
-4. **Automatic Processing**: 
+2. **Add Podcasts**: Paste Apple Podcasts or RSS feed URLs
+3. **Automatic Processing**: 
    - System fetches latest episodes
    - Downloads and transcribes audio
    - Generates AI summaries

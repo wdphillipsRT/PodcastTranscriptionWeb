@@ -4,6 +4,7 @@ services:
   # PostgreSQL database
   db:
     image: postgres:15-alpine
+    restart: always
     environment:
       POSTGRES_DB: podcast_transcription
       POSTGRES_USER: postgres
@@ -21,6 +22,7 @@ services:
   # Redis for Celery
   redis:
     image: redis:7-alpine
+    restart: always
     ports:
       - "6379:6379"
     healthcheck:
@@ -32,6 +34,7 @@ services:
   # Flask web application
   web:
     build: .
+    restart: always
     ports:
       - "8005:8005"
     environment:
@@ -66,6 +69,7 @@ services:
   # Celery worker for background tasks
   celery:
     build: .
+    restart: always
     command: celery -A tasks worker --loglevel=info
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/podcast_transcription
