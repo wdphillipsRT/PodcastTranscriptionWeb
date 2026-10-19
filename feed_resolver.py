@@ -1,6 +1,6 @@
 """Bounded podcast feed resolution. No parser-initiated HTTP or hidden retries."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from hashlib import sha256
 import json
 import ipaddress
@@ -11,6 +11,9 @@ from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 import feedparser
 import requests
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 from config import Settings
 from ingestion_types import (IngestionError, SourceDescriptor, normalize_public_url,
@@ -38,6 +41,8 @@ _PUBLIC_AUTH = _PublicRequestAuth()
 
 def _public_address(value):
     address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.scope_id:
+        return False
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
         address = address.ipv4_mapped
     return address.is_global and not (address.is_multicast or address.is_unspecified
@@ -45,26 +50,115 @@ def _public_address(value):
 
 
 def _validate_destination(parts, resolver=None):
-    """Reject any non-public answer. Egress policy must also prevent rebinding.
-
-    Validation and requests' connection resolution are distinct operations; this
-    check does not claim to pin DNS or eliminate the DNS time-of-check window.
-    The resolver is replaceable so offline tests never perform real DNS queries.
-    """
+    """Reject any non-public answer and return one immutable socket destination."""
+    port = parts.port or (443 if parts.scheme == "https" else 80)
     try:
         try:
             address = ipaddress.ip_address(parts.hostname)
         except ValueError:
             resolver = resolver or socket.getaddrinfo
-            answers = resolver(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80),
+            answers = resolver(parts.hostname, port,
                 type=socket.SOCK_STREAM)
             if not answers or not all(_public_address(answer[4][0]) for answer in answers):
                 raise ValueError
         else:
             if not _public_address(str(address)):
                 raise ValueError
+            answers = [(socket.AF_INET6 if address.version == 6 else socket.AF_INET,
+                        socket.SOCK_STREAM, 6, "", (str(address), port))]
+        family, _, _, _, sockaddr = answers[0]
+        if family not in {socket.AF_INET, socket.AF_INET6}:
+            raise ValueError
+        # Rebuild numeric sockaddr: no resolver-supplied scope/flow/port overrides.
+        sockaddr = (str(ipaddress.ip_address(sockaddr[0])), port)
+        if family == socket.AF_INET6:
+            sockaddr += (0, 0)
+        return family, sockaddr
     except (OSError, ValueError):
         raise IngestionError("unsafe_destination") from None
+
+
+class _PinnedConnection:
+    """Only socket establishment differs; urllib3 still owns HTTP and TLS.
+
+    In particular the connection's host stays the URL hostname, so urllib3 sends
+    the original Host/SNI and verifies its certificate using the standard trust
+    store. No second getaddrinfo call, proxy, tunnel, or fallback is permitted.
+    """
+
+    def __init__(self, *args, destination, **kwargs):
+        self._destination = destination
+        super().__init__(*args, **kwargs)
+
+    def _new_conn(self):
+        family, sockaddr = self._destination
+        sock = None
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            for option in self.socket_options or ():
+                sock.setsockopt(*option)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as error:
+            if sock is not None:
+                sock.close()
+            if isinstance(error, socket.timeout):
+                raise ConnectTimeoutError(self, "public connection timed out") from None
+            raise NewConnectionError(self, "public connection failed") from None
+
+
+class _PinnedHTTPConnection(_PinnedConnection, HTTPConnection):
+    pass
+
+
+class _PinnedHTTPSConnection(_PinnedConnection, HTTPSConnection):
+    pass
+
+
+class _PinnedHTTPPool(HTTPConnectionPool):
+    ConnectionCls = _PinnedHTTPConnection
+
+
+class _PinnedHTTPSPool(HTTPSConnectionPool):
+    ConnectionCls = _PinnedHTTPSConnection
+
+
+class _PinnedAdapter(requests.adapters.HTTPAdapter):
+    def __init__(self, parts, destination):
+        super().__init__(max_retries=0)
+        self._parts, self._destination = parts, destination
+        self._pool = None
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        if proxies or verify is not True or cert or urlsplit(request.url).netloc != self._parts.netloc:
+            raise IngestionError("unsafe_destination")
+        host, options = self.build_connection_pool_key_attributes(request, verify, cert)
+        pool_type = _PinnedHTTPSPool if host["scheme"] == "https" else _PinnedHTTPPool
+        if host["scheme"] == "http":
+            options = {}
+        self._pool = pool_type(host["host"], host["port"],
+                               destination=self._destination, **options)
+        return self._pool
+
+    def close(self):
+        if self._pool is not None:
+            self._pool.close()
+        super().close()
+
+
+@contextmanager
+def _pinned_session(session, parts, destination):
+    # Retain the explicit offline adapter seam used by ingestion contract tests.
+    # Real Requests sessions always get an isolated, credential-free transport;
+    # caller cookies, proxies, custom adapters and disabled TLS cannot enter it.
+    if not isinstance(session, requests.sessions.Session):
+        yield session
+        return
+    with requests.Session() as client:
+        client.trust_env = False
+        client.mount(parts.scheme + "://", _PinnedAdapter(parts, destination))
+        yield client
 
 
 def _request_url(url, *, transient=False):
@@ -73,7 +167,6 @@ def _request_url(url, *, transient=False):
     parts = urlsplit(url)
     if parts.username is not None or parts.password is not None:
         raise IngestionError("invalid_url")
-    _validate_destination(parts)
     return url
 
 
@@ -81,27 +174,32 @@ def _request_url(url, *, transient=False):
 def http_response(session, method, url, settings, *, transient=False):
     """Follow bounded, validated redirects and close every response."""
     response = None
-    try:
-        for redirect in range(MAX_REDIRECTS + 1):
-            response = session.request(method, _request_url(url, transient=transient), stream=True,
-                allow_redirects=False,
-                auth=_PUBLIC_AUTH,
-                timeout=(settings.HTTP_CONNECT_TIMEOUT_SECONDS, settings.HTTP_READ_TIMEOUT_SECONDS),
-                headers={"User-Agent": "PodcastTranscriptionBot/1.0"})
-            if response.status_code not in {301, 302, 303, 307, 308}:
-                break
-            location = response.headers.get("Location")
-            response.close()
-            response = None
-            if not location or redirect == MAX_REDIRECTS:
-                raise IngestionError("redirect_failed")
-            url = urljoin(url, location)
-        yield response
-    except requests.RequestException:
-        raise IngestionError("http_failed") from None
-    finally:
-        if response is not None:
-            response.close()
+    with ExitStack() as transports:
+        try:
+            for redirect in range(MAX_REDIRECTS + 1):
+                url = _request_url(url, transient=transient)
+                parts = urlsplit(url)
+                destination = _validate_destination(parts)
+                client = transports.enter_context(_pinned_session(session, parts, destination))
+                response = client.request(method, url, stream=True,
+                    allow_redirects=False,
+                    auth=_PUBLIC_AUTH,
+                    timeout=(settings.HTTP_CONNECT_TIMEOUT_SECONDS, settings.HTTP_READ_TIMEOUT_SECONDS),
+                    headers={"User-Agent": "PodcastTranscriptionBot/1.0", "Host": parts.netloc})
+                if response.status_code not in {301, 302, 303, 307, 308}:
+                    break
+                location = response.headers.get("Location")
+                response.close()
+                response = None
+                if not location or redirect == MAX_REDIRECTS:
+                    raise IngestionError("redirect_failed")
+                url = urljoin(url, location)
+            yield response
+        except requests.RequestException:
+            raise IngestionError("http_failed") from None
+        finally:
+            if response is not None:
+                response.close()
 
 
 def bounded_chunks(response, maximum):
