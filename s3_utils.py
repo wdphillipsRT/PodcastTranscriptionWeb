@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 import re
 
@@ -178,6 +179,38 @@ class S3Manager:
         if not isinstance(content, str):
             raise StoragePermanentError("artifact body must be text")
         return self.upload_binary_content(content.encode("utf-8"), s3_key, content_type)
+
+    def put_content_addressed(self, content: bytes, s3_key: str,
+                              content_type: str = "application/json", *,
+                              address_sha256: str | None = None) -> str:
+        """Create once; conflicting writers must have exactly the same bytes.
+
+        An explicit address supports artifacts whose semantic digest excludes
+        their embedded digest field. The caller validates that artifact schema.
+        """
+        validate_artifact_key(s3_key)
+        self._content_type(content_type)
+        if not isinstance(content, bytes) or not content:
+            raise StoragePermanentError("artifact body must be nonempty bytes")
+        address = sha256(content).hexdigest() if address_sha256 is None else address_sha256
+        if (not isinstance(address, str) or re.fullmatch(r"[a-f0-9]{64}", address) is None
+                or s3_key.rsplit("/", 1)[1] != address + ".json"):
+            raise StoragePermanentError("invalid content address")
+        try:
+            response = self.s3_client.put_object(Bucket=self.bucket_name, Key=s3_key,
+                Body=content, ContentType=content_type, ServerSideEncryption="AES256", IfNoneMatch="*")
+            self._check_response(response)
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") not in {
+                    "PreconditionFailed", "412", "ConditionalRequestConflict"}:
+                _failure(error)
+            if self.get_bytes(s3_key, max_bytes=len(content)) != content:
+                raise StorageIntegrityError("immutable artifact conflict") from None
+        except StorageError:
+            raise
+        except Exception as error:
+            _failure(error)
+        return s3_key
 
     def upload_file(self, local_file_path, s3_key, content_type):
         validate_artifact_key(s3_key)

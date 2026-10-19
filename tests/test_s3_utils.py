@@ -279,3 +279,93 @@ def test_object_hash_stream_failure_closes_and_preserves_transient_category():
         function(KEY, max_bytes=10)
     assert "SECRET" not in str(caught.value)
     body.close.assert_called_once()
+
+
+@pytest.mark.parametrize("kind", ["classification", "policy", "learning"])
+def test_content_addressed_creation_is_private_and_conditional(kind):
+    storage, client = manager()
+    put = getattr(storage, "put_content_addressed", None)
+    assert callable(put), "conditional immutable artifact writer missing"
+    content = b'{"decisions":[]}'
+    key = storage.generate_s3_key("podcast", "episode", kind, sha256(content).hexdigest() + ".json")
+    client.put_object.return_value = {}
+    assert put(content, key) == key
+    client.put_object.assert_called_once_with(Bucket=BUCKET, Key=key, Body=content,
+        ContentType="application/json", ServerSideEncryption="AES256", IfNoneMatch="*")
+
+
+def test_content_addressed_semantic_digest_is_explicit_and_validated():
+    storage, client = manager()
+    put = getattr(storage, "put_content_addressed", None)
+    assert callable(put), "conditional immutable artifact writer missing"
+    key = "items/podcast/episode/policy/" + "a" * 64 + ".json"
+    client.put_object.return_value = {}
+    assert put(b"{}", key, address_sha256="a" * 64) == key
+    for digest in ("A" * 64, "../bad", True, "b" * 64):
+        with pytest.raises(s3_utils.StoragePermanentError):
+            put(b"{}", key, address_sha256=digest)
+    with pytest.raises(s3_utils.StoragePermanentError):
+        put(b"{}", key)
+    assert client.put_object.call_count == 1
+
+
+@pytest.mark.parametrize("code", ["PreconditionFailed", "412", "ConditionalRequestConflict"])
+def test_content_addressed_conflict_reuses_only_identical_bounded_bytes(code):
+    storage, client = manager()
+    put = getattr(storage, "put_content_addressed", None)
+    assert callable(put), "conditional immutable artifact writer missing"
+    content = b'{"a":1}'
+    key = "items/podcast/episode/classification/" + sha256(content).hexdigest() + ".json"
+    client.put_object.side_effect = ClientError({"Error": {"Code": code}}, "PutObject")
+    for existing in (content, b"short", content + b"!", b'{"a":2}'):
+        body = BytesIO(existing)
+        client.get_object.return_value = {"Body": body, "ContentLength": len(existing)}
+        if existing == content:
+            assert put(content, key) == key
+        else:
+            with pytest.raises(s3_utils.StorageIntegrityError):
+                put(content, key)
+        assert body.closed
+
+
+def test_content_addressed_missing_conflict_and_transport_failures_are_safe():
+    storage, client = manager()
+    put = getattr(storage, "put_content_addressed", None)
+    assert callable(put), "conditional immutable artifact writer missing"
+    content = b"{}"
+    key = "items/podcast/episode/classification/" + sha256(content).hexdigest() + ".json"
+    client.put_object.side_effect = ClientError({"Error": {"Code": "PreconditionFailed"}}, "PutObject")
+    client.get_object.side_effect = ClientError({"Error": {"Code": "NoSuchKey", "Message": "SECRET"}}, "GetObject")
+    with pytest.raises(s3_utils.StorageIntegrityError):
+        put(content, key)
+    for code, error in (("SlowDown", s3_utils.StorageTransientError), ("AccessDenied", s3_utils.StoragePermanentError)):
+        client.put_object.side_effect = ClientError({"Error": {"Code": code, "Message": "SECRET"}}, "PutObject")
+        with pytest.raises(error) as caught:
+            put(content, key)
+        assert "SECRET" not in str(caught.value)
+
+
+def test_concurrent_immutable_writers_create_once_and_reuse_identical_bytes():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+
+    storage, client = manager()
+    content = b'{"decisions":[]}'
+    key = "items/podcast/episode/classification/" + sha256(content).hexdigest() + ".json"
+    objects, writes, guard, started = {}, [], Lock(), Barrier(2)
+    def put(**kwargs):
+        assert kwargs["IfNoneMatch"] == "*"
+        started.wait(timeout=5)
+        with guard:
+            if kwargs["Key"] in objects:
+                raise ClientError({"Error": {"Code": "PreconditionFailed"}}, "PutObject")
+            objects[kwargs["Key"]] = kwargs["Body"]
+            writes.append(kwargs["Body"])
+        return {}
+    def get(**kwargs):
+        value = objects[kwargs["Key"]]
+        return {"Body": BytesIO(value), "ContentLength": len(value)}
+    client.put_object.side_effect, client.get_object.side_effect = put, get
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: storage.put_content_addressed(content, key), range(2)))
+    assert results == [key, key] and writes == [content] and objects == {key: content}
