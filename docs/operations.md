@@ -4,16 +4,21 @@
 
 Run commands from the repository root in a Bash SSH session. The only supported
 installation is `docker-compose.yml`: `postgres`, `redis`, `migrate`, `web`,
-`worker`, and `beat`. The `migrate` service exits successfully after applying
-schema migrations; the other five services stay running. Keep one worker
-service and one beat service unless a reviewed scaling change is made.
+`worker`, `beat`, and `classifier`. The `migrate` service exits successfully after
+applying schema migrations; the other six services stay running after credentials
+are configured. Keep one media worker, one classifier, and one beat service
+unless a reviewed scaling change is made. The classifier alone consumes the
+`classification` queue; the media worker consumes exactly
+`default,discovery,downloads,transcription`.
 
 Use a Linux host with Docker Engine, the Docker Compose v2 plugin, Git,
 Python 3 for secret generation, curl, and an editor. Allow enough disk for the
 database/images and RAM for PostgreSQL, two worker processes, and the worker's
-768 MiB temporary media filesystem. The image supplies Python 3.11, FFmpeg,
-yt-dlp, and Deno; no host media tools are needed. The host needs outbound HTTPS
-to AWS, Google/YouTube, Apple, public feed/media hosts, and image/package
+768 MiB temporary media filesystem, plus one classifier process and its 256 MiB
+temporary filesystem. The non-root image supplies Python 3.11, FFmpeg,
+yt-dlp, Deno, Node 22, and Claude Code 2.1.303; no host media tools are needed.
+The host needs outbound HTTPS
+to AWS, Anthropic, Google/YouTube, Apple, public feed/media hosts, and image/package
 registries. Amazon Transcribe usage and provider quotas can incur costs.
 
 The administrator owns the Cloudflare Tunnel and DNS configuration for
@@ -25,6 +30,167 @@ all host interfaces: the app trusts one forwarding proxy.
 
 Phase 1 supports ingestion and transcription. Claude learning bundles and
 delivery to Lamad, Ebenezer, and Agent Factory are deferred to later phases.
+
+## Filtered learning and delivery inputs
+
+`learning_projection.py` provides the single transcript input gateway for
+future Phase 2 bundle extraction and Phase 3 Lamad, Ebenezer, and Agent Factory
+publishers. This task implements that boundary; it does not create learning
+bundles or publish to any of those systems. Downstream code must not read
+`ContentItem.segments_s3_key` or `transcript_s3_key` directly. A repository
+contract test scans `learning_*.py`, `publishers/`, and `integrations/` for
+direct artifact-field references outside the gateway.
+
+Use committed item/revision inputs and the existing private storage client:
+
+```python
+from learning_projection import load_active_learning_projection
+
+projection = load_active_learning_projection(
+    session=db.session, storage=storage, item_id=item_id,
+)
+segment = projection.assert_citable(segment_id)
+```
+
+The immutable result has the canonical `learning-transcript-projection/v1`
+schema and exact canonical editorial records, including their IDs, hashes,
+timings, text, and citations. It exposes no storage client, full transcript,
+or raw policy. Only `editorial` is eligible; `uncertain` is always excluded.
+The method and the module's `assert_citable(projection, segment_id)` both
+reject excluded, uncertain, unknown, and promotional references with the same
+safe exception, without disclosing whether an excluded segment exists.
+
+Loading requires a completed item and its active completed classification
+revision matching the current transcript and canonical-object hashes. All
+objects are read with the existing byte limit. Canonical JSON bytes, schemas,
+content-addressed keys, embedded hashes, item/source ownership and membership,
+classifier provenance, policy lineage, revision totals, and exact editorial
+projection equality are verified. Policy/projection digests follow their
+canonical schema convention: each hashes the artifact without its own digest
+field. The canonical transcript object also has its full stored-byte hash.
+After storage reads, the gateway rechecks the active revision, transcript
+identity, source membership, and newer revisions before returning.
+
+The default `require_latest=True` blocks new bundle construction while any
+higher revision is pending, retrying, running, or failed, or a higher completed
+revision has not become the active pointer. A higher superseded attempt does
+not block the valid active revision. Previously published bundles may remain
+active until replacement validation; loading does not unpublish them.
+`require_latest=False` is reserved for explicit inspection of the still-active
+prior result. It never bypasses artifact checks and must not be used for new
+bundle extraction or delivery.
+
+Any missing, corrupt, stale, failed, or superseded active input raises
+`LearningProjectionUnavailable` with the message `learning projection unavailable`. Consumers
+must stop extraction/delivery and use the existing classification recovery
+workflow; they must never retry with a full/raw transcript. The gateway makes
+no database writes, commits no caller changes, and logs no transcript text,
+artifact keys, or provider diagnostics. Its short database read sessions end
+before storage I/O. A returned DTO is a snapshot, so future publishers must
+also validate their bundle/revision identity when activating a replacement.
+
+Purpose-specific promotional research is an explicit separate path:
+
+```python
+from learning_projection import load_promotional_projection
+
+promotion = load_promotional_projection(
+    session=db.session, storage=storage, item_id=item_id,
+    labels=("self_promotion", "cross_promotion"),
+    purpose="asp-50-marketing-research",
+)
+```
+
+Purpose is a nonempty policy-valid slug (up to 128 characters); labels must
+contain only `self_promotion` and/or `cross_promotion`, without duplicates.
+This returns the distinct immutable `promotional-analysis-projection/v1`
+`PromotionalProjection`, which is rejected by the general citation API. It
+reconstructs only the requested promotion records on demand from the
+hash-validated canonical transcript and active policy, always with latest
+revision gating. No promotional artifact is stored in the revision, and the
+stored learning projection is not read for this research path. Neither path
+loads the full text artifact as a fallback.
+
+## Commercial acceptance, evaluation, and observations
+
+Run the offline commercial gate before promoting a classification policy:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_commercial_classification_smoke.py tests/eval/test_commercial_policy_eval.py
+.venv/bin/python -m pytest -q
+.venv/bin/python -m compileall -q .
+git diff --check
+```
+
+No live Claude, authentication, AWS, RSS, YouTube, Redis, or broker is needed.
+The smoke test injects only external storage/classifier/broker/provider boundaries
+and exercises real final-stage hooks, SQLite outboxes, worker checkpoints, artifact
+validation, owner review routes, correction sweeps, and filtered loaders. It covers
+both podcast and YouTube completed canonical items without reacquiring media.
+The crash case kills the task after block 1 commits and before publication, then
+reconciles/replays a multi-block revision without another paid call for block 1.
+
+All ten section-13 invariants are checked at their implemented boundaries:
+canonical bytes/IDs/times/hashes remain unchanged; coverage is exact; citations
+require editorial IDs; general payloads omit all excluded/uncertain content;
+promotional research has a separate type rejected by the citation gateway;
+rules stay source-scoped; corrections retain prior artifacts and revision lineage;
+retries select one shared active revision; failures never return a full transcript;
+and backlog classification never invokes media/providers. Summaries, teachings,
+claims, evidence indexes, embeddings, immutable bundles, and actual Lamad,
+Ebenezer, and Agent Factory publishers are deferred to Phases 2/3. Their eventual
+release gates must extend these assertions through actual extraction and delivery.
+The authorized owner review page intentionally reads canonical segments with a
+validated policy; it is an audit interface, not a general-learning consumer.
+
+`tests/fixtures/commercial-eval.json` is wholly synthetic, with independent truth
+labels and supplied classifier outputs for every label, adjacent/repeated ads,
+editorial introductions/teaching calls to action/closing summaries, and exact
+confidence thresholds and ambiguous boundaries. The deterministic harness builds
+real policies and projections; it measures policy behavior, not live-model accuracy.
+Metrics are nested by numeric source ID and label. Precision is correct predicted
+segments / predicted segments; recall is correct predicted segments / truth
+segments. False-exclusion rate is truth-editorial segments withheld (including
+uncertain) / truth-editorial segments. Uncertain-duration rate is uncertain segment
+milliseconds / all segment milliseconds (gaps are excluded). A boundary is an
+adjacent-segment label transition; accuracy uses matching boundaries / the union
+of truth and predicted boundaries, also computed per label for its incident edges.
+The source report retains truth/predicted boundary counts for inspection.
+Reports contain only integer numerators/denominators and label/source identifiers;
+divide counts to obtain rates and treat a zero denominator as undefined.
+The release fixture allows zero editorial false exclusions. A policy-version
+change fails until `expected_metrics.policy_version` and reviewed expected metrics
+are updated together. Mutation tests check imperfect metrics and prevent changing
+expected counts from accepting an editorial false exclusion.
+
+Any later opt-in, administrator-reviewed real evaluation corpus must live only
+under the Git-ignored `.runtime/eval/` directory with restricted local access.
+Never commit its transcripts, annotations, classifier outputs, prompts, or
+per-example results; never print or log them, including on test failure. Export
+only aggregate counts by label/source ID. Keep real evaluation opt-in and separate
+from the synthetic default suite; do not substitute private data into Git fixtures.
+
+Task observations use the `tasks` logger at INFO with fixed event messages
+`commercial_classification_prepare`, `_block`, `_finalize`, `_failed`, and
+`_source_rule`. Configure a structured log handler to serialize only the
+`commercial_event` extra field and the fixed event name. That field allows only
+`item_id`, `source_id`, `revision_id`, `policy_version`, `stage_duration_ms`,
+`label_counts`, `duration_ratios`, `review_required`, `retry_category`, and
+`rule_match_counts`. The encoder takes integer item/source/revision identities,
+uses the running code's policy version, and omits unknown retry categories and
+unexpected count fields. Finalization counts use `editorial`, aggregated `excluded`
+(the four noneditorial/nonuncertain labels), and `uncertain`; duration ratios use
+`included`, `excluded`, and `uncertain`. Source-rule counts are cumulative `scanned`
+and `matched` (items queued by that sweep); its revision ID identifies the
+originating reviewed policy. Stage duration uses a monotonic clock. Events can
+repeat on replay and are observations, not a billing ledger or activation signal.
+Use durable revision/block state for costs and completion. Log-sink failure cannot
+fail an otherwise committed checkpoint.
+
+Never add transcript bodies, segment IDs, prompts, model output, source URLs,
+private artifact keys, hashes, credentials, provider diagnostics, exception text,
+or tracebacks to these events. The acceptance tests inspect log records and
+structured fields against the allowlist and synthetic leak sentinels.
 
 ## Credentials and environment
 
@@ -117,21 +283,55 @@ use. HTTP curl health checks need no login cookie.
 
 ## Build, migrate, start, and provision the administrator
 
+Build and migrate before authenticating the isolated classifier:
+
 ```bash
 docker compose version
 docker compose config --quiet
 docker compose build
 docker compose up -d --wait postgres redis
 docker compose run --rm --no-deps migrate
+```
+
+Create the dedicated writable Claude configuration directory and authenticate
+from the SSH terminal using the device/browser flow:
+
+```bash
+install -d -m 700 .runtime/claude
+docker compose run --rm --entrypoint claude classifier auth login
+docker compose run --rm --entrypoint claude classifier auth status --text
+```
+
+Open the displayed browser/device URL on another computer if necessary and
+complete the terminal prompts. These commands bypass the startup guard only
+to perform authentication. Credentials remain in `.runtime/claude`, which is
+ignored by Git and excluded from the Docker build context; they are never copied
+into the image or repository. Do not share auth output or commit credentials.
+The container runs as UID/GID 1000:1000: this private directory must be owned
+by that identity and writable by it. If the SSH user has a different UID/GID,
+have the host administrator set ownership to 1000:1000 while retaining mode 700.
+For a different protected host directory, set `CLAUDE_CONFIG_HOST_PATH` in the
+Compose environment and create that exact directory with the same ownership
+and permissions. Only `classifier` mounts it at `/claude-config`.
+
+Then start the services:
+
+```bash
 docker compose up -d
 docker compose ps -a
-docker compose logs --tail=100 migrate web worker beat
+docker compose logs --tail=100 migrate web worker beat classifier
 ```
 
 `migrate` runs `flask --app app:create_app db upgrade`. Compose also gates
 application startup on a successful migration. The web and worker entrypoints
 check the database schema, Redis, S3, Transcribe, YouTube API, yt-dlp, and Deno
-before starting; beat checks database, Redis, and its schedule. If a provider
+before starting; beat checks database, Redis, and its schedule. Classifier
+startup pins `PYTHONPATH=/app`, requires the exact configured Claude version
+(`CLAUDE_EXPECTED_VERSION=2.1.303`), silently checks `claude auth status`, and
+checks database, Redis, and S3 before executing Celery. Authentication or version
+failure prevents the classification consumer from starting and emits only a
+safe error. `DISABLE_UPDATES=1` prevents runtime updates; classifier also sets
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. If a provider
 or credential fails, fix it and rerun `docker compose up -d`. Inspect logs and
 readiness as described below; never bypass these checks to hide a failure.
 
@@ -193,7 +393,7 @@ docker compose ps -a
 curl --fail --show-error http://localhost:8005/healthz
 curl --show-error --max-time 110 --write-out '\nHTTP %{http_code}\n' http://localhost:8005/readyz
 docker compose exec web flask --app app:create_app system check
-docker compose logs --tail=200 web worker beat
+docker compose logs --tail=200 web worker beat classifier
 docker compose logs --follow --tail=100 worker
 ```
 
@@ -207,6 +407,27 @@ fails. A targeted check is:
 ```bash
 docker compose exec web flask --app app:create_app system check --services database,redis,s3,transcribe,youtube,yt_dlp,deno,worker,beat
 ```
+
+The web `/readyz` deliberately does not probe local Claude authentication:
+web has no Claude credential mount. Web, migrations, beat, and the media worker
+remain operational without that directory or Claude login. The classifier's
+startup guard protects its own consumer; web readiness alone does not establish
+classifier health. Verify the separate service and its named worker:
+
+```bash
+docker compose ps -a classifier
+docker compose logs --tail=100 classifier
+docker compose exec classifier celery -A tasks.celery_app inspect --timeout 5 --destination "classifier@$(docker compose exec -T classifier hostname)" ping
+docker compose exec classifier claude auth status --text
+docker compose exec classifier flask --app app:create_app system check --services database,redis,s3
+```
+
+The inspect destination must be the classifier hostname shown in its startup
+logs (`classifier@<container-hostname>`); it prevents a media-worker reply from
+being mistaken for classifier health. Inspect auth output only in a private
+terminal. If credentials expire, stop `classifier`, repeat the dedicated
+`auth login`/`auth status --text` commands above, then run
+`docker compose up -d classifier`. Other services do not need Claude credentials.
 
 The `beat` probe validates the configured hourly task; it is not a live
 scheduler heartbeat. Confirm that the beat container is running and its logs
@@ -329,7 +550,7 @@ provider evidence automatically. Record only status, origin, hashes, row counts,
 and job success privately; never copy transcript bodies, keys, signed URLs, or
 credentials into tickets, terminal output, or shared logs.
 
-After live checks, verify the actual six-service stack with the health/readiness
+After live checks, verify the actual seven-service stack with the health/readiness
 commands above. Add the selected video, RSS, channel, and playlist through the
 authenticated UI, confirm origin labels and backfill progress, and replay
 discovery. Inspect UI and local logs privately for any credential, private key,
@@ -344,10 +565,20 @@ For a disposable Docker acceptance run, first inspect `docker compose ls`,
 that replaces each app service's `env_file` with that path and uses a unique
 image tag; `--env-file` alone does not replace the service-level `.env` reference.
 Use the same explicit project name, files, and env file for every command.
-Use no existing application volume or administrator. Verify migration
-`0001_media_foundation`, provision a temporary sole admin, record all eight table
-counts, perform ordinary project `down`/`up` without volume deletion, then compare
-counts. Only web may publish loopback port 8005; if occupied, document an isolated
+Use no existing application volume, Claude credential directory, or administrator.
+Override the classifier's credential bind with a unique private disposable host
+directory (owned by 1000:1000, mode 700), even when testing its unauthenticated
+failure. Never reuse the deployed Claude mount. Verify migration head
+`0002_commercial_classification`, provision a temporary sole admin, and record
+all thirteen table counts: `admins`, `content_sources`, `content_items`,
+`source_items`, `backfill_requests`, `discovery_runs`, `discovery_candidates`,
+`processing_jobs`, `classification_revisions`, `classification_blocks`,
+`segment_overrides`, `source_classification_rules`, and `classification_sweeps`
+(plus Alembic's `alembic_version` metadata table). Perform ordinary project
+`down`/`up` without volume deletion, then compare counts. Without Claude
+authentication, confirm only the classifier fails closed and the media/web
+services remain independent; authenticated classification is a separately
+authorized live check. Only web may publish loopback port 8005; if occupied, document an isolated
 loopback port override. Full readiness requires real configured providers. Clean
 up only resources carrying that exact disposable project label and its temporary
 files. Never remove volumes from the deployed application to run this gate.
@@ -356,10 +587,17 @@ files. Never remove volumes from the deployed application to run this gate.
 
 Record the current Git revision and take a database backup before upgrading.
 Review release notes and security changes before altering dependencies. Current
-pins are `yt-dlp[default]==2026.8.19` in `requirements.txt` and Deno `2.9.7`
-in `Dockerfile`; yt-dlp reports `2026.08.19` at runtime. Version expectations
+pins are `yt-dlp[default]==2026.8.19` in `requirements.txt`, Deno `2.9.7`, and
+`@anthropic-ai/claude-code@2.1.303` in `Dockerfile`; yt-dlp reports `2026.08.19`
+and Claude reports exactly `2.1.303 (Claude Code)` at runtime. The Node 22
+Bookworm build stage installs Claude; the final image copies only Node and
+the installed Claude package, without npm. Claude 2.1.303 installs its native
+launcher at `bin/claude.exe`; the final image symlinks that installed executable.
+Both build stages validate the exact Claude version, including as UID/GID
+1000:1000 in the final Python runtime. Version expectations
 also live in `config.py`, `.env.example`, `youtube_media.py`,
-`system_checks.py`, and their tests. Update all applicable pins, runtime checks,
+`system_checks.py`, `scripts/start-classifier.sh`, `claude_classifier.py`, and
+their tests. Update all applicable pins, runtime checks,
 and the deployed `.env` together in a reviewed change. Do not enable runtime
 self-updates, plugins, remote components, external configs, or browser cookies.
 
@@ -374,7 +612,7 @@ docker compose build --pull
 On the deployed checkout, pause writers, migrate the new image, then restart:
 
 ```bash
-docker compose stop web worker beat
+docker compose stop web worker beat classifier
 docker compose run --rm --no-deps migrate
 docker compose up -d
 docker compose ps -a
@@ -428,7 +666,7 @@ exec; its environment provides the internal database identity:
   esac
   mkdir -p -- "$backup_dir"
   chmod 700 -- "$backup_dir"
-  docker compose stop web worker beat
+  docker compose stop web worker beat classifier
   backup_file="$(mktemp "$backup_dir/postgres-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX.dump")"
   if docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' > "$backup_file" && docker compose exec -T postgres pg_restore --list < "$backup_file" > /dev/null; then
     chmod 600 -- "$backup_file"
@@ -454,7 +692,7 @@ select a known successful dump, inspect its archive, and only then run the
 restore command. No volume deletion is required:
 
 ```bash
-docker compose stop web worker beat
+docker compose stop web worker beat classifier
 docker compose up -d --wait postgres redis
 read -r -p 'Path to the reviewed PostgreSQL dump: ' restore_file
 if [ -f "$restore_file" ]; then
@@ -473,7 +711,7 @@ fi
 ```
 
 Proceed only if restore exits successfully. Redis may still contain messages
-from the replaced database. With web, worker, and beat stopped, renew Redis's
+from the replaced database. With web, worker, beat, and classifier stopped, renew Redis's
 anonymous volume, explicitly clear all Redis databases, and verify empty state
 before migrations or writers restart. This deliberately discards stale broker,
 result, and rate-limit state. Ordinary container recreation can retain the
@@ -484,7 +722,7 @@ in a subshell that stops on failure; do not resume writers if any step fails:
 unset restore_file
 (
   set -euo pipefail
-  docker compose stop web worker beat
+  docker compose stop web worker beat classifier
   docker compose up -d --force-recreate --renew-anon-volumes --wait redis
   test "$(docker compose exec -T redis redis-cli FLUSHALL)" = OK
   test "$(docker compose exec -T redis redis-cli DBSIZE)" = 0
@@ -516,7 +754,7 @@ credentials. `docker compose restart` alone does not load new environment values
 
 ```bash
 chmod 600 .env
-docker compose up -d --force-recreate web worker beat
+docker compose up -d --force-recreate web worker beat classifier
 docker compose exec web flask --app app:create_app system check
 ```
 
@@ -524,7 +762,7 @@ For PostgreSQL password rotation, stop writers and use the interactive psql
 password command so the new password does not enter shell history or SQL text:
 
 ```bash
-docker compose stop web worker beat
+docker compose stop web worker beat classifier
 docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 ```
 
@@ -537,7 +775,7 @@ change an initialized database role. Then run:
 chmod 600 .env
 docker compose up -d --force-recreate --wait postgres
 docker compose run --rm --no-deps migrate
-docker compose up -d --force-recreate web worker beat
+docker compose up -d --force-recreate web worker beat classifier
 docker compose exec web flask --app app:create_app system check
 ```
 

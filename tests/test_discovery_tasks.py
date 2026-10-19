@@ -21,7 +21,10 @@ def test_celery_configuration_is_json_utc_bounded_and_routes_named_queues():
     assert config.worker_prefetch_multiplier == 1 and config.broker_connection_retry_on_startup
     assert 0 < config.task_soft_time_limit < config.task_time_limit
     assert config.result_expires > 0
-    assert {q.name for q in config.task_queues} == {"default", "discovery", "downloads", "transcription"}
+    assert {q.name for q in config.task_queues} == {"default", "discovery", "downloads", "transcription", "classification"}
+    for name in ("classify_item", "reconcile_classifications", "scan_source_rule"):
+        assert config.task_routes["tasks." + name]["queue"] == "classification"
+    assert config.beat_schedule["classification-reconciliation"]["task"] == "tasks.reconcile_classifications"
     assert config.task_routes["tasks.discover_source"]["queue"] == "discovery"
     assert config.task_routes["tasks.process_item"]["queue"] == "downloads"
     assert any(value["task"] == "tasks.check_all_sources" and value["schedule"] == 3600 for value in config.beat_schedule.values())
@@ -57,6 +60,7 @@ def test_dispatch_messages_only_contain_integer_ids_and_stable_task_identity(mon
 def test_worker_import_never_loads_app_settings_or_connects_to_services():
     script = textwrap.dedent("""\
         import importlib
+        import sys
         import socket
         from unittest.mock import patch
         from flask import Flask
@@ -71,6 +75,7 @@ def test_worker_import_never_loads_app_settings_or_connects_to_services():
              patch.object(socket.socket, 'connect', forbidden), \\
              patch.object(Engine, 'connect', forbidden):
             tasks = importlib.import_module('tasks')
+            assert 'claude_classifier' not in sys.modules
             importlib.import_module('discovery_service')
             assert tasks.celery_app.main == 'podcast_transcription'
     """)

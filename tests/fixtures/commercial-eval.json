@@ -1,0 +1,34 @@
+{
+  "synthetic_only": true,
+  "sources": [{"source_id": 101, "platform": "podcast"}, {"source_id": 202, "platform": "youtube"}],
+  "cases": [
+    {"text": "Welcome to this synthetic lesson about rivers.", "truth": "editorial", "output": "editorial", "confidence": 1.0, "duration": 1},
+    {"text": "Our fictional sponsor offers a trial with code IMAGINARY.", "truth": "paid_commercial", "output": "paid_commercial", "confidence": 1.0, "duration": 2},
+    {"text": "Our fictional sponsor offers a trial with code IMAGINARY.", "truth": "paid_commercial", "output": "paid_commercial", "confidence": 1.0, "duration": 3},
+    {"text": "Returning to the lesson, river sediment moves downstream.", "truth": "editorial", "output": "editorial", "confidence": 1.0, "duration": 4},
+    {"text": "Purchase my imaginary book and course about imaginary boats.", "truth": "self_promotion", "output": "self_promotion", "confidence": 1.0, "duration": 5},
+    {"text": "Join my fictional newsletter, product service, and workshop event.", "truth": "self_promotion", "output": "self_promotion", "confidence": 1.0, "duration": 6},
+    {"text": "Listen to another fictional podcast on our imaginary network.", "truth": "cross_promotion", "output": "cross_promotion", "confidence": 1.0, "duration": 7},
+    {"text": "Subscribe to this fictional channel for episode reminders.", "truth": "housekeeping", "output": "housekeeping", "confidence": 1.0, "duration": 8},
+    {"text": "A routine announcement: our imaginary schedule moves to Tuesday.", "truth": "housekeeping", "output": "housekeeping", "confidence": 1.0, "duration": 9},
+    {"text": "A synthetic transition could be a sponsor or a lesson example.", "truth": "uncertain", "output": "paid_commercial", "confidence": 0.949, "duration": 10},
+    {"text": "A synthetic incomplete return leaves the boundary ambiguous.", "truth": "uncertain", "output": "editorial", "confidence": 0.799, "duration": 11},
+    {"text": "At the editorial threshold, observe the riverbank layers.", "truth": "editorial", "output": "editorial", "confidence": 0.8, "duration": 12},
+    {"text": "At the exclusion threshold, use an imaginary affiliate discount.", "truth": "paid_commercial", "output": "paid_commercial", "confidence": 0.95, "duration": 13},
+    {"text": "Teaching exercise: draw a river bend and compare your prediction.", "truth": "editorial", "output": "editorial", "confidence": 1.0, "duration": 14},
+    {"text": "Closing summary: erosion and deposition shape river bends.", "truth": "editorial", "output": "editorial", "confidence": 1.0, "duration": 15}
+  ],
+  "expected_metrics": {
+    "policy_version": "commercial-segment-policy/v1",
+    "per_source": {
+      "label_counts": {"editorial": 5, "paid_commercial": 3, "self_promotion": 2, "cross_promotion": 1, "housekeeping": 2, "uncertain": 2},
+      "editorial_segments": 5,
+      "editorial_false_exclusions": 0,
+      "total_milliseconds": 120000,
+      "uncertain_milliseconds": 21000,
+      "boundary_matches": 9,
+      "boundary_truth": 9,
+      "boundary_predicted": 9
+    }
+  }
+}

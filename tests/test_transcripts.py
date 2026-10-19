@@ -235,3 +235,71 @@ def test_podcast_citations_preserve_milliseconds_without_exponent_or_rounding(st
     data["results"]["items"] = [{"type": "pronunciation", "start_time": str(start), "end_time": str(end), "alternatives": [{"content": "Word."}]}]
     result = module().normalize_amazon_transcribe(data, canonical_url="https://podcasts.example/episode", **{**METADATA, "platform": "podcast", "external_id": "episode-123"})
     assert result.segments[0].citation == f"https://podcasts.example/episode#t={expected}"
+
+
+def parse_stored(raw, transcript, **updates):
+    expectations = dict(expected_item_id=transcript.item_id,
+                        expected_transcript_sha256=transcript.transcript_sha256,
+                        expected_segments_sha256=sha256(raw.encode() if isinstance(raw, str) else raw).hexdigest())
+    return module().parse_canonical_transcript(raw, **{**expectations, **updates})
+
+
+def test_public_parser_round_trips_exact_stored_bytes_and_optional_hashes():
+    transcript = module().normalize_vtt(VTT, origin="creator_caption", **METADATA)
+    for raw in (transcript.to_json(), transcript.to_json().encode()):
+        parsed = parse_stored(raw, transcript)
+        assert parsed == transcript
+        assert parsed.to_json() == transcript.to_json()
+    assert parse_stored(transcript.to_json(), transcript, expected_segments_sha256=None,
+                        expected_transcript_sha256=None) == transcript
+
+
+@pytest.mark.parametrize("updates", [
+    {"expected_item_id": 8}, {"expected_item_id": True},
+    {"expected_transcript_sha256": "a" * 64}, {"expected_segments_sha256": "b" * 64},
+    {"expected_transcript_sha256": "bad"}, {"expected_segments_sha256": False},
+])
+def test_public_parser_rejects_mismatched_expected_lineage(updates):
+    transcript = module().normalize_vtt(VTT, origin="creator_caption", **METADATA)
+    with pytest.raises(module().TranscriptValidationError):
+        parse_stored(transcript.to_json(), transcript, **updates)
+
+
+@pytest.mark.parametrize("damage", ["unknown", "segment_unknown", "bool_time", "string_time", "nan", "duplicate_id", "text", "schema", "hash", "private", "oversized"])
+def test_public_parser_rejects_invalid_stored_contract(damage):
+    transcript = module().normalize_vtt(VTT, origin="creator_caption", **METADATA)
+    data = transcript.to_dict()
+    if damage == "unknown":
+        data["extra"] = "ignored"
+    elif damage == "segment_unknown":
+        data["segments"][0]["extra"] = "ignored"
+    elif damage in {"bool_time", "string_time", "nan"}:
+        data["segments"][0]["start"] = {"bool_time": True, "string_time": "1.2", "nan": float("nan")}[damage]
+    elif damage == "duplicate_id":
+        data["segments"][1] = data["segments"][0]
+    elif damage == "text":
+        data["segments"][0]["text"] = "tampered"
+    elif damage == "private":
+        data["segments"][0]["citation"] = "s3://private/secret"
+    elif damage == "oversized":
+        data["provider_version"] = "x" * 129
+    else:
+        data["schema" if damage == "schema" else "transcript_sha256"] = "invalid"
+    raw = json.dumps(data)
+    with pytest.raises(module().TranscriptValidationError):
+        parse_stored(raw, transcript)
+
+
+@pytest.mark.parametrize("raw", [b"SECRET", b"\xff", "null", "[]", "1", '{"schema":1,"schema":2}'])
+def test_public_parser_always_raises_safe_validation_error(raw):
+    with pytest.raises(module().TranscriptValidationError) as caught:
+        module().parse_canonical_transcript(raw, expected_item_id=7,
+                                           expected_transcript_sha256=None, expected_segments_sha256=None)
+    assert "SECRET" not in str(caught.value)
+
+
+def test_public_parser_rejects_valid_json_with_noncanonical_storage_bytes():
+    transcript = module().normalize_vtt(VTT, origin="creator_caption", **METADATA)
+    for raw in (json.dumps(transcript.to_dict()), transcript.to_json() + "\n"):
+        with pytest.raises(module().TranscriptValidationError):
+            parse_stored(raw, transcript)

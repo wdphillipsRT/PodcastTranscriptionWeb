@@ -162,6 +162,145 @@ def drain(pipeline):
         getattr(tasks, name).run(identity)
 
 
+def test_terminal_stage_atomically_creates_revision_and_releases_lock_before_publish(pipeline, app, monkeypatch):
+    from models import ClassificationRevision
+    import sqlalchemy as sa
+    row = pipeline.item()
+    app.config["CLASSIFICATION_ENABLED"] = True
+    item_id = row.id
+    observed = []
+    def send(name, *, args, **options):
+        assert name == "tasks.classify_item" and args[1:] == ["prepare", None]
+        with tasks._item_lock(item_id) as acquired:
+            assert acquired
+        assert not db.session().in_transaction()
+        with db.engine.connect() as connection:
+            assert connection.scalar(sa.select(ContentItem.status).where(ContentItem.id == item_id)) == "completed"
+            assert connection.scalar(sa.select(ProcessingJob.state).where(ProcessingJob.item_id == item_id,
+                ProcessingJob.stage == "transcribe")) == "completed"
+            assert connection.scalar(sa.select(ClassificationRevision.error_category).where(
+                ClassificationRevision.id == args[0])) == "dispatch_pending"
+        observed.append(args)
+    monkeypatch.setattr(tasks.celery_app, "send_task", send)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert len(observed) == 1 and ClassificationRevision.query.count() == 1
+    tasks.process_item.run(row.id)
+    assert ClassificationRevision.query.count() == 1
+
+
+@pytest.mark.parametrize("failure_stage", ["prepare", "insert"])
+def test_classification_hook_failure_never_fails_valid_transcript(pipeline, monkeypatch, failure_stage):
+    row = pipeline.item()
+    import classification_service
+    method = "prepare_revision_request" if failure_stage == "prepare" else "ensure_revision"
+    def fail(*args, **kwargs):
+        raise RuntimeError("private classification error")
+    monkeypatch.setattr(classification_service.ClassificationService, method, fail)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert row.status == "completed" and row.error_category is None
+    assert ProcessingJob.query.filter_by(stage="transcribe").one().state == "completed"
+
+
+def test_disabled_completion_persists_revision_before_item_completed(pipeline, monkeypatch):
+    from models import ClassificationRevision
+    import classification_service
+    row = pipeline.item()
+    original = classification_service.ClassificationService.ensure_revision
+    observed = []
+    def insert(service, identity, reason, **kwargs):
+        assert kwargs["commit"] is False
+        assert db.session.get(ContentItem, identity).status == "transcribing"
+        assert ProcessingJob.query.filter_by(item_id=identity, stage="transcribe").one().state == "running"
+        result = original(service, identity, reason, **kwargs)
+        observed.append(result)
+        return result
+    monkeypatch.setattr(classification_service.ClassificationService, "ensure_revision", insert)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert len(observed) == 1
+    revision = ClassificationRevision.query.one()
+    assert revision.state == "pending" and revision.error_category == "dispatch_pending"
+
+
+def test_classification_request_preparation_has_committed_canonical_refs_without_transaction(pipeline, monkeypatch):
+    import classification_service
+    import sqlalchemy as sa
+    row = pipeline.item()
+    original = classification_service.ClassificationService.prepare_revision_request
+    observed = []
+    def prepare(service, identity, **kwargs):
+        observed.append(not db.session().in_transaction())
+        with db.engine.connect() as connection:
+            state = connection.execute(sa.select(ContentItem.status, ContentItem.segments_s3_key).where(
+                ContentItem.id == identity)).one()
+            assert state.status == "transcribing" and state.segments_s3_key
+            assert connection.scalar(sa.select(ProcessingJob.state).where(ProcessingJob.item_id == identity,
+                ProcessingJob.stage == "transcribe")) == "running"
+        return original(service, identity, **kwargs)
+    monkeypatch.setattr(classification_service.ClassificationService, "prepare_revision_request", prepare)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert observed == [True]
+
+
+@pytest.mark.parametrize("failure", ["revision_reload", "dispatch_decode", "dispatch_commit"])
+def test_post_completion_classification_failure_cannot_downgrade_media(pipeline, monkeypatch, failure):
+    import classification_service
+    import sqlalchemy as sa
+    from models import ClassificationRevision
+    row = pipeline.item()
+    item_id = row.id
+    original_ensure = classification_service.ClassificationService.ensure_revision
+    original_commit, original_get = db.session.commit, db.session.get
+    original_dispatch = tasks._revision_dispatch
+    checkpoint = {"inserted": False, "committed": False, "failed": False}
+
+    def ensure(*args, **kwargs):
+        identity = original_ensure(*args, **kwargs)
+        checkpoint["inserted"] = True
+        return identity
+
+    def fail_once():
+        checkpoint["failed"] = True
+        raise RuntimeError("private classification handoff failure")
+
+    def commit():
+        if checkpoint["committed"] and failure == "dispatch_commit" and not checkpoint["failed"]:
+            fail_once()
+        original_commit()
+        if checkpoint["inserted"]:
+            checkpoint["committed"] = True
+
+    def get(model, *args, **kwargs):
+        if (model is ClassificationRevision and checkpoint["committed"]
+                and failure == "revision_reload" and not checkpoint["failed"]):
+            fail_once()
+        return original_get(model, *args, **kwargs)
+
+    def dispatch(revision):
+        assert checkpoint["committed"]
+        if failure == "dispatch_decode" and not checkpoint["failed"]:
+            fail_once()
+        return original_dispatch(revision)
+
+    monkeypatch.setattr(classification_service.ClassificationService, "ensure_revision", ensure)
+    monkeypatch.setattr(db.session, "commit", commit)
+    monkeypatch.setattr(db.session, "get", get)
+    monkeypatch.setattr(tasks, "_revision_dispatch", dispatch)
+    tasks.process_item.run(item_id)
+    drain(pipeline)
+    assert checkpoint["failed"]
+    with db.engine.connect() as connection:
+        assert connection.execute(sa.select(ContentItem.status, ContentItem.error_category).where(
+            ContentItem.id == item_id)).one() == ("completed", None)
+        assert connection.execute(sa.select(ProcessingJob.state, ProcessingJob.error_category).where(
+            ProcessingJob.item_id == item_id, ProcessingJob.stage == "transcribe")).one() == ("completed", None)
+        assert connection.execute(sa.select(ClassificationRevision.state, ClassificationRevision.error_category).where(
+            ClassificationRevision.item_id == item_id)).one() == ("pending", "dispatch_pending")
+
+
 def test_podcast_bounded_hashed_private_audio_then_amazon_and_replay(pipeline):
     row = pipeline.item(signed=True)
     function = getattr(tasks, "process_item", None)

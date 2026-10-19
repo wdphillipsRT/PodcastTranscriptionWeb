@@ -30,6 +30,8 @@ def test_authenticated_mutations_require_csrf_for_form_and_json(workspace, monke
     match = re.search(r'<meta name="csrf-token" content="([^"]+)"', page.text)
     assert match
     for path in ("/sources", "/sources/1/backfills", "/backfills/1/cancel", "/items/1/retry", "/api/sources",
+                 "/items/1/classification/overrides", "/api/items/1/classification/overrides",
+                 "/items/1/classification/retry", "/api/items/1/classification/retry",
                  "/api/sources/1/backfills", "/api/backfills/1/cancel", "/api/items/1/retry", "/logout"):
         for kwargs in ({"data": {}}, {"json": {}}):
             response = workspace.client.post(path, **kwargs)
@@ -41,7 +43,8 @@ def test_authenticated_mutations_require_csrf_for_form_and_json(workspace, monke
 def test_unauthenticated_api_mutations_return_json_401_even_with_csrf_enabled(workspace):
     workspace.app.config["WTF_CSRF_ENABLED"] = True
     client = workspace.app.test_client()
-    for method, path in (("get", "/api/items/1"), ("post", "/api/sources"), ("post", "/api/items/1/retry")):
+    for method, path in (("get", "/api/items/1"), ("post", "/api/sources"), ("post", "/api/items/1/retry"),
+                         ("post", "/api/items/1/classification/overrides"), ("post", "/api/items/1/classification/retry")):
         response = getattr(client, method)(path)
         assert response.status_code == 401 and response.json == {"error": "Authentication required"}
     for path in ("/", "/dashboard", "/sources/1", "/items/1/transcript"):
@@ -92,7 +95,9 @@ def test_provider_storage_and_unhandled_errors_are_generic(workspace, monkeypatc
 
 
 def test_no_get_mutation_and_shared_js_csrf(workspace):
-    for path in ("/logout", "/api/items/1/retry", "/api/backfills/1/cancel", "/api/sources/1/backfills"):
+    for path in ("/logout", "/api/items/1/retry", "/api/backfills/1/cancel", "/api/sources/1/backfills",
+                 "/items/1/classification/overrides", "/api/items/1/classification/overrides",
+                 "/items/1/classification/retry", "/api/items/1/classification/retry"):
         assert workspace.client.get(path).status_code == 405
     script = (Path(workspace.app.root_path) / "static/js/app.js").read_text()
     assert "apiRequest" in script and "csrf-token" in script and "X-CSRFToken" in script

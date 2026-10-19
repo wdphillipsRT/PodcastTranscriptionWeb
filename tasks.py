@@ -1,6 +1,8 @@
 """ID-only task boundary; application/provider clients are created lazily."""
 from contextlib import contextmanager
+import logging
 import os
+from time import monotonic
 from types import SimpleNamespace
 
 from celery import Celery
@@ -11,6 +13,51 @@ celery_app.config_from_object("celeryconfig")
 
 # Populated only when a task needs its own app context, never at import time.
 _worker_application = None
+
+
+def _observe_classification(event, identity, started, *, result=None, retry_category=None,
+                            rule_match_counts=None):
+    """Closed event encoder: never accept a payload, exception or artifact.
+
+    Identity is an integer-only item/source/revision snapshot. Policy version
+    and event names are code-owned. Counts come from committed service results;
+    logging adds no storage reads, database work, or task failure boundary.
+    """
+    from commercial_policy import POLICY_VERSION
+    from classification_service import (FinalizationResult, RETRYABLE_CLASSIFICATION_ERRORS,
+                                        PERMANENT_CLASSIFICATION_ERRORS)
+    if event not in {"prepare", "block", "finalize", "failed", "source_rule"}:
+        return
+    if len(identity) != 3 or any(type(value) is not int or value <= 0 for value in identity):
+        return
+    payload = dict(zip(("item_id", "source_id", "revision_id"), identity))
+    payload.update(policy_version=POLICY_VERSION, stage_duration_ms=max(0, round((monotonic() - started) * 1000)))
+    if retry_category in RETRYABLE_CLASSIFICATION_ERRORS | PERMANENT_CLASSIFICATION_ERRORS:
+        payload["retry_category"] = retry_category
+    valid_totals = (type(result) is FinalizationResult and all(
+        type(getattr(result, name)) is int and getattr(result, name) >= 0
+        for name in ("included_segments", "excluded_segments", "uncertain_segments",
+            "included_milliseconds", "excluded_milliseconds", "uncertain_milliseconds"))
+        and type(result.review_required) is bool)
+    if valid_totals and event == "finalize" and result.state == "completed":
+        payload["label_counts"] = dict(editorial=result.included_segments,
+            excluded=result.excluded_segments, uncertain=result.uncertain_segments)
+        durations = dict(included=result.included_milliseconds, excluded=result.excluded_milliseconds,
+            uncertain=result.uncertain_milliseconds)
+        total = sum(durations.values())
+        payload["duration_ratios"] = {key: value / total if total else 0 for key, value in durations.items()}
+        payload["review_required"] = result.review_required
+    if rule_match_counts is not None:
+        # Reconstruct only the known count fields, never forward caller extras.
+        counts = {key: rule_match_counts.get(key) for key in ("scanned", "matched")}
+        if all(type(value) is int and value >= 0 for value in counts.values()):
+            payload["rule_match_counts"] = counts
+    try:
+        logging.getLogger(__name__).info("commercial_classification_" + event,
+            extra={"commercial_event": payload})
+    except Exception:
+        # An unavailable log sink cannot change a durable checkpoint or retry.
+        pass
 
 
 @contextmanager
@@ -268,20 +315,11 @@ class _ProcessingPipeline:
         return message
 
     def _verify_completed(self, item):
-        from hashlib import sha256
-        import json
-        from transcripts import CanonicalTranscript, TranscriptSegment, SCHEMA
+        from transcripts import parse_canonical_transcript
         segments = self.storage.get_bytes(item.segments_s3_key, max_bytes=self.settings.YOUTUBE_CAPTION_MAX_BYTES)
-        if sha256(segments).hexdigest() != item.segments_sha256:
-            return False
-        payload = json.loads(segments)
-        if not isinstance(payload, dict):
-            return False
-        schema, digest = payload.pop("schema"), payload.pop("transcript_sha256")
-        payload["segments"] = tuple(TranscriptSegment(**segment) for segment in payload["segments"])
-        canonical = CanonicalTranscript(**payload)
-        return (schema == SCHEMA and digest == canonical.transcript_sha256 == item.transcript_sha256
-            and canonical.item_id == item.id and canonical.platform == item.platform
+        canonical = parse_canonical_transcript(segments, expected_item_id=item.id,
+            expected_transcript_sha256=item.transcript_sha256, expected_segments_sha256=item.segments_sha256)
+        return (canonical.platform == item.platform
             and canonical.external_id == item.external_id and canonical.origin == item.transcript_origin
             and canonical.source_id in {membership.source_id for membership in item.sources}
             and canonical.provider == item.transcription_provider and canonical.language == item.language
@@ -395,6 +433,52 @@ class _ProcessingPipeline:
             return "youtube_audio" if item.processing_stage == "youtube_audio" else "youtube_captions"
         return "podcast_audio"
 
+    def _complete(self, item, job=None):
+        """Join classification creation and media completion in one transaction.
+
+        Verified canonical references survive even if the optional handoff fails.
+        Request preparation performs storage I/O outside the final transaction.
+        """
+        from models import ContentItem, ProcessingJob, ClassificationRevision, utc_now
+        item_id, job_id = item.id, job.id if job is not None else None
+        precompletion = item.status != "completed"
+        if precompletion:
+            item.status = "transcribing"
+        self.session.commit()
+
+        def complete_media():
+            current = self.session.get(ContentItem, item_id)
+            current.status, current.error_category = "completed", None
+            if job_id is not None:
+                final_job = self.session.get(ProcessingJob, job_id)
+                final_job.state, final_job.error_category = "completed", None
+                final_job.completed_at = final_job.completed_at or utc_now()
+                current.last_successful_stage = final_job.stage
+
+        try:
+            service = get_classification_service()
+            request = service.prepare_revision_request(item_id, allow_precompletion=precompletion)
+            revision_id = service.ensure_revision(item_id, "transcript_completed", prepared_request=request, commit=False)
+            complete_media()
+            self.session.commit()
+        except Exception:
+            # Classification cannot downgrade verified media. Beat repairs the
+            # exceptional gap; never feed classifier exceptions to media retry.
+            self.session.rollback()
+            complete_media()
+            self.session.commit()
+            return None
+        try:
+            revision = self.session.get(ClassificationRevision, revision_id)
+            message = _revision_dispatch(revision) if revision.error_category == "dispatch_pending" else None
+            self.session.commit()
+        except Exception:
+            # Media completion and the outbox are already durable. Failures in
+            # this optional read/dispatch handoff must only defer publication.
+            self.session.rollback()
+            return None
+        return ("classification", message) if message else None
+
     def run(self, item_id, requested_stage=None):
         from models import ContentItem, ProcessingJob, utc_now
         item = self.session.get(ContentItem, item_id)
@@ -409,9 +493,9 @@ class _ProcessingPipeline:
             verification_error = error
             stage = self._verification_stage(item)
         if stage is None:
-            item.status, item.error_category = "completed", None
-            self.session.commit()
-            return None
+            final_job = self.session.query(ProcessingJob).filter_by(item_id=item_id,
+                stage=self._verification_stage(item)).one_or_none()
+            return self._complete(item, final_job)
         if item.status in {"failed", "unavailable", "deferred"}:
             self.session.rollback()
             return None
@@ -441,14 +525,14 @@ class _ProcessingPipeline:
                 raise verification_error
             source = self._source(item)
             following = getattr(self, "_" + stage)(item, source)
-            job.state, job.completed_at, job.error_category = "completed", utc_now(), None
-            item.last_successful_stage, item.error_category = stage, None
             if following is None:
                 if not _completed_valid(item):
                     raise ValueError("invalid artifact lineage")
-                item.status = "completed"
-            self.session.commit()
-            return self._queue(item, following) if following else None
+            else:
+                job.state, job.completed_at, job.error_category = "completed", utc_now(), None
+                item.last_successful_stage, item.error_category = stage, None
+                self.session.commit()
+                return self._queue(item, following)
         except Exception as error:
             # Roll back partial metadata changes; completed upstream artifact
             # tuples are committed in their own stage and remain reusable.
@@ -473,6 +557,9 @@ class _ProcessingPipeline:
             item.status = "deferred" if retryable else "unavailable" if unavailable else "failed"
             self.session.commit()
             return None
+        # The terminal classification handoff cannot enter the media failure
+        # handler, including after the final completion commit has succeeded.
+        return self._complete(item, job)
 
     def _save_audio(self, item, media):
         from hashlib import sha256
@@ -597,7 +684,7 @@ class _ProcessingPipeline:
         from hashlib import sha256
         import json
         from transcribe import transcribe_audio_from_s3, deterministic_job_name
-        from transcripts import CanonicalTranscript, TranscriptSegment, SCHEMA, canonical_json
+        from transcripts import parse_canonical_transcript, canonical_json
         result = transcribe_audio_from_s3(item.media_s3_key, item_id=item.id, source_id=source.id,
             platform=item.platform, external_id=item.external_id, audio_sha256=item.media_sha256,
             settings=self.settings, s3_manager=self.storage, canonical_url=item.canonical_url)
@@ -617,14 +704,9 @@ class _ProcessingPipeline:
         # Amazon's API already uploads canonical artifacts. Validate the exact
         # private tuple and canonical identity before treating it as completed.
         segments = self.storage.get_bytes(result["segments_key"], max_bytes=self.settings.YOUTUBE_CAPTION_MAX_BYTES)
-        payload = json.loads(segments)
-        if not isinstance(payload, dict):
-            raise ValueError("invalid transcription canonical object")
-        schema, digest = payload.pop("schema"), payload.pop("transcript_sha256")
-        payload["segments"] = tuple(TranscriptSegment(**segment) for segment in payload["segments"])
-        transcript = CanonicalTranscript(**payload)
-        if (schema != SCHEMA or digest != transcript.transcript_sha256 or digest != result["transcript_sha256"]
-                or transcript.item_id != item.id or transcript.source_id != source.id
+        transcript = parse_canonical_transcript(segments, expected_item_id=item.id,
+            expected_transcript_sha256=digest, expected_segments_sha256=None)
+        if (transcript.source_id != source.id
                 or transcript.platform != item.platform or transcript.external_id != item.external_id
                 or transcript.origin != "amazon_transcribe" or transcript.provider != result["provider"]
                 or transcript.language != result["language"] or transcript.source_sha256 != result["source_sha256"]):
@@ -714,6 +796,8 @@ def _run_processing(task, item_id, stage=None):
             message = _ProcessingPipeline(task).run(item_id, stage)
         # Release lifetime lock before publishing so a fast downstream worker
         # can claim immediately. Publication never overwrites a completed job.
+        if message and message[0] == "classification":
+            return _publish_classification(message[1])
         if message and message[0] == "retry":
             import random
             _, identity, attempts, category, task_id = message
@@ -745,3 +829,463 @@ def transcribe_item_audio(self, item_id):
 @celery_app.task(bind=True, name="tasks.normalize_item_transcript", queue="downloads", acks_late=True, reject_on_worker_lost=True)
 def normalize_item_transcript(self, item_id):
     return _run_processing(self, item_id, "normalize")
+
+
+def get_classification_service():
+    """Construct lazily; media workers need no Claude credential configuration."""
+    from classification_service import ClassificationService
+    from claude_classifier import ClaudeClassifier
+    from extensions import db
+    settings = SimpleNamespace(**dict(current_app.config))
+    return ClassificationService(session=db.session, storage=get_processing_storage(),
+        classifier=ClaudeClassifier(settings), settings=settings)
+
+
+def _classification_phase(revision_id, phase, block_ordinal):
+    from discovery_service import positive_id
+    positive_id(revision_id)
+    if phase not in ("prepare", "block", "finalize"):
+        raise ValueError("invalid classification phase")
+    if phase == "block":
+        positive_id(block_ordinal)
+    elif block_ordinal is not None:
+        raise ValueError("invalid classification ordinal")
+
+
+def _phase_dispatch(revision, phase, ordinal=None):
+    from classification_service import DispatchInstruction
+    suffix = f"b{ordinal}" if phase == "block" else phase
+    return DispatchInstruction(revision.id, phase, ordinal,
+        f"classify-{revision.item_id}-{revision.transcript_sha256[:16]}-r{revision.revision}-{suffix}")
+
+
+def _revision_dispatch(revision):
+    """Decode only a verified, code-owned checkpoint identity from the outbox."""
+    import re
+    if revision.state in {"completed", "failed", "superseded"}:
+        return None
+    suffix = (revision.celery_task_id or "").rsplit("-", 1)[-1]
+    if suffix in {"prepare", "finalize"}:
+        result = _phase_dispatch(revision, suffix)
+    elif re.fullmatch(r"b[1-9][0-9]*", suffix):
+        result = _phase_dispatch(revision, "block", int(suffix[1:]))
+    else:
+        raise ValueError("invalid classification checkpoint")
+    if result.task_id != revision.celery_task_id:
+        raise ValueError("invalid classification checkpoint")
+    return result
+
+
+def _prepare_classification_publication(dispatch):
+    from extensions import db
+    from models import ClassificationRevision
+    revision = db.session.get(ClassificationRevision, dispatch.revision_id, populate_existing=True)
+    if revision.state in {"completed", "failed", "superseded"}:
+        db.session.commit()
+        return None
+    revision.celery_task_id, revision.error_category = dispatch.task_id, "dispatch_pending"
+    db.session.commit()
+    return dispatch
+
+
+def _publish_classification(dispatch, *, countdown=None, restore_category=None):
+    """Publish a committed outbox after releasing the worker-lifetime lock."""
+    from extensions import db
+    from models import ClassificationRevision
+    if dispatch is None or not current_app.config["CLASSIFICATION_ENABLED"]:
+        return False
+    revision = db.session.get(ClassificationRevision, dispatch.revision_id, populate_existing=True)
+    if (revision is None or revision.state in {"completed", "failed", "superseded"}
+            or revision.celery_task_id != dispatch.task_id or revision.error_category != "dispatch_pending"):
+        db.session.commit()
+        return False
+    # Attempts and heartbeat distinguish successive retries sharing a task ID.
+    generation = dict(state=revision.state, attempts=revision.attempts, heartbeat_at=revision.heartbeat_at)
+    db.session.commit()
+    options = {"task_id": dispatch.task_id, "queue": "classification"}
+    if countdown is not None:
+        options["countdown"] = countdown
+    try:
+        celery_app.send_task("tasks.classify_item", args=[dispatch.revision_id, dispatch.phase,
+            dispatch.block_ordinal], **options)
+    except Exception:
+        # Delivery may have succeeded. The durable stable identity is replayed.
+        db.session.rollback()
+        return False
+    db.session.query(ClassificationRevision).filter_by(id=dispatch.revision_id,
+        celery_task_id=dispatch.task_id, error_category="dispatch_pending", **generation).filter(
+        ClassificationRevision.state.notin_(("completed", "failed", "superseded"))).update(
+        {"error_category": restore_category}, synchronize_session="fetch")
+    db.session.commit()
+    return True
+
+
+def _classification_delay(attempts):
+    import random
+    return min(3600, 30 * 2 ** (attempts - 1)) + random.uniform(1, 30)
+
+
+def _classification_failed(revision_id, phase, ordinal, category):
+    """Caller holds the item lock; revision attempts count failed calls only."""
+    from classification_service import RETRYABLE_CLASSIFICATION_ERRORS, PERMANENT_CLASSIFICATION_ERRORS
+    from extensions import db
+    from models import ClassificationRevision, ClassificationBlock, utc_now
+    if category not in RETRYABLE_CLASSIFICATION_ERRORS | PERMANENT_CLASSIFICATION_ERRORS:
+        category = "invalid_policy"
+    revision = db.session.query(ClassificationRevision).filter_by(id=revision_id).with_for_update().populate_existing().one()
+    if revision.state in {"completed", "superseded"}:
+        db.session.commit()
+        return None, None, None
+    revision.attempts += 1
+    retry = category in RETRYABLE_CLASSIFICATION_ERRORS and revision.attempts < 5
+    revision.state = "retrying" if retry else "failed"
+    revision.error_category = "dispatch_pending" if retry else category
+    revision.heartbeat_at = utc_now()
+    if ordinal is not None:
+        block = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id, ordinal=ordinal).one_or_none()
+        if block is not None and block.state not in {"completed", "superseded"}:
+            block.state, block.error_category = "failed", category
+    dispatch = _phase_dispatch(revision, phase, ordinal) if retry else None
+    if dispatch:
+        revision.celery_task_id = dispatch.task_id
+    attempts = revision.attempts
+    db.session.commit()
+    countdown = _classification_delay(attempts) if retry else None
+    return dispatch, countdown, category
+
+
+def _classification_step(service, revision_id, phase, ordinal=None, *, handoff_superseded=True):
+    """One service checkpoint under an already-held lifetime lock, no broker I/O."""
+    from classification_service import ClassificationServiceError
+    from extensions import db
+    from models import ClassificationRevision
+    revision = db.session.get(ClassificationRevision, revision_id, populate_existing=True)
+    if revision is None or revision.state in {"completed", "failed", "superseded"}:
+        db.session.commit()
+        return None, None, None
+    item_id = revision.item_id
+    observation_identity = (item_id, revision.source_id, revision.id)
+    db.session.commit()
+    started = monotonic()
+    try:
+        if phase == "block":
+            result = service.run_block(revision_id, ordinal)
+        else:
+            result = getattr(service, {"prepare": "prepare_revision", "finalize": "finalize_revision"}[phase])(revision_id)
+    except ClassificationServiceError as error:
+        db.session.rollback()
+        if not error.record:
+            # A live/stale claim or ambiguous commit is repaired by reconciliation.
+            return None, None, None
+        outcome = _classification_failed(revision_id, phase, ordinal, error.category)
+        _observe_classification("failed", observation_identity, started, retry_category=outcome[2])
+        return outcome
+    _observe_classification(phase, observation_identity, started, result=result)
+    if result.next_dispatch is not None:
+        return _prepare_classification_publication(result.next_dispatch), None, None
+    if result.state == "superseded" and handoff_superseded:
+        identity = service.ensure_revision(item_id, "policy_upgrade")
+        current = db.session.get(ClassificationRevision, identity)
+        dispatch = _revision_dispatch(current)
+        db.session.commit()
+        return dispatch, None, None
+    return None, None, None
+
+
+@celery_app.task(name="tasks.classify_item", queue="classification")
+def classify_item(revision_id, phase, block_ordinal=None):
+    _classification_phase(revision_id, phase, block_ordinal)
+    from extensions import db
+    from models import ClassificationRevision
+    with application_context():
+        item_id = db.session.query(ClassificationRevision.item_id).filter_by(id=revision_id).scalar()
+        db.session.commit()
+        if item_id is None:
+            return
+        with _item_lock(item_id) as acquired:
+            if not acquired:
+                return
+            if not current_app.config["CLASSIFICATION_ENABLED"]:
+                # A previously acknowledged message can arrive after rollout
+                # is disabled. Return it to the durable outbox for re-enabling.
+                revision = db.session.get(ClassificationRevision, revision_id, populate_existing=True)
+                if (revision.state not in {"completed", "failed", "superseded"}
+                        and revision.celery_task_id == _phase_dispatch(revision, phase, block_ordinal).task_id):
+                    revision.error_category = "dispatch_pending"
+                db.session.commit()
+                return
+            dispatch, countdown, category = _classification_step(get_classification_service(), revision_id, phase, block_ordinal)
+        _publish_classification(dispatch, countdown=countdown, restore_category=category)
+
+
+def _missing_classification_query():
+    import sqlalchemy as sa
+    from commercial_policy import POLICY_VERSION
+    from models import ContentItem, ClassificationRevision
+    current = sa.exists().where(ClassificationRevision.item_id == ContentItem.id,
+        ClassificationRevision.transcript_sha256 == ContentItem.transcript_sha256,
+        ClassificationRevision.policy_version == POLICY_VERSION,
+        ClassificationRevision.state != "superseded")
+    return sa.select(ContentItem.id).where(ContentItem.status == "completed", ~current)
+
+
+def _reconcile_revision(revision_id, item_id, cutoff):
+    """Separate aged delivery replays from proven abandoned running work."""
+    from extensions import db
+    from models import ClassificationRevision, ClassificationBlock
+    with _item_lock(item_id) as acquired:
+        if not acquired:
+            return None, None, None
+        revision = db.session.get(ClassificationRevision, revision_id, populate_existing=True)
+        if revision is None or revision.state in {"completed", "failed", "superseded"}:
+            db.session.commit()
+            return None, None, None
+        block = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id, state="running").order_by(
+            ClassificationBlock.ordinal).first()
+        heartbeat = (block.heartbeat_at or block.started_at) if block else revision.heartbeat_at or revision.started_at
+        if block is not None or revision.state == "running" and revision.error_category != "dispatch_pending":
+            if heartbeat is None or heartbeat >= cutoff:
+                db.session.commit()
+                return None, None, None
+            dispatch = _revision_dispatch(revision)
+            phase, ordinal = ("block", block.ordinal) if block else (dispatch.phase, dispatch.block_ordinal)
+            return _classification_failed(revision_id, phase, ordinal, "worker_timeout")
+        if revision.error_category != "dispatch_pending":
+            delivered_at = revision.updated_at or revision.created_at
+            if delivered_at is None or delivered_at >= cutoff:
+                db.session.commit()
+                return None, None, None
+        dispatch = _revision_dispatch(revision)
+        category, countdown = None, None
+        if revision.state == "retrying":
+            from classification_service import RETRYABLE_CLASSIFICATION_ERRORS
+            if revision.error_category in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
+                category = revision.error_category
+            # Block failures retain their category while the revision's sole
+            # error field is used by the outbox. Prepare/finalize cannot recover
+            # the original category after an unknown send; the next call will.
+            failed = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id,
+                ordinal=dispatch.block_ordinal, state="failed").one_or_none() if dispatch.phase == "block" else None
+            if category is None and failed is not None and failed.error_category in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
+                category = failed.error_category
+            countdown = _classification_delay(revision.attempts) if revision.attempts else None
+        # Pending and retrying deliveries did not execute a failed checkpoint.
+        # Re-arm the stable outbox without consuming the worker-attempt budget;
+        # publication updates updated_at, renewing the delivery grace period.
+        revision.error_category = "dispatch_pending"
+        db.session.commit()
+        return dispatch, countdown, category
+
+
+def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_item_id=0, create_only=False):
+    """One bounded keyset page shared by beat and the operator backlog command."""
+    from datetime import timedelta
+    import sqlalchemy as sa
+    import celeryconfig
+    from extensions import db
+    from models import ClassificationRevision, ClassificationBlock, utc_now
+    from classification_service import ClassificationServiceError
+    bound = min(current_app.config["CLASSIFICATION_RECONCILE_BATCH_SIZE"], 100, limit if limit is not None else 100)
+    if type(bound) is not int or bound < 1:
+        raise ValueError("invalid classification limit")
+    for cursor in (after_revision_id, after_item_id):
+        if type(cursor) is not int or cursor < 0:
+            raise ValueError("invalid classification cursor")
+    counts = dict(scanned=0, created=0, published=0, failed=0,
+        after_revision_id=after_revision_id, after_item_id=after_item_id)
+    enabled = current_app.config["CLASSIFICATION_ENABLED"]
+    cutoff = utc_now() - timedelta(seconds=celeryconfig.task_time_limit + 300)
+    if enabled and not create_only:
+        stale_running = sa.and_(ClassificationRevision.state == "running",
+            sa.func.coalesce(ClassificationRevision.heartbeat_at, ClassificationRevision.started_at) < cutoff)
+        stale_delivery = sa.and_(sa.or_(ClassificationRevision.state == "retrying",
+            sa.and_(ClassificationRevision.state == "pending", ClassificationRevision.started_at.is_(None),
+                ClassificationRevision.heartbeat_at.is_(None))),
+            sa.func.coalesce(ClassificationRevision.updated_at, ClassificationRevision.created_at) < cutoff)
+        stale_block = sa.exists().where(ClassificationBlock.revision_id == ClassificationRevision.id,
+            ClassificationBlock.state == "running",
+            sa.func.coalesce(ClassificationBlock.heartbeat_at, ClassificationBlock.started_at) < cutoff)
+        candidates = list(db.session.execute(sa.select(ClassificationRevision.id, ClassificationRevision.item_id).where(
+            ClassificationRevision.id > after_revision_id,
+            ClassificationRevision.state.in_(("pending", "running", "retrying")),
+            sa.or_(ClassificationRevision.error_category == "dispatch_pending", stale_running, stale_delivery, stale_block))
+            .order_by(ClassificationRevision.id).limit(bound)))
+        db.session.commit()
+        for identity, item_id in candidates:
+            counts["scanned"] += 1
+            counts["after_revision_id"] = identity
+            dispatch, countdown, category = _reconcile_revision(identity, item_id, cutoff)
+            counts["published"] += int(_publish_classification(dispatch, countdown=countdown, restore_category=category))
+    remaining = bound - counts["scanned"]
+    if remaining:
+        from models import ContentItem
+        candidates = list(db.session.scalars(_missing_classification_query().where(ContentItem.id > after_item_id)
+            .order_by(ContentItem.id).limit(remaining)))
+        db.session.commit()
+        for item_id in candidates:
+            counts["scanned"] += 1
+            counts["after_item_id"] = item_id
+            dispatch = None
+            with _item_lock(item_id) as acquired:
+                if not acquired:
+                    continue
+                try:
+                    # Recheck after acquiring the same lock as the media worker.
+                    missing = db.session.scalar(_missing_classification_query().where(ContentItem.id == item_id))
+                    had_revision = db.session.scalar(sa.select(ClassificationRevision.id).where(
+                        ClassificationRevision.item_id == item_id).limit(1))
+                    db.session.commit()
+                    if missing is None:
+                        continue
+                    identity = get_classification_service().ensure_revision(item_id,
+                        "policy_upgrade" if had_revision else "backfill")
+                    revision = db.session.get(ClassificationRevision, identity)
+                    dispatch = _revision_dispatch(revision)
+                    db.session.commit()
+                    counts["created"] += 1
+                except ClassificationServiceError:
+                    db.session.rollback()
+                    counts["failed"] += 1
+            counts["published"] += int(_publish_classification(dispatch))
+    return counts
+
+
+@celery_app.task(name="tasks.reconcile_classifications", queue="classification")
+def reconcile_classifications(after_revision_id=0, after_item_id=0):
+    with application_context():
+        counts = reconcile_classification_batch(after_revision_id=after_revision_id, after_item_id=after_item_id)
+        if current_app.config["CLASSIFICATION_ENABLED"]:
+            _reconcile_source_sweeps()
+        if (current_app.config["CLASSIFICATION_ENABLED"] and counts["scanned"]
+                == min(current_app.config["CLASSIFICATION_RECONCILE_BATCH_SIZE"], 100)):
+            try:
+                celery_app.send_task("tasks.reconcile_classifications", queue="classification",
+                    kwargs={name: counts[name] for name in ("after_revision_id", "after_item_id")})
+            except Exception:
+                pass  # Periodic argument-free reconciliation restarts this scan.
+        return counts
+
+
+@celery_app.task(name="tasks.scan_source_rule", queue="classification")
+def scan_source_rule(sweep_id):
+    from discovery_service import positive_id
+    positive_id(sweep_id)
+    with application_context():
+        if not current_app.config["CLASSIFICATION_ENABLED"]:
+            import sqlalchemy as sa
+            from extensions import db
+            from models import ClassificationSweep
+            db.session.execute(sa.update(ClassificationSweep).where(ClassificationSweep.id == sweep_id,
+                ClassificationSweep.state.in_(("pending", "running")),
+                sa.or_(ClassificationSweep.error_category.is_(None), ClassificationSweep.error_category == "dispatch_pending"))
+                .values(error_category="dispatch_pending"))
+            db.session.commit()
+            return
+        if current_app.config["CLASSIFICATION_ENABLED"]:
+            from extensions import db
+            from models import ClassificationRevision, ClassificationSweep, SourceClassificationRule, SegmentOverride
+            from sqlalchemy.exc import SQLAlchemyError
+            try:
+                identity = db.session.query(SegmentOverride.item_id, ClassificationSweep.source_id,
+                    SegmentOverride.policy_revision_id).select_from(ClassificationSweep).join(
+                    SourceClassificationRule, SourceClassificationRule.id == ClassificationSweep.rule_id).join(
+                    SegmentOverride, SegmentOverride.id == SourceClassificationRule.originating_override_id).filter(
+                    ClassificationSweep.id == sweep_id).one_or_none()
+                db.session.commit()
+                started = monotonic()
+                result = get_classification_service().scan_source_rule(sweep_id)
+                if result is None:
+                    return
+                if identity is not None:
+                    _observe_classification("source_rule", identity, started,
+                        rule_match_counts=dict(scanned=result.items_scanned, matched=result.items_queued))
+                for revision_id in result.revision_ids:
+                    revision = db.session.get(ClassificationRevision, revision_id)
+                    dispatch = _revision_dispatch(revision)
+                    db.session.commit()
+                    _publish_classification(dispatch)
+                if result.next_task_id:
+                    _publish_source_sweep(sweep_id)
+                return dict(sweep_id=result.sweep_id, state=result.state,
+                    cursor_item_id=result.cursor_item_id, items_scanned=result.items_scanned,
+                    items_queued=result.items_queued)
+            except SQLAlchemyError:
+                # Cursor/revision writes roll back together. The pending sweep
+                # outbox and revision reconciler repair unknown commit results.
+                db.session.rollback()
+
+
+def _publish_source_sweep(sweep_id):
+    """Publish only a committed stable cursor outbox; never erase newer work."""
+    import sqlalchemy as sa
+    from extensions import db
+    from models import ClassificationSweep, utc_now
+    from classification_service import SOURCE_SWEEP_RETRY_ERRORS, source_sweep_retry_at
+    if not current_app.config["CLASSIFICATION_ENABLED"]:
+        return False
+    sweep = db.session.get(ClassificationSweep, sweep_id, populate_existing=True)
+    if (sweep is None or sweep.state not in {"pending", "running"}
+            or sweep.error_category not in SOURCE_SWEEP_RETRY_ERRORS | {"dispatch_pending"}):
+        db.session.commit()
+        return False
+    retry_at = source_sweep_retry_at(sweep)
+    if retry_at is not None and utc_now() < retry_at:
+        db.session.commit()
+        return False
+    task_id = f"source-rule-{sweep.id}-after-{sweep.cursor_item_id or 0}"
+    if sweep.celery_task_id != task_id:
+        db.session.commit()
+        return False
+    generation = dict(state=sweep.state, cursor_item_id=sweep.cursor_item_id,
+        items_scanned=sweep.items_scanned, items_queued=sweep.items_queued,
+        updated_at=sweep.updated_at, error_category=sweep.error_category)
+    db.session.commit()
+    try:
+        celery_app.send_task("tasks.scan_source_rule", args=[sweep_id], queue="classification", task_id=task_id)
+    except Exception:
+        db.session.rollback()
+        return False
+    try:
+        conditions = [ClassificationSweep.id == sweep_id, ClassificationSweep.celery_task_id == task_id]
+        conditions.extend(getattr(ClassificationSweep, name) == value for name, value in generation.items())
+        db.session.execute(sa.update(ClassificationSweep).where(*conditions).values(error_category=None))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    return True
+
+
+def publish_override(result):
+    """Route/UI handoff after record_override has committed both outboxes."""
+    try:
+        _publish_classification(result.next_dispatch)
+    finally:
+        _publish_source_sweep(result.sweep_id)
+
+
+def _reconcile_source_sweeps():
+    """Bounded replay for pending and acknowledged-but-lost sweep deliveries."""
+    from datetime import timedelta
+    import sqlalchemy as sa
+    import celeryconfig
+    from extensions import db
+    from models import ClassificationSweep, utc_now
+    from classification_service import SOURCE_SWEEP_RETRY_DELAY_SECONDS, SOURCE_SWEEP_RETRY_ERRORS
+    now = utc_now()
+    cutoff = now - timedelta(seconds=celeryconfig.task_time_limit + 300)
+    retry_cutoff = now - timedelta(seconds=SOURCE_SWEEP_RETRY_DELAY_SECONDS)
+    aged_delivery = sa.and_(ClassificationSweep.error_category.is_(None), ClassificationSweep.updated_at < cutoff)
+    retry_ready = sa.and_(ClassificationSweep.error_category.in_(SOURCE_SWEEP_RETRY_ERRORS),
+        ClassificationSweep.updated_at <= retry_cutoff)
+    identities = list(db.session.scalars(sa.select(ClassificationSweep.id).where(
+        ClassificationSweep.state.in_(("pending", "running")),
+        sa.or_(ClassificationSweep.error_category == "dispatch_pending", retry_ready, aged_delivery))
+        .order_by(ClassificationSweep.id).limit(50)))
+    db.session.commit()
+    for identity in identities:
+        db.session.execute(sa.update(ClassificationSweep).where(ClassificationSweep.id == identity,
+            ClassificationSweep.state.in_(("pending", "running")),
+            aged_delivery)
+            .values(error_category="dispatch_pending"))
+        db.session.commit()
+        _publish_source_sweep(identity)

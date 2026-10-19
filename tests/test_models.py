@@ -13,7 +13,8 @@ from extensions import db
 
 
 NAMES = ("Admin", "ContentSource", "ContentItem", "SourceItem", "DiscoveryRun",
-         "DiscoveryCandidate", "BackfillRequest", "ProcessingJob")
+         "DiscoveryCandidate", "BackfillRequest", "ProcessingJob", "ClassificationRevision",
+         "ClassificationBlock", "SegmentOverride", "SourceClassificationRule", "ClassificationSweep")
 
 
 @pytest.fixture
@@ -73,6 +74,8 @@ def test_schema_replaces_legacy_models(schema):
     assert set(db.metadata.tables) == {
         "admins", "content_sources", "content_items", "source_items", "discovery_runs",
         "discovery_candidates", "backfill_requests", "processing_jobs",
+        "classification_revisions", "classification_blocks", "segment_overrides",
+        "source_classification_rules", "classification_sweeps",
     }
     assert not hasattr(schema, "User")
 

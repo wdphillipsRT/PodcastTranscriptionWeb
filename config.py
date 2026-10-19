@@ -1,8 +1,10 @@
 """Validated environment settings shared by web and worker processes."""
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -49,6 +51,16 @@ class Settings:
     RATELIMIT_DEFAULT: str = ""
     RATELIMIT_LOGIN: str = "5 per minute"
     LOG_LEVEL: str = "INFO"
+    CLAUDE_CLASSIFIER_MODEL: str = "claude-sonnet-5-5"
+    CLAUDE_EXPECTED_VERSION: str = "2.1.303"
+    CLAUDE_CLASSIFIER_TIMEOUT_SECONDS: int = 180
+    CLAUDE_CLASSIFIER_MAX_BUDGET_USD: Decimal = Decimal("0.50")
+    CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD: Decimal = Decimal("5.00")
+    CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS: int = 7200
+    CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES: int = 2_097_152
+    CLASSIFICATION_ENABLED: bool = False
+    CLASSIFICATION_RECONCILE_INTERVAL_SECONDS: int = 300
+    CLASSIFICATION_RECONCILE_BATCH_SIZE: int = 100
 
 
 _REQUIRED = (
@@ -119,6 +131,36 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
 
     if values["YOUTUBE_MAX_ITEMS_PER_BACKFILL_TASK"] > values["BACKFILL_REQUEST_MAX_ITEMS"]:
         raise ConfigError("YOUTUBE_MAX_ITEMS_PER_BACKFILL_TASK must not exceed BACKFILL_REQUEST_MAX_ITEMS")
+
+    if values["CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES"] > 2_097_152:
+        raise ConfigError("CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES must not exceed 2097152")
+    if values["CLASSIFICATION_RECONCILE_BATCH_SIZE"] > 500:
+        raise ConfigError("CLASSIFICATION_RECONCILE_BATCH_SIZE must not exceed 500")
+    for name in ("CLAUDE_CLASSIFIER_MAX_BUDGET_USD", "CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD"):
+        try:
+            raw = environment.get(name, str(getattr(Settings, name))).strip()
+            if not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", raw):
+                raise ValueError
+            value = Decimal(raw)
+            if not value.is_finite() or value <= 0:
+                raise ValueError
+        except (InvalidOperation, ValueError):
+            raise ConfigError(f"{name} must be a positive finite decimal") from None
+        values[name] = value
+    if values["CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD"] < values["CLAUDE_CLASSIFIER_MAX_BUDGET_USD"]:
+        raise ConfigError("CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD must cover the per-call budget")
+    if values["CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS"] < values["CLAUDE_CLASSIFIER_TIMEOUT_SECONDS"]:
+        raise ConfigError("CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS must cover the per-call timeout")
+    for name, pattern in (("CLAUDE_EXPECTED_VERSION", r"[0-9]+\.[0-9]+\.[0-9]+"),
+                          ("CLAUDE_CLASSIFIER_MODEL", r"claude-(?!latest-)[a-z]+-[0-9]+-[0-9]+(?:-[0-9]{8})?")):
+        value = _nonempty(environment, name, getattr(Settings, name))
+        if not re.fullmatch(pattern, value):
+            raise ConfigError(f"{name} must be a pinned version")
+        values[name] = value
+    enabled = environment.get("CLASSIFICATION_ENABLED", "false").strip().lower()
+    if enabled not in {"true", "false"}:
+        raise ConfigError("CLASSIFICATION_ENABLED must be true or false")
+    values["CLASSIFICATION_ENABLED"] = enabled == "true"
 
     secure = environment.get("SESSION_COOKIE_SECURE", "true").strip().lower()
     if secure not in {"true", "false"}:

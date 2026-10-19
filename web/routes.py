@@ -6,16 +6,18 @@ import re
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
-from flask import Blueprint, abort, current_app, flash, jsonify, redirect, render_template, request, url_for
+from flask import Blueprint, Response, abort, current_app, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from extensions import db
 from ingestion_types import SourceDescriptor, normalize_public_url
-from models import (BackfillRequest, ContentItem, ContentSource, DiscoveryRun,
+from models import (BackfillRequest, ClassificationRevision, ContentItem, ContentSource, DiscoveryRun,
                     ProcessingJob, SourceItem, SOURCE_TYPES, utc_now)
-from s3_utils import get_s3_manager
+from s3_utils import (get_s3_manager, parse_media_range, StorageRangeError, AUDIO_CONTENT_TYPES)
+from commercial_policy import LABELS, POLICY_VERSION
 from source_classifier import CHANNEL_ID, PLAYLIST_ID, classify_source_url, youtube_locator
 
 
@@ -27,6 +29,66 @@ ORIGIN_LABELS = {"creator_caption": "Creator captions", "automatic_caption": "Au
 PROVIDER_LABELS = {"yt-dlp": "YouTube captions", "amazon_transcribe": "Amazon Transcribe"}
 TRANSCRIPT_MAX_BYTES = 10 * 1024 * 1024
 ITEM_PAGE_SIZE = 200
+REVIEW_PAGE_SIZE = 50
+CLASSIFICATION_STATES = {state: state.capitalize() for state in
+    ("pending", "running", "retrying", "completed", "failed", "superseded")}
+CLASSIFICATION_FAILURES = {"claude_timeout": "Classifier timeout", "claude_unavailable": "Classifier unavailable",
+    "claude_invalid_output": "Invalid classifier result", "storage_transient": "Storage unavailable",
+    "worker_timeout": "Worker timeout", "claude_auth": "Classifier authentication",
+    "claude_config": "Classifier configuration", "model_mismatch": "Classifier configuration",
+    "invalid_canonical": "Transcript unavailable", "invalid_policy": "Policy unavailable",
+    "revision_budget_exhausted": "Classification budget reached", "dispatch_pending": "Awaiting dispatch"}
+CLASSIFICATION_TOTALS = ("included_segments", "excluded_segments", "uncertain_segments",
+    "included_milliseconds", "excluded_milliseconds", "uncertain_milliseconds")
+
+
+def classification_view(latest=None, active=None):
+    """Closed aggregate DTO: no artifact identities or free-form diagnostics."""
+    return dict(state=CLASSIFICATION_STATES.get(latest.state, "Not classified") if latest else "Not classified",
+        policy_version=POLICY_VERSION if latest and latest.policy_version == POLICY_VERSION else "Not available",
+        review_required=bool(active and active.review_required),
+        failure=CLASSIFICATION_FAILURES.get(latest.error_category, "Classification unavailable") if latest and latest.error_category else None,
+        **{name: getattr(active, name) if active else 0 for name in CLASSIFICATION_TOTALS})
+
+
+def classification_views(items):
+    """Two bounded revision joins for an entire item page, not one query per row."""
+    if not items:
+        return {}
+    latest, active = aliased(ClassificationRevision), aliased(ClassificationRevision)
+    newest = db.select(db.func.max(ClassificationRevision.id)).where(
+        ClassificationRevision.item_id == ContentItem.id,
+        ClassificationRevision.transcript_sha256 == ContentItem.transcript_sha256).correlate(ContentItem).scalar_subquery()
+    rows = db.session.execute(db.select(ContentItem.id, latest, active).select_from(ContentItem)
+        .outerjoin(latest, latest.id == newest)
+        .outerjoin(active, and_(active.id == ContentItem.active_classification_revision_id,
+            active.item_id == ContentItem.id, active.state == "completed",
+            active.transcript_sha256 == ContentItem.transcript_sha256,
+            active.segments_sha256 == ContentItem.segments_sha256))
+        .where(ContentItem.id.in_([item.id for item in items]), ContentItem.admin_id == current_user.id))
+    return {identity: classification_view(revision, policy) for identity, revision, policy in rows}
+
+
+def review_query():
+    newer = aliased(ClassificationRevision)
+    return db.select(ClassificationRevision).join(ContentItem, ContentItem.id == ClassificationRevision.item_id).join(
+        ContentSource, ContentSource.id == ClassificationRevision.source_id).where(
+        ContentItem.admin_id == current_user.id, ContentSource.admin_id == current_user.id,
+        ClassificationRevision.transcript_sha256 == ContentItem.transcript_sha256,
+        ClassificationRevision.segments_sha256 == ContentItem.segments_sha256,
+        or_(and_(ClassificationRevision.id == ContentItem.active_classification_revision_id,
+                 ClassificationRevision.state == "completed", ClassificationRevision.review_required.is_(True)),
+            and_(ClassificationRevision.state == "failed", ~db.select(newer.id).where(
+                newer.item_id == ContentItem.id, newer.transcript_sha256 == ContentItem.transcript_sha256,
+                newer.revision > ClassificationRevision.revision, newer.state != "superseded").exists())))
+
+
+@workspace.app_context_processor
+def review_navigation():
+    if not getattr(current_user, "is_authenticated", False):
+        return {}
+    depth = db.session.scalar(db.select(db.func.count()).select_from(review_query().subquery()))
+    return {"classification_review_depth": depth}
 
 
 def settings():
@@ -71,7 +133,7 @@ def source_view(source):
                 next_check_at=source.next_check_at)
 
 
-def item_view(item):
+def item_view(item, classification=None):
     language = item.language if isinstance(item.language, str) and re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?", item.language) else "Unknown"
     return dict(id=item.id, title=item.title, status=item.status,
                 platform="YouTube" if item.platform == "youtube" else "Podcast",
@@ -80,7 +142,7 @@ def item_view(item):
                 segments_available=bool(item.segments_s3_key),
                 transcript_origin=ORIGIN_LABELS.get(item.transcript_origin, "Not available"),
                 transcription_provider=PROVIDER_LABELS.get(item.transcription_provider, "Not available"),
-                language=language)
+                language=language, classification=classification if classification is not None else classification_views([item]).get(item.id, classification_view()))
 
 
 def backfill_view(row):
@@ -117,7 +179,11 @@ def failure(message, status=400):
 def dashboard():
     sources = db.session.scalars(db.select(ContentSource).filter_by(admin_id=current_user.id)
                                  .order_by(ContentSource.created_at.desc())).all()
-    return render_template("dashboard.html", sources=[source_view(row) for row in sources])
+    recent = list(db.session.scalars(db.select(ContentItem).filter_by(admin_id=current_user.id)
+        .order_by(ContentItem.created_at.desc(), ContentItem.id.desc()).limit(20)))
+    classifications = classification_views(recent)
+    return render_template("dashboard.html", sources=[source_view(row) for row in sources],
+        items=[item_view(row, classifications[row.id]) for row in recent])
 
 
 @workspace.post("/api/sources")
@@ -207,7 +273,8 @@ def source_items(source_id):
             older_url = url_for("workspace.items", source_id=source_id, before=rows[-1].id)
         if db.session.scalar(query.where(boundary(rows[0], older=False)).with_only_columns(ContentItem.id).limit(1)):
             newer_url = url_for("workspace.items", source_id=source_id, after=rows[0].id)
-    return dict(items=[item_view(row) for row in rows], older_url=older_url, newer_url=newer_url)
+    classifications = classification_views(rows)
+    return dict(items=[item_view(row, classifications[row.id]) for row in rows], older_url=older_url, newer_url=newer_url)
 
 
 @workspace.get("/sources/<int:source_id>")
@@ -298,6 +365,243 @@ def transcript(item_id):
     except Exception:
         return render_template("index.html", error="Transcript is temporarily unavailable."), 503
     return render_template("item.html", item=item_view(row), memberships=[], transcript=text, citations=citation_views(row))
+
+
+def public_review_target(row):
+    """Rebuild a public citation; stored segment URLs are never rendered."""
+    try:
+        if not isinstance(row.canonical_url, str) or len(row.canonical_url) > 4096:
+            return None
+        canonical = normalize_public_url(row.canonical_url)
+        host = urlsplit(canonical).hostname
+        if any(host == domain or host.endswith("." + domain) for domain in ("amazonaws.com", "amazonaws.com.cn")):
+            return None
+        if row.platform == "youtube":
+            kind, _, identity = youtube_locator(canonical)
+            if kind != "youtube_video" or identity != row.external_id:
+                return None
+            return f"https://www.youtube.com/watch?v={identity}&t={{start}}s"
+        if row.platform == "podcast":
+            return canonical + "#t={start},{end}"
+    except Exception:
+        pass
+    return None
+
+
+def review_artifacts(item_id, storage, target):
+    """Authenticated inspection shares the gateway's complete identity checks.
+
+    Deliberately permits the still-active policy while a correction is pending.
+    Both artifacts, their totals and membership are validated before any text
+    reaches HTML. No learning projection or promotion gateway is bypassed.
+    """
+    from learning_projection import _inputs, _still_active
+    snapshot, transcript, policy = _inputs(db.session, storage, item_id, False)
+    positions = {segment.id: index for index, segment in enumerate(transcript.segments)}
+    ranges = []
+    for entry in policy.ranges:
+        first, last = positions[entry.first_segment_id], positions[entry.last_segment_id]
+        citation = None
+        if target:
+            start = str(math.floor(entry.start)) if "youtube.com/watch" in target else f"{entry.start:.3f}".rstrip("0").rstrip(".")
+            end = f"{entry.end:.3f}".rstrip("0").rstrip(".")
+            # Replacement is literal so untrusted URL braces are not interpreted.
+            citation = target.replace("{start}", start).replace("{end}", end)
+        ranges.append(dict(label=entry.label, eligible=entry.eligible, confidence=entry.confidence,
+            reasons=entry.reason_codes, signals=entry.signal_codes, decision_source=entry.decision_source,
+            start=entry.start, end=entry.end, citation=citation,
+            text="\n".join(segment.text for segment in transcript.segments[first:last + 1])))
+    _still_active(db.session, item_id, False, snapshot)
+    return dict(active_revision_id=snapshot[1]["id"], completed_at=snapshot[1]["completed_at"],
+        ranges=ranges, boundaries=[dict(id=segment.id, label=f"{index + 1}: {segment.start:.3f}–{segment.end:.3f} seconds")
+            for index, segment in enumerate(transcript.segments)])
+
+
+def owned_media_key(row):
+    key = row.media_s3_key
+    prefix = f"items/{row.platform}/{row.external_id}/audio/"
+    return key if isinstance(key, str) and key.startswith(prefix) else None
+
+
+@workspace.get("/classification/review")
+@login_required
+def classification_review():
+    if set(request.args) - {"after"} or len(request.args.getlist("after")) > 1:
+        abort(400)
+    query = review_query()
+    priority = db.case((ClassificationRevision.uncertain_segments > 0, 0), else_=1)
+    if "after" in request.args:
+        cursor = request.args["after"]
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", cursor) or int(cursor) > 2**63 - 1:
+            abort(400)
+        # Queue eligibility can change between requests. The immutable anchor
+        # still supplies its ordering tuple after a review resolves/supersedes.
+        pivot = db.session.scalar(db.select(ClassificationRevision).join(ContentItem,
+            ContentItem.id == ClassificationRevision.item_id).join(ContentSource,
+            ContentSource.id == ClassificationRevision.source_id).where(
+            ClassificationRevision.id == int(cursor), ContentItem.admin_id == current_user.id,
+            ContentSource.admin_id == current_user.id)) or abort(404)
+        rank = 0 if pivot.uncertain_segments else 1
+        query = query.where(or_(priority > rank, and_(priority == rank,
+            or_(ClassificationRevision.created_at > pivot.created_at,
+                and_(ClassificationRevision.created_at == pivot.created_at, ClassificationRevision.id > pivot.id)))))
+    revisions = list(db.session.scalars(query.order_by(priority, ClassificationRevision.created_at,
+        ClassificationRevision.id).limit(REVIEW_PAGE_SIZE + 1)))
+    rows = revisions[:REVIEW_PAGE_SIZE]
+    titles = dict(db.session.execute(db.select(ContentItem.id, ContentItem.title).where(
+        ContentItem.id.in_([row.item_id for row in rows]), ContentItem.admin_id == current_user.id)).all()) if rows else {}
+    return render_template("classification_review.html", reviews=[dict(id=row.id, item_id=row.item_id,
+        title=titles.get(row.item_id, "Item"), created_at=row.created_at,
+        classification=classification_view(row, row if row.state == "completed" else None)) for row in rows],
+        next_url=url_for("workspace.classification_review", after=rows[-1].id) if len(revisions) > REVIEW_PAGE_SIZE else None)
+
+
+@workspace.get("/items/<int:item_id>/classification")
+@login_required
+def classification_item(item_id):
+    row = item_owned(item_id)
+    view, target, key, active = item_view(row), public_review_target(row), owned_media_key(row), row.active_classification_revision_id
+    db.session.commit()  # External artifact reads never retain a request transaction.
+    details, media_available, storage = None, False, None
+    try:
+        if active:
+            storage = get_s3_manager(settings())
+            details = review_artifacts(item_id, storage, target)
+    except Exception:
+        return failure("Classification review is temporarily unavailable.", 503)
+    if key:
+        try:
+            storage = storage or get_s3_manager(settings())
+            info = storage.media_info(key)
+            media_available = info["content_type"] in AUDIO_CONTENT_TYPES and type(info["length"]) is int and info["length"] > 0
+        except Exception:
+            pass
+    return render_template("classification_item.html", item=view, review=details, labels=LABELS,
+        media_available=media_available)
+
+
+def classification_payload(allowed):
+    def unique(pairs):
+        value = {}
+        for key, entry in pairs:
+            if key in value:
+                raise ValueError
+            value[key] = entry
+        return value
+
+    def invalid_constant(_value):
+        raise ValueError
+
+    try:
+        data = payload()
+        if request.is_json:
+            data = json.loads(request.get_data(), object_pairs_hook=unique, parse_constant=invalid_constant)
+    except (ValueError, UnicodeError, RecursionError):
+        abort(400)
+    if (set(data) - (allowed | {"csrf_token"})
+            or not request.is_json and any(len(request.form.getlist(key)) != 1 for key in request.form)):
+        abort(400)
+    return data
+
+
+@workspace.post("/items/<int:item_id>/classification/overrides")
+@workspace.post("/api/items/<int:item_id>/classification/overrides")
+@login_required
+def classification_override(item_id):
+    row = item_owned(item_id)
+    data = classification_payload({"active_revision_id", "first_segment_id", "last_segment_id", "label"})
+    identity = data.get("active_revision_id")
+    if not request.is_json and isinstance(identity, str) and re.fullmatch(r"[1-9][0-9]{0,9}", identity):
+        identity = int(identity)
+    if (type(identity) is not int or not 0 < identity < 2**31
+            or not isinstance(data.get("label"), str) or data["label"] not in LABELS
+            or any(not isinstance(data.get(key), str) or not re.fullmatch(r"seg-[0-9]{6}-[a-f0-9]{16}", data[key])
+                for key in ("first_segment_id", "last_segment_id"))):
+        abort(400)
+    revision = db.session.scalar(db.select(ClassificationRevision).where(
+        ClassificationRevision.id == identity, ClassificationRevision.item_id == row.id))
+    if revision is None:
+        abort(400)
+    if row.active_classification_revision_id != identity:
+        return failure("Classification changed. Reload the review page.", 409)
+    admin_id = current_user.id
+    db.session.commit()
+    from tasks import get_classification_service, publish_override
+    try:
+        outcome = get_classification_service().record_override(item_id=item_id, admin_id=admin_id,
+            active_revision_id=identity, first_segment_id=data["first_segment_id"],
+            last_segment_id=data["last_segment_id"], label=data["label"])
+    except Exception:
+        db.session.rollback()
+        latest = item_owned(item_id).active_classification_revision_id
+        if latest != identity:
+            return failure("Classification changed. Reload the review page.", 409)
+        abort(400)
+    try:
+        publish_override(outcome)  # Service committed both outboxes before this handoff.
+    except Exception:
+        db.session.rollback()  # Unknown publication keeps committed outboxes recoverable.
+    return result(dict(id=item_id, revision_id=outcome.revision_id, state="pending"), status=202,
+        location=url_for("workspace.classification_item", item_id=item_id), message="Correction saved. Classification requested.")
+
+
+@workspace.post("/items/<int:item_id>/classification/retry")
+@workspace.post("/api/items/<int:item_id>/classification/retry")
+@login_required
+def classification_retry(item_id):
+    item_owned(item_id)
+    classification_payload(set())
+    from tasks import _item_lock, get_classification_service, _revision_dispatch, _publish_classification
+    with _item_lock(item_id) as acquired:
+        if not acquired:
+            return failure("Classification is busy. Try again shortly.", 409)
+        row = item_owned(item_id)
+        if row.status != "completed":
+            return failure("Classification retry is unavailable.", 409)
+        failed = db.session.scalar(db.select(ClassificationRevision).where(
+            ClassificationRevision.item_id == item_id, ClassificationRevision.transcript_sha256 == row.transcript_sha256,
+            ClassificationRevision.state == "failed").order_by(ClassificationRevision.id.desc()).limit(1))
+        if failed is None:
+            return failure("Classification retry is unavailable.", 409)
+        key = f"manual_retry:{failed.id}"
+        db.session.commit()
+        try:
+            revision_id = get_classification_service().ensure_revision(item_id, "manual_retry", idempotency_key=key)
+            revision = db.session.get(ClassificationRevision, revision_id)
+            dispatch = _revision_dispatch(revision) if revision.error_category == "dispatch_pending" else None
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            return failure("Classification retry is temporarily unavailable.", 503)
+    try:
+        _publish_classification(dispatch)
+    except Exception:
+        db.session.rollback()
+    return result(dict(id=item_id, revision_id=revision_id, state="pending"), status=202,
+        location=url_for("workspace.classification_item", item_id=item_id), message="Classification retry requested.")
+
+
+@workspace.get("/items/<int:item_id>/media")
+@login_required
+def private_media(item_id):
+    row = item_owned(item_id)
+    key = owned_media_key(row)
+    if not key:
+        abort(404)
+    header = request.headers.get("Range")
+    try:
+        parse_media_range(header)
+    except StorageRangeError:
+        abort(416)
+    db.session.commit()
+    try:
+        media = get_s3_manager(settings()).download_range(key, header)
+    except StorageRangeError:
+        abort(416)
+    except Exception:
+        abort(404)
+    return Response(media["body"], status=206, content_type=media["content_type"], headers={
+        "Content-Length": str(media["length"]), "Content-Range": media["content_range"], "Accept-Ranges": "bytes"})
 
 
 def selector(data):

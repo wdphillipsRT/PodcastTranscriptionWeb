@@ -20,7 +20,7 @@ OBSOLETE = (
 )
 EXCLUDED_DIRS = {
     ".git", ".venv", "venv", "env", ".worktrees", ".superpowers", ".planning",
-    ".claude", ".codex", ".pytest_cache", "__pycache__", "tests", "docs",
+    ".claude", ".runtime", ".codex", ".pytest_cache", "__pycache__", "tests", "docs",
     "node_modules", "data", "logs", "downloads", "tmp", "build", "dist",
 }
 PATTERNS = {
@@ -231,6 +231,36 @@ def test_backup_files_are_ignored_by_git_and_docker():
     assert "backups/" in (ROOT / ".gitignore").read_text().splitlines()
     assert "*.dump" in (ROOT / ".gitignore").read_text().splitlines()
     assert "backups" in patterns and "*.dump" in patterns
+
+
+def test_claude_runtime_credentials_are_ignored_by_git_and_docker():
+    paths = (".runtime/claude/.credentials.json", ".runtime/claude/settings.json", ".runtime/other/private")
+    checked = subprocess.run(["git", "check-ignore", "--no-index", "--stdin"],
+                             input="\n".join(paths) + "\n", cwd=ROOT,
+                             text=True, capture_output=True, check=False)
+    assert checked.returncode == 0 and set(checked.stdout.splitlines()) == set(paths)
+    assert ".runtime/" in (ROOT / ".gitignore").read_text().splitlines()
+    assert ".runtime/" in (ROOT / ".dockerignore").read_text().splitlines()
+
+
+def test_operations_documents_classifier_authentication_and_current_schema():
+    guide = (ROOT / "docs/operations.md").read_text()
+    for command in (
+        "install -d -m 700 .runtime/claude",
+        "docker compose run --rm --entrypoint claude classifier auth login",
+        "docker compose run --rm --entrypoint claude classifier auth status --text",
+        "docker compose exec classifier celery -A tasks.celery_app inspect --timeout 5 --destination",
+    ):
+        assert command in guide
+    assert "0002_commercial_classification" in guide
+    assert "seven-service stack" in guide and "all thirteen table" in guide
+    assert "six-service stack" not in guide and "all eight table" not in guide
+    for table in ("admins", "content_sources", "content_items", "source_items", "backfill_requests",
+                  "discovery_runs", "discovery_candidates", "processing_jobs", "classification_revisions",
+                  "classification_blocks", "segment_overrides", "source_classification_rules", "classification_sweeps"):
+        assert f"`{table}`" in guide
+    assert "@anthropic-ai/claude-code@2.1.303" in guide
+    assert "CLAUDE_CONFIG_HOST_PATH" in guide
 
 
 def backup_block():

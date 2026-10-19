@@ -31,6 +31,7 @@
     {% if current_user.is_authenticated %}
     <nav aria-label="Main navigation">
       <a href="{{ url_for('workspace.dashboard') }}">Dashboard</a>
+      <a href="{{ url_for('workspace.classification_review') }}">Classification reviews ({{ classification_review_depth }})</a>
       <form method="post" action="{{ url_for('auth.logout') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() if config.WTF_CSRF_ENABLED else '' }}">
         <button type="submit">Log out</button>

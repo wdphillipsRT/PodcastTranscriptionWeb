@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "source_items.html" import item_table with context %}
 {% block title %}Dashboard · Private media workspace{% endblock %}
 {% block content %}
 <h1>Media sources</h1>
@@ -21,5 +22,8 @@
     <p>Discovery: {{ source.discovery_state }} · {{ 'Enabled' if source.enabled else 'Disabled' }}</p>
   </article>
   {% else %}<p>No sources yet. Add a source above to begin.</p>{% endfor %}
+</section>
+<section aria-labelledby="recent-items"><h2 id="recent-items">Recent imported items</h2>
+{{ item_table(items) }}
 </section>
 {% endblock %}

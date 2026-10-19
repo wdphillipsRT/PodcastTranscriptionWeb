@@ -1,9 +1,13 @@
 """The actual Alembic history must match ORM metadata and reverse cleanly."""
 
 import importlib
+import importlib.util
+from io import StringIO
+from pathlib import Path
 
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
+from alembic.operations import Operations
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
 import pytest
@@ -16,10 +20,27 @@ def test_initial_migration_upgrade_schema_and_downgrade(app_factory, tmp_path):
     database = tmp_path / "migration.sqlite"
     app = app_factory(SQLALCHEMY_DATABASE_URI=f"sqlite:///{database}")
     runner = app.test_cli_runner()
+    result = runner.invoke(args=["db", "upgrade", "0001_media_foundation"])
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    with app.app_context(), db.engine.begin() as connection:
+        connection.execute(sa.text("INSERT INTO admins (id, email, password_hash) VALUES (1, 'owner@example.com', 'hash')"))
+        connection.execute(sa.text("""INSERT INTO content_sources
+            (id, admin_id, source_type, external_id, canonical_url, name, provider_metadata)
+            VALUES (1, 1, 'podcast_rss', 'feed', 'https://example.com/feed', 'Feed', '{}')"""))
+        connection.execute(sa.text("""INSERT INTO content_items
+            (id, admin_id, item_type, platform, external_id, canonical_url, title, status,
+             transcript_s3_key, transcript_sha256, segments_s3_key, segments_sha256)
+            VALUES (1, 1, 'youtube_video', 'youtube', 'old-item', 'https://example.com/item',
+                    'Existing item', 'completed', 'transcript.json', :digest, 'segments.json', :digest)"""),
+                           {"digest": "a" * 64})
+        connection.execute(sa.text("INSERT INTO source_items (source_id, item_id) VALUES (1, 1)"))
+        connection.execute(sa.text("INSERT INTO processing_jobs (item_id, stage) VALUES (1, 'normalize')"))
     result = runner.invoke(args=["db", "upgrade"])
     assert result.exit_code == 0, result.output + repr(result.exception)
     expected = {"admins", "content_sources", "content_items", "source_items", "discovery_runs",
-                "discovery_candidates", "backfill_requests", "processing_jobs"}
+                "discovery_candidates", "backfill_requests", "processing_jobs",
+                "classification_revisions", "classification_blocks", "segment_overrides",
+                "source_classification_rules", "classification_sweeps"}
     with app.app_context():
         inspector = sa.inspect(db.engine)
         assert set(inspector.get_table_names()) == expected | {"alembic_version"}
@@ -33,8 +54,14 @@ def test_initial_migration_upgrade_schema_and_downgrade(app_factory, tmp_path):
             assert db.metadata.tables["content_items"].c.remote_media_url.type.compile(
                 dialect=dialect) == "VARCHAR(4096)"
         with db.engine.connect() as connection:
-            assert connection.scalar(sa.text("select version_num from alembic_version")) == "0001_media_foundation"
-            context = MigrationContext.configure(connection, opts={"compare_type": True})
+            assert connection.scalar(sa.text("select version_num from alembic_version")) == "0002_commercial_classification"
+            retained = connection.execute(sa.text("SELECT status, transcript_s3_key, transcript_sha256, segments_s3_key, segments_sha256, active_classification_revision_id FROM content_items WHERE id = 1")).one()
+            assert tuple(retained) == ("completed", "transcript.json", "a" * 64, "segments.json", "a" * 64, None)
+            assert connection.scalar(sa.text("SELECT count(*) FROM source_items WHERE item_id = 1")) == 1
+            assert connection.scalar(sa.text("SELECT count(*) FROM processing_jobs WHERE item_id = 1")) == 1
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+            context = MigrationContext.configure(connection, opts={"compare_type": True, "compare_server_default": True})
             assert compare_metadata(context, db.metadata) == []
         for table in expected:
             reflected = inspector.get_check_constraints(table)
@@ -52,6 +79,21 @@ def test_initial_migration_upgrade_schema_and_downgrade(app_factory, tmp_path):
         }
         for table, required in index_columns.items():
             assert required <= {tuple(index["column_names"]) for index in inspector.get_indexes(table)}
+    result = runner.invoke(args=["db", "downgrade", "0001_media_foundation"])
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    with app.app_context(), db.engine.connect() as connection:
+        assert connection.scalar(sa.text("SELECT transcript_s3_key FROM content_items WHERE id = 1")) == "transcript.json"
+        assert connection.scalar(sa.text("SELECT count(*) FROM source_items WHERE item_id = 1")) == 1
+        assert connection.scalar(sa.text("SELECT count(*) FROM processing_jobs WHERE item_id = 1")) == 1
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+        assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        assert "active_classification_revision_id" not in {c["name"] for c in sa.inspect(connection).get_columns("content_items")}
+    result = runner.invoke(args=["db", "upgrade"])
+    assert result.exit_code == 0, result.output + repr(result.exception)
+
+
+    with app.app_context(), db.engine.connect() as connection:
+        assert compare_metadata(MigrationContext.configure(connection, opts={"compare_type": True}), db.metadata) == []
     result = runner.invoke(args=["db", "downgrade", "base"])
     assert result.exit_code == 0, result.output + repr(result.exception)
     with app.app_context():
@@ -61,6 +103,26 @@ def test_initial_migration_upgrade_schema_and_downgrade(app_factory, tmp_path):
     # A fresh upgrade after downgrade catches stale indexes and broken reversibility.
     result = runner.invoke(args=["db", "upgrade"])
     assert result.exit_code == 0, result.output + repr(result.exception)
+
+
+def test_classification_migration_renders_postgresql_in_dependency_order():
+    path = Path(__file__).resolve().parents[1] / "migrations/versions/0002_commercial_classification.py"
+    specification = importlib.util.spec_from_file_location("classification_migration", path)
+    assert specification is not None
+    migration = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(migration)
+    assert migration.revision == "0002_commercial_classification"
+    assert migration.down_revision == "0001_media_foundation"
+    sql = StringIO()
+    context = MigrationContext.configure(dialect_name="postgresql", opts={"as_sql": True, "output_buffer": sql})
+    with Operations.context(context):
+        migration.upgrade()
+        migration.downgrade()
+    statements = sql.getvalue()
+    assert "BIGINT" in statements and "VARCHAR(27)" in statements
+    assert statements.index("CREATE TABLE classification_sweeps") < statements.index("ALTER TABLE content_items ADD COLUMN active_classification_revision_id")
+    assert "ADD CONSTRAINT fk_content_items_active_classification_revision" in statements
+    assert statements.index("DROP CONSTRAINT fk_content_items_active_classification_revision") < statements.index("DROP TABLE classification_revisions")
 
 
 def test_migrated_storage_accepts_public_selectors_and_rejects_signed_bindings(app_factory, tmp_path):

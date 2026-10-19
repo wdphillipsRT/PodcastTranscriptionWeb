@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% from "source_items.html" import classification_summary with context %}
+{% block title %}Classification review · {{ item.title }}{% endblock %}
+{% block content %}
+<h1>Classification review: {{ item.title }}</h1>
+<p><a href="{{ url_for('workspace.item', item_id=item.id) }}">Back to item</a></p>
+{{ classification_summary(item.classification) }}
+{% if media_available %}<section aria-labelledby="playback-heading"><h2 id="playback-heading">Private playback</h2>
+<audio id="review-audio" controls preload="metadata" src="{{ url_for('workspace.private_media', item_id=item.id) }}">Your browser does not support audio playback.</audio>
+<p id="playback-status" role="status" aria-live="polite"></p></section>{% endif %}
+{% if review %}
+<p>Decision timestamp: <time datetime="{{ review.completed_at.isoformat() }}">{{ review.completed_at }}</time></p>
+<section aria-labelledby="ranges-heading"><h2 id="ranges-heading">Contiguous ranges</h2>
+{% for range in review.ranges %}<article>
+<h3>{{ range.start }}–{{ range.end }} seconds · {{ range.label }}</h3>
+<dl><dt>Learning eligibility</dt><dd>{{ 'Included' if range.eligible else 'Excluded' }}</dd>
+<dt>Confidence</dt><dd>{{ '%.3f'|format(range.confidence) }}</dd>
+<dt>Reasons</dt><dd>{{ range.reasons|join(', ') }}</dd>
+<dt>Signals</dt><dd>{{ range.signals|join(', ') or 'None' }}</dd>
+<dt>Decision source</dt><dd>{{ range.decision_source }}</dd></dl>
+{% if media_available %}<button type="button" data-seek="{{ range.start }}" aria-controls="review-audio">Play from {{ range.start }} seconds</button>{% endif %}
+{% if range.citation %}<p><a href="{{ range.citation }}" target="_blank" rel="noopener noreferrer">Public source timestamp</a></p>{% endif %}
+<pre>{{ range.text }}</pre></article>{% endfor %}</section>
+<section aria-labelledby="correction-heading"><h2 id="correction-heading">Correct a contiguous range</h2>
+<p id="correction-help">Choose the first and last segments in transcript order. Every segment between them receives the selected label. Editorial content is included in learning; other labels are excluded. The correction also learns a rule for this source.</p>
+<form method="post" action="{{ url_for('workspace.classification_override', item_id=item.id) }}" aria-describedby="correction-help">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() if config.WTF_CSRF_ENABLED else '' }}">
+<input type="hidden" name="active_revision_id" value="{{ review.active_revision_id }}">
+<label for="first-segment">First segment</label><select id="first-segment" name="first_segment_id" required>{% for boundary in review.boundaries %}<option value="{{ boundary.id }}">{{ boundary.label }}</option>{% endfor %}</select>
+<label for="last-segment">Last segment</label><select id="last-segment" name="last_segment_id" required>{% for boundary in review.boundaries %}<option value="{{ boundary.id }}">{{ boundary.label }}</option>{% endfor %}</select>
+<label for="classification-label">Label</label><select id="classification-label" name="label" required>{% for label in labels %}<option value="{{ label }}">{{ label }}</option>{% endfor %}</select>
+<button type="submit">Save correction</button></form></section>
+{% else %}<p>No active classification policy is available yet.</p>{% endif %}
+{% if item.classification.state == 'Failed' %}<section aria-labelledby="retry-classification"><h2 id="retry-classification">Retry classification</h2>
+<form method="post" action="{{ url_for('workspace.classification_retry', item_id=item.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() if config.WTF_CSRF_ENABLED else '' }}">
+<button type="submit">Retry classification</button></form></section>{% endif %}
+{% endblock %}

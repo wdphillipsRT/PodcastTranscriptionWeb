@@ -18,6 +18,7 @@
 .worktrees
 .superpowers
 .claude
+.runtime/
 .codex
 .planning
 .github
