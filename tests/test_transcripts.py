@@ -137,7 +137,11 @@ def test_vtt_accepts_youtube_whitespace_split_payloads_and_skips_empty_cues():
     "next-cue\n00:00:02.000 --> 00:00:03.000\nSecond.",
     "NOTE hidden note\nhidden\n\n00:00:02.000 --> 00:00:03.000\nSecond.",
     "STYLE\n::cue { color: lime; }\n\n00:00:02.000 --> 00:00:03.000\nSecond.",
+    "STYLE \n::cue { color: lime; }\n\n00:00:02.000 --> 00:00:03.000\nSecond.",
+    "STYLE\t\n::cue { color: lime; }\n\n00:00:02.000 --> 00:00:03.000\nSecond.",
     "REGION\nid:region\n\n00:00:02.000 --> 00:00:03.000\nSecond.",
+    "REGION \nid:region\n\n00:00:02.000 --> 00:00:03.000\nSecond.",
+    "REGION\t\nid:region\n\n00:00:02.000 --> 00:00:03.000\nSecond.",
 ])
 def test_vtt_empty_cues_do_not_consume_next_cue_ids_or_metadata(following):
     raw = ("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFirst.\n\n"
@@ -146,7 +150,23 @@ def test_vtt_empty_cues_do_not_consume_next_cue_ids_or_metadata(following):
     assert [segment.text for segment in result.segments] == ["First.", "Second."]
 
 
-@pytest.mark.parametrize("payload", ["", " \t\n", "<c></c>"])
+@pytest.mark.parametrize("payload", ["STYLEguide", "REGIONAL", "STYLE caption", "REGION caption"])
+def test_vtt_metadata_prefixes_remain_detached_caption_text(payload):
+    raw = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n \t\n" + payload
+    result = module().normalize_vtt(raw, origin="automatic_caption", **METADATA)
+    assert [segment.text for segment in result.segments] == [payload]
+
+
+@pytest.mark.parametrize("payload", ["\u00a0", "&nbsp;", "\u2003"])
+def test_vtt_whitespace_only_cues_are_skipped(payload):
+    raw = ("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFirst.\n\n"
+           "00:00:01.000 --> 00:00:02.000\n" + payload +
+           "\n\n00:00:02.000 --> 00:00:03.000\nSecond.")
+    result = module().normalize_vtt(raw, origin="automatic_caption", **METADATA)
+    assert [segment.text for segment in result.segments] == ["First.", "Second."]
+
+
+@pytest.mark.parametrize("payload", ["", " \t\n", "<c></c>", "\u00a0", "&nbsp;"])
 def test_vtt_without_usable_caption_text_is_rejected(payload):
     raw = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n" + payload
     with pytest.raises(module().TranscriptValidationError, match="^invalid transcript input$"):
@@ -161,6 +181,7 @@ def test_vtt_without_usable_caption_text_is_rejected(payload):
     "00:00:02.000 --> malformed\n \t",
     "00:00:02.000 --> 00:00:04.000\n\nSECRET\x00",
     "00:00:02.000 --> 00:00:04.000\n\n\x0b",
+    "00:00:02.000 --> 00:00:04.000\n\n\x0c",
     "00:00:02.000 --> 00:00:04.000\n\ns3://private/SECRET",
     "00:00:02.000 --> 00:00:04.000\n\nhttps://bucket.s3.amazonaws.com/SECRET",
     "00:00:02.000 --> 00:00:04.000\n\nhttps://example.com/?token=SECRET",
