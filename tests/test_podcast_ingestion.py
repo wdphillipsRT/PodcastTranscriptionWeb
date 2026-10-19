@@ -456,7 +456,7 @@ def single_enclosure(url, *, guid="episode", link=""):
 def test_feed_query_selectors_are_requested_and_distinguish_source_identity(settings):
     sources = []
     for selector in ("1", "2"):
-        canonical = URL + f"?locale=en&show={selector}"
+        canonical = URL + f"?show={selector}&locale=en"
         session = Session(Response(url=canonical), Response(FEED, url=canonical))
         source = resolve_podcast_source(URL + f"?show={selector}&locale=en", settings, session)
         assert [call[1] for call in session.calls] == [canonical, canonical]
@@ -627,3 +627,52 @@ def test_guidless_reacquisition_matches_full_digest_and_fails_on_rotation(source
     with pytest.raises(IngestionError, match="item_not_found"):
         podcast.reacquire_podcast_media(source, item.external_id, settings,
             Session(Response(single_enclosure(raw.replace("secret", "rotated"), guid=None))))
+
+
+def test_repeated_public_queries_keep_order_through_discovery_reacquisition_download(settings, tmp_path):
+    sources, episodes = [], []
+    for query in ("show=2&show=1", "show=1&show=2"):
+        feed_url = URL + "?" + query
+        media_url = "https://cdn.example/audio?" + query
+        body = single_enclosure(media_url, guid=None)
+        resolving = Session(Response(url=feed_url), Response(body, url=feed_url))
+        source = resolve_podcast_source(feed_url, settings, resolving)
+        assert [call[1] for call in resolving.calls] == [feed_url, feed_url]
+        assert source.canonical_url == feed_url
+        assert source.external_id == sha256(feed_url.encode()).hexdigest()
+        session = Session(Response(body, url=feed_url), Response(body, url=feed_url), Response(b"audio"))
+        episode = discover_podcast_items(source, settings, session).items[0]
+        assert episode.media_url == episode.canonical_url == media_url
+        assert episode.guid == media_url
+        assert episode.external_id == sha256((source.external_id + media_url).encode()).hexdigest()
+        locator = podcast.reacquire_podcast_media(source, episode.external_id, settings, session)
+        download_podcast_audio(locator, tmp_path / str(len(sources)), settings, session)
+        assert [call[1] for call in session.calls] == [feed_url, feed_url, media_url]
+        sources.append(source)
+        episodes.append(episode)
+    assert sources[0].external_id != sources[1].external_id
+    assert episodes[0].external_id != episodes[1].external_id
+
+
+def test_reversed_enclosure_pair_order_distinguishes_fallback_identity_within_same_source(source, settings):
+    episodes = []
+    for query in ("episode=2&episode=1", "episode=1&episode=2"):
+        media_url = "https://cdn.example/audio?" + query
+        episode = discover_podcast_items(source, settings,
+            Session(Response(single_enclosure(media_url, guid=None)))).items[0]
+        assert episode.media_url == media_url
+        episodes.append(episode)
+    assert episodes[0].external_id != episodes[1].external_id
+
+
+def test_query_normalization_preserves_pair_order_while_normalizing_encoding():
+    raw = "https://example.org/feed?show=2&show=1&label=a%20b&path=%2f&empty"
+    assert normalize_public_url(raw) == "https://example.org/feed?show=2&show=1&label=a+b&path=%2F&empty="
+
+
+@pytest.mark.parametrize("query", ["show=2&show=1&TOKEN=&token=secret", "token=secret&show=2&token=", "show=2&%74oken=secret&show=1"])
+def test_sensitive_duplicate_keys_are_rejected_in_every_position(query, settings):
+    session = Session()
+    with pytest.raises(IngestionError):
+        resolve_podcast_source(URL + "?" + query, settings, session)
+    assert session.calls == []

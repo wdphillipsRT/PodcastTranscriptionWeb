@@ -307,7 +307,8 @@ def test_core_writes_reject_unsafe_remote_media_urls(schema, operation, unsafe_u
 
 
 @pytest.mark.parametrize("operation", ["insert", "update"])
-@pytest.mark.parametrize("safe_url", [None, "https://cdn.example.com/episode.mp3", "https://cdn.example.com/audio?episode=1"])
+@pytest.mark.parametrize("safe_url", [None, "https://cdn.example.com/episode.mp3", "https://cdn.example.com/audio?episode=1",
+    "https://cdn.example.com/audio?episode=2&episode=1", "https://cdn.example.com/audio?episode=1&episode=2"])
 def test_core_writes_preserve_safe_remote_media_urls_and_null(schema, operation, safe_url):
     owner = admin(schema)
     if operation == "insert":
@@ -423,3 +424,25 @@ def test_case_insensitive_signed_queries_rejected_at_bind_time(schema, key):
             platform="podcast", item_type="podcast_episode", external_id="unsafe",
             canonical_url="https://example.org/episode", title="Episode",
             remote_media_url=f"https://cdn.example.org/audio?{key}=secret"))
+
+
+@pytest.mark.parametrize("query", ["episode=2&episode=1", "episode=1&episode=2"])
+def test_candidate_core_bind_preserves_duplicate_public_query_order(schema, query):
+    _, _, _, run = graph(schema)
+    descriptor = {"canonical_url": "https://example.org/episode?" + query,
+        "remote_media_url": "https://cdn.example.org/audio?" + query}
+    db.session.execute(sa.insert(schema.DiscoveryCandidate).values(run_id=run.id, platform="podcast",
+        external_id="query-order", descriptor=descriptor))
+    db.session.commit()
+    value = db.session.scalar(sa.select(schema.DiscoveryCandidate).where(
+        schema.DiscoveryCandidate.external_id == "query-order"))
+    assert value.descriptor == descriptor
+
+
+def test_remote_media_core_bind_rejects_sensitive_duplicates(schema):
+    owner = admin(schema)
+    with pytest.raises(StatementError, match="credentials"):
+        db.session.execute(sa.insert(schema.ContentItem).values(admin_id=owner.id,
+            platform="podcast", item_type="podcast_episode", external_id="unsafe-duplicate",
+            canonical_url="https://example.org/episode", title="Episode",
+            remote_media_url="https://cdn.example.org/audio?episode=2&TOKEN=&token=secret"))

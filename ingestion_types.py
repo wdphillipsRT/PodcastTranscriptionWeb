@@ -60,7 +60,11 @@ def has_sensitive_query(value: str) -> bool:
 
 
 def normalize_public_url(value: str) -> str:
-    """Canonical public identity: retain sorted selectors; reject access secrets."""
+    """Retain public query pair order and duplicates; reject access secrets.
+
+    Query order can select a resource, particularly when keys repeat. Only the
+    encoding is normalized; pairs are never sorted for identity or acquisition.
+    """
     try:
         parts = urlsplit(validated_http_url(value))
         host, port = parts.hostname, parts.port
@@ -71,7 +75,7 @@ def normalize_public_url(value: str) -> str:
             host = f"[{host}]"
         if port is not None and (parts.scheme, port) not in {("https", 443), ("http", 80)}:
             host += f":{port}"
-        query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+        query = urlencode(parse_qsl(parts.query, keep_blank_values=True))
         return urlunsplit((parts.scheme.lower(), host, parts.path or "/", query, ""))
     except (TypeError, ValueError, UnicodeError):
         raise IngestionError("invalid_url") from None
