@@ -460,8 +460,10 @@ def _immutable_completed_classification(_mapper, connection, target):
     state = sa.inspect(target)
     if not any(state.attrs[column.key].history.has_changes() for column in state.mapper.column_attrs):
         return
+    # Hold the row lock through the ORM UPDATE so another writer cannot
+    # complete the revision between this state check and that update.
     persisted_state = connection.scalar(sa.select(ClassificationRevision.__table__.c.state).where(
-        ClassificationRevision.__table__.c.id == state.identity[0]))
+        ClassificationRevision.__table__.c.id == state.identity[0]).with_for_update())
     if persisted_state == "completed":
         raise ValueError("completed classification revisions are immutable")
 

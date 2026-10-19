@@ -4,6 +4,7 @@ import importlib
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import IntegrityError
 
 from extensions import db
@@ -128,6 +129,39 @@ def test_completed_revision_is_immutable_but_selectable(schema, field, value):
     setattr(revision, field, value)
     with pytest.raises(ValueError, match="immutable"):
         db.session.commit()
+
+
+def test_revision_immutability_check_locks_row_before_update(schema):
+    _, source, item = graph(schema)
+    revision = schema.ClassificationRevision(**revision_values(source, item))
+    db.session.add(revision)
+    db.session.commit()
+    statements = []
+
+    def capture(connection, statement, _multiparams, _params, _execution_options):
+        statements.append((statement, connection.get_transaction()))
+
+    sa.event.listen(db.engine, "before_execute", capture)
+    try:
+        revision.attempts = 1
+        db.session.flush()
+    finally:
+        sa.event.remove(db.engine, "before_execute", capture)
+
+    state_reads = [(index, statement, transaction) for index, (statement, transaction) in enumerate(statements)
+        if isinstance(statement, sa.sql.Select) and list(statement.selected_columns.keys()) == ["state"]
+        and statement.get_final_froms() == [schema.ClassificationRevision.__table__]]
+    assert len(state_reads) == 1
+    read_index, state_query, transaction = state_reads[0]
+    update_index, update_transaction = next((index, transaction)
+        for index, (statement, transaction) in enumerate(statements)
+        if isinstance(statement, sa.sql.Update) and statement.table.name == "classification_revisions")
+    assert read_index < update_index
+    assert transaction is update_transaction and transaction.is_active
+    # Compile the real listener query for PostgreSQL; SQLite cannot establish
+    # PostgreSQL row-lock semantics and deliberately omits FOR UPDATE itself.
+    assert str(state_query.compile(dialect=postgresql.dialect())).endswith("FOR UPDATE")
+    assert "FOR UPDATE" not in str(state_query.compile(dialect=sqlite.dialect()))
 
 
 def block_values(revision, **changes):
