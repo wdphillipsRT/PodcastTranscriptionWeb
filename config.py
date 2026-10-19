@@ -48,6 +48,17 @@ class Settings:
     TRANSCRIBE_POLL_SECONDS: int = 10
     TRANSCRIBE_TIMEOUT_SECONDS: int = 14_400
     TRANSCRIBE_LANGUAGE_CODE: str = "en-US"
+    TRANSCRIPTION_PRIMARY: str = "amazon_transcribe"
+    FASTER_WHISPER_EXPECTED_VERSION: str = "1.2.1"
+    WHISPER_MODEL: str = "medium.en"
+    WHISPER_MODEL_REPOSITORY: str = "Systran/faster-whisper-medium.en"
+    WHISPER_MODEL_REVISION: str = "a29b04bd15381511a9af671baec01072039215e3"
+    WHISPER_COMPUTE_TYPE: str = "int8"
+    WHISPER_CPU_THREADS: int = 10
+    WHISPER_MAX_ATTEMPTS: int = 3
+    WHISPER_SOFT_TIME_LIMIT_SECONDS: int = 21600
+    WHISPER_HARD_TIME_LIMIT_SECONDS: int = 21900
+    WHISPER_MAX_AUDIO_DURATION_SECONDS: int = 21600
     RATELIMIT_DEFAULT: str = ""
     RATELIMIT_LOGIN: str = "5 per minute"
     LOG_LEVEL: str = "INFO"
@@ -131,6 +142,28 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
 
     if values["YOUTUBE_MAX_ITEMS_PER_BACKFILL_TASK"] > values["BACKFILL_REQUEST_MAX_ITEMS"]:
         raise ConfigError("YOUTUBE_MAX_ITEMS_PER_BACKFILL_TASK must not exceed BACKFILL_REQUEST_MAX_ITEMS")
+
+    primary = _nonempty(environment, "TRANSCRIPTION_PRIMARY", Settings.TRANSCRIPTION_PRIMARY)
+    if primary not in {"amazon_transcribe", "faster_whisper"}:
+        raise ConfigError("TRANSCRIPTION_PRIMARY must be amazon_transcribe or faster_whisper")
+    values["TRANSCRIPTION_PRIMARY"] = primary
+    for name in ("FASTER_WHISPER_EXPECTED_VERSION", "WHISPER_MODEL", "WHISPER_MODEL_REPOSITORY",
+                 "WHISPER_MODEL_REVISION", "WHISPER_COMPUTE_TYPE"):
+        expected = getattr(Settings, name)
+        value = _nonempty(environment, name, expected)
+        if value != expected:
+            raise ConfigError(f"{name} must be {expected}")
+        values[name] = value
+    if values["WHISPER_CPU_THREADS"] > 10:
+        raise ConfigError("WHISPER_CPU_THREADS must be between 1 and 10")
+    if values["WHISPER_MAX_ATTEMPTS"] != 3:
+        raise ConfigError("WHISPER_MAX_ATTEMPTS must be 3")
+    if values["WHISPER_HARD_TIME_LIMIT_SECONDS"] <= values["WHISPER_SOFT_TIME_LIMIT_SECONDS"]:
+        raise ConfigError("WHISPER_HARD_TIME_LIMIT_SECONDS must exceed WHISPER_SOFT_TIME_LIMIT_SECONDS")
+    if values["WHISPER_MAX_AUDIO_DURATION_SECONDS"] > 21600:
+        raise ConfigError("WHISPER_MAX_AUDIO_DURATION_SECONDS must not exceed 21600")
+    if values["WHISPER_MAX_AUDIO_DURATION_SECONDS"] > values["WHISPER_HARD_TIME_LIMIT_SECONDS"]:
+        raise ConfigError("WHISPER_MAX_AUDIO_DURATION_SECONDS must not exceed WHISPER_HARD_TIME_LIMIT_SECONDS")
 
     if values["CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES"] > 2_097_152:
         raise ConfigError("CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES must not exceed 2097152")

@@ -2,6 +2,7 @@
 
 import ast
 import fnmatch
+import json
 import os
 from pathlib import Path
 import re
@@ -109,6 +110,71 @@ def violations(path, content):
 
 def test_obsolete_files_are_absent():
     assert not [name for name in OBSOLETE if (ROOT / name).exists()]
+
+
+def test_whisper_model_lock_has_exact_immutable_identity():
+    path = ROOT / "whisper-model.lock.json"
+    assert path.is_file(), "Missing immutable Whisper model lock"
+    assert json.loads(path.read_text()) == {
+        "schema": "whisper-model-lock/v1",
+        "provider": "faster-whisper",
+        "provider_version": "1.2.1",
+        "model": "medium.en",
+        "model_repository": "Systran/faster-whisper-medium.en",
+        "model_revision": "a29b04bd15381511a9af671baec01072039215e3",
+        "compute_type": "int8",
+        "required_files": ["config.json", "model.bin", "tokenizer.json", "vocabulary.json"],
+    }
+
+
+def test_whisper_dependencies_are_separate_exact_pins_with_sha256_hashes():
+    source = ROOT / "requirements-whisper.in"
+    lock = ROOT / "requirements-whisper.lock"
+    assert source.is_file(), "Missing Whisper dependency input"
+    assert lock.is_file(), "Missing hashed Whisper dependency lock"
+    assert source.read_text().strip() == "faster-whisper==1.2.1"
+    assert "faster-whisper" not in (ROOT / "requirements.txt").read_text().lower()
+    content = lock.read_text()
+    assert "--python-version 3.11" in content
+    assert "--python-platform x86_64-unknown-linux-gnu" in content
+    requirements = [line.strip() for line in content.replace("\\\n", " ").splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+    names = set()
+    for requirement in requirements:
+        pin, *hashes = requirement.split()
+        assert re.fullmatch(r"[a-zA-Z0-9_.-]+==[a-zA-Z0-9_.+!-]+", pin), requirement
+        assert hashes and all(re.fullmatch(r"--hash=sha256:[a-f0-9]{64}", value)
+                              for value in hashes), requirement
+        name, version = pin.split("==")
+        assert name not in names, name
+        names.add(name)
+        if name == "faster-whisper":
+            assert version == "1.2.1"
+    assert {"faster-whisper", "ctranslate2", "av", "onnxruntime", "tokenizers", "huggingface-hub"} <= names
+
+
+def test_environment_example_pins_whisper_rollout_and_omits_credentials():
+    environment = dict(line.split("=", 1) for line in (ROOT / ".env.example").read_text().splitlines()
+                       if line and not line.startswith("#"))
+    expected = {
+        "TRANSCRIPTION_PRIMARY": "amazon_transcribe",
+        "FASTER_WHISPER_EXPECTED_VERSION": "1.2.1",
+        "WHISPER_MODEL": "medium.en",
+        "WHISPER_MODEL_REPOSITORY": "Systran/faster-whisper-medium.en",
+        "WHISPER_MODEL_REVISION": "a29b04bd15381511a9af671baec01072039215e3",
+        "WHISPER_COMPUTE_TYPE": "int8",
+        "WHISPER_CPU_THREADS": "10",
+        "WHISPER_MAX_ATTEMPTS": "3",
+        "WHISPER_SOFT_TIME_LIMIT_SECONDS": "21600",
+        "WHISPER_HARD_TIME_LIMIT_SECONDS": "21900",
+        "WHISPER_MAX_AUDIO_DURATION_SECONDS": "21600",
+        "WHISPER_AWS_ACCESS_KEY_ID": "",
+        "WHISPER_AWS_SECRET_ACCESS_KEY": "",
+        "WHISPER_AWS_SESSION_TOKEN": "",
+    }
+    for name, value in expected.items():
+        assert name in environment, f"Missing Whisper example setting: {name}"
+        assert environment[name] == value
 
 
 def test_production_runtime_has_no_retired_integrations_or_unsafe_media_execution():

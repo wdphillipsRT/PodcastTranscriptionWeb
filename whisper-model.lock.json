@@ -1,0 +1,15 @@
+{
+  "schema": "whisper-model-lock/v1",
+  "provider": "faster-whisper",
+  "provider_version": "1.2.1",
+  "model": "medium.en",
+  "model_repository": "Systran/faster-whisper-medium.en",
+  "model_revision": "a29b04bd15381511a9af671baec01072039215e3",
+  "compute_type": "int8",
+  "required_files": [
+    "config.json",
+    "model.bin",
+    "tokenizer.json",
+    "vocabulary.json"
+  ]
+}

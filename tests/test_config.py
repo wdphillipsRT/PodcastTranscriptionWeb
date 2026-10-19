@@ -41,6 +41,97 @@ NUMERIC_DEFAULTS = {
     "CLASSIFICATION_RECONCILE_BATCH_SIZE": 100,
 }
 
+WHISPER_DEFAULTS = {
+    "TRANSCRIPTION_PRIMARY": "amazon_transcribe",
+    "FASTER_WHISPER_EXPECTED_VERSION": "1.2.1",
+    "WHISPER_MODEL": "medium.en",
+    "WHISPER_MODEL_REPOSITORY": "Systran/faster-whisper-medium.en",
+    "WHISPER_MODEL_REVISION": "a29b04bd15381511a9af671baec01072039215e3",
+    "WHISPER_COMPUTE_TYPE": "int8",
+    "WHISPER_CPU_THREADS": 10,
+    "WHISPER_MAX_ATTEMPTS": 3,
+    "WHISPER_SOFT_TIME_LIMIT_SECONDS": 21600,
+    "WHISPER_HARD_TIME_LIMIT_SECONDS": 21900,
+    "WHISPER_MAX_AUDIO_DURATION_SECONDS": 21600,
+}
+
+
+@pytest.mark.parametrize("name,expected", WHISPER_DEFAULTS.items())
+def test_whisper_defaults(valid_environment, name, expected):
+    assert getattr(load_settings(valid_environment), name) == expected
+
+
+@pytest.mark.parametrize("primary", ["amazon_transcribe", "faster_whisper"])
+def test_transcription_primary_accepts_only_explicit_supported_providers(valid_environment, primary):
+    valid_environment["TRANSCRIPTION_PRIMARY"] = primary
+    assert load_settings(valid_environment).TRANSCRIPTION_PRIMARY == primary
+
+
+@pytest.mark.parametrize("name,value", [
+    ("TRANSCRIPTION_PRIMARY", "faster-whisper"),
+    ("TRANSCRIPTION_PRIMARY", "Amazon_Transcribe"),
+    ("TRANSCRIPTION_PRIMARY", "other"),
+    ("FASTER_WHISPER_EXPECTED_VERSION", "1.2.0"),
+    ("WHISPER_MODEL", "large-v3"),
+    ("WHISPER_MODEL_REPOSITORY", "other/faster-whisper-medium.en"),
+    ("WHISPER_MODEL_REVISION", "main"),
+    ("WHISPER_MODEL_REVISION", "0" * 40),
+    ("WHISPER_COMPUTE_TYPE", "float32"),
+    ("WHISPER_CPU_THREADS", "11"),
+    ("WHISPER_MAX_ATTEMPTS", "2"),
+    ("WHISPER_MAX_ATTEMPTS", "4"),
+    ("WHISPER_MAX_AUDIO_DURATION_SECONDS", "21601"),
+])
+def test_whisper_rejects_unapproved_settings(valid_environment, name, value):
+    valid_environment[name] = value
+    with pytest.raises(ConfigError, match=name):
+        load_settings(valid_environment)
+
+
+@pytest.mark.parametrize("name", [name for name, default in WHISPER_DEFAULTS.items() if isinstance(default, str)])
+def test_whisper_rejects_empty_identity_settings(valid_environment, name):
+    valid_environment[name] = "   "
+    with pytest.raises(ConfigError, match=name):
+        load_settings(valid_environment)
+
+
+@pytest.mark.parametrize("name", [name for name, default in WHISPER_DEFAULTS.items() if isinstance(default, int)])
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "many", ""])
+def test_whisper_rejects_nonpositive_or_invalid_integers(valid_environment, name, value):
+    valid_environment[name] = value
+    with pytest.raises(ConfigError, match=name):
+        load_settings(valid_environment)
+
+
+@pytest.mark.parametrize("threads", range(1, 11))
+def test_whisper_accepts_bounded_cpu_threads(valid_environment, threads):
+    valid_environment["WHISPER_CPU_THREADS"] = str(threads)
+    assert load_settings(valid_environment).WHISPER_CPU_THREADS == threads
+
+
+@pytest.mark.parametrize("soft,hard,duration,match", [
+    ("21600", "21600", "21600", "WHISPER_HARD_TIME_LIMIT_SECONDS"),
+    ("21600", "21599", "21600", "WHISPER_HARD_TIME_LIMIT_SECONDS"),
+    ("100", "200", "201", "WHISPER_MAX_AUDIO_DURATION_SECONDS"),
+])
+def test_whisper_validates_timeout_relationships(valid_environment, soft, hard, duration, match):
+    valid_environment.update(WHISPER_SOFT_TIME_LIMIT_SECONDS=soft,
+                             WHISPER_HARD_TIME_LIMIT_SECONDS=hard,
+                             WHISPER_MAX_AUDIO_DURATION_SECONDS=duration)
+    with pytest.raises(ConfigError, match=match):
+        load_settings(valid_environment)
+
+
+def test_whisper_parses_valid_numeric_overrides(valid_environment):
+    valid_environment.update(WHISPER_CPU_THREADS="1", WHISPER_MAX_ATTEMPTS="3",
+                             WHISPER_SOFT_TIME_LIMIT_SECONDS="100",
+                             WHISPER_HARD_TIME_LIMIT_SECONDS="200",
+                             WHISPER_MAX_AUDIO_DURATION_SECONDS="200")
+    settings = load_settings(valid_environment)
+    assert (settings.WHISPER_CPU_THREADS, settings.WHISPER_MAX_ATTEMPTS,
+            settings.WHISPER_SOFT_TIME_LIMIT_SECONDS, settings.WHISPER_HARD_TIME_LIMIT_SECONDS,
+            settings.WHISPER_MAX_AUDIO_DURATION_SECONDS) == (1, 3, 100, 200, 200)
+
 
 def test_load_settings_returns_flask_compatible_settings(valid_environment):
     settings = load_settings(valid_environment)
