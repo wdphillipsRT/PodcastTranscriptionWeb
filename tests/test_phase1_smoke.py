@@ -3,6 +3,7 @@
 from collections import Counter, deque
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from hashlib import sha256
 from io import BytesIO
 import json
@@ -13,6 +14,7 @@ import socket
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from bs4 import BeautifulSoup
 from botocore.exceptions import ClientError
 from flask_login import current_user
 import pytest
@@ -273,13 +275,16 @@ def test_phase1_ingests_backfills_and_replays_privately(smoke, monkeypatch, capl
 
     selectors = [
         ("channel", {"selector_type": "date_range", "start_date": "2026-01-04", "end_date": "2026-01-05"}, 2, 2),
-        ("playlist", {"selector_type": "count", "requested_count": 28}, 28, 1),
-        ("channel", {"selector_type": "explicit_url", "explicit_url": f"https://www.youtube.com/watch?v={video_id(1)}"}, 1, 1),
+        ("playlist", {"selector_type": "count", "requested_count": 28}, 5, 3),
+        ("channel", {"selector_type": "explicit_url", "explicit_url": f"https://www.youtube.com/watch?v={video_id(1)}"}, 1, 0),
     ]
     request_ids = []
     for kind, selector, accepted, queued in selectors:
         before_memberships = {row.external_id for row in ContentItem.query.join(SourceItem).filter(
             SourceItem.source_id == sources[kind])}
+        before_jobs = {row.id for row in ProcessingJob.query.all()}
+        before_dispatch = len(smoke.dispatched)
+        before_downloads, before_puts, before_starts = len(smoke.downloads), len(smoke.puts), len(smoke.starts)
         response = browser.post(f"/api/sources/{sources[kind]}/backfills", json=selector, headers=headers)
         assert response.status_code == 201
         request_ids.append(response.json["id"])
@@ -297,17 +302,42 @@ def test_phase1_ingests_backfills_and_replays_privately(smoke, monkeypatch, capl
                 video_id(3): "2026-01-04", video_id(4): "2026-01-05"}
             request = db.session.get(BackfillRequest, response.json["id"])
             assert (request.start_date.isoformat(), request.end_date.isoformat()) == ("2026-01-04", "2026-01-05")
+        elif selector["selector_type"] == "count":
+            memberships = {row.external_id for row in ContentItem.query.join(SourceItem).filter(
+                SourceItem.source_id == sources[kind])}
+            assert memberships - before_memberships == {video_id(n) for n in range(5)}
+            assert memberships == {video_id(n) for n in range(30)}
+            # Two selected videos were processed by the channel's date-range
+            # backfill. Only the remaining three may receive processing work.
+            dispatched = [identity for name, identity in smoke.dispatched[before_dispatch:] if name == "process_item"]
+            assert Counter(db.session.get(ContentItem, identity).external_id for identity in dispatched) == {
+                video_id(n): 1 for n in range(3)}
+            jobs = ProcessingJob.query.filter(ProcessingJob.id.notin_(before_jobs)).all()
+            assert {db.session.get(ContentItem, job.item_id).external_id for job in jobs} == {video_id(n) for n in range(3)}
+            assert Counter((db.session.get(ContentItem, job.item_id).external_id, job.stage) for job in jobs) == {
+                (video_id(n), stage): 1 for n in range(3) for stage in ("youtube_captions", "normalize")}
+            assert all(job.state == "completed" and job.attempts == 1 for job in jobs)
+            assert Counter(smoke.downloads[before_downloads:]) == {
+                (video_id(n), action): 1 for n in range(3) for action in ("inventory", "creator")}
+            assert len(smoke.starts) == before_starts
+            new_keys = smoke.puts[before_puts:]
+            assert len(new_keys) == 9
+            assert Counter(key.split("/")[2] for key in new_keys) == {video_id(n): 3 for n in range(3)}
         before = counts()
         tasks.run_backfill.run(response.json["id"])
         smoke.drain()
         assert counts() == before
-    assert counts()[:5] == (1, 4, 54, 82, 3)
+    assert counts()[:5] == (1, 4, 55, 84, 3)
 
-    # Scheduled scans discover remaining history and add shared memberships only.
+    # Scheduled scans retain the initial observed-history baseline. Historical
+    # items omitted by newest-25 require an explicit backfill.
+    before_scheduled = counts(), list(smoke.downloads), list(smoke.puts), list(smoke.starts)
     for source_id in sources.values():
         tasks.discover_source.run(source_id)
     smoke.drain()
-    assert counts() == (1, 4, 60, 91, 3, 121)
+    assert (counts(), smoke.downloads, smoke.puts, smoke.starts) == before_scheduled
+    assert counts() == (1, 4, 55, 84, 3, 111)
+    assert {row.external_id for row in ContentItem.query.filter_by(platform="podcast")} == expected_rss
     assert {row.status for row in ContentItem.query.all()} == {"completed"}, [
         (row.external_id, row.status, row.processing_stage, row.error_category)
         for row in ContentItem.query.all() if row.status != "completed"]
@@ -317,13 +347,13 @@ def test_phase1_ingests_backfills_and_replays_privately(smoke, monkeypatch, capl
     assert {row.state for row in DiscoveryRun.query.all()} == {"completed"}
     assert {row.run_type for row in DiscoveryRun.query.all()} == {"initial", "scheduled", "backfill"}
     origins = Counter(row.transcript_origin for row in ContentItem.query.all())
-    assert origins == {"creator_caption": 28, "automatic_caption": 1, "amazon_transcribe": 31}
+    assert origins == {"creator_caption": 28, "automatic_caption": 1, "amazon_transcribe": 26}
     for number, expected in ((29, ["inventory", "creator"]),
                               (28, ["inventory", "creator", "automatic"]),
                               (27, ["inventory", "creator", "automatic", "audio"])):
         assert [action for identity, action in smoke.downloads if identity == video_id(number)] == expected
-    assert len(smoke.starts) == len(set(smoke.starts)) == 31
-    assert sum(url == AUDIO_URL for method, url in smoke.http_calls) == 30
+    assert len(smoke.starts) == len(set(smoke.starts)) == 26
+    assert sum(url == AUDIO_URL for method, url in smoke.http_calls) == 25
     assert len(smoke.puts) == len(set(smoke.puts)), "Duplicate processing wrote artifacts again"
     assert all(not path.exists() for path in smoke.paths)
 
@@ -359,7 +389,11 @@ def test_phase1_ingests_backfills_and_replays_privately(smoke, monkeypatch, capl
                 expected = f"https://www.youtube.com/watch?v={row.external_id}&t={int(segment['start'])}s"
                 assert segment["citation"] == expected
             else:
-                assert segment["citation"].startswith(row.canonical_url + "#t=")
+                # Derive exact millisecond targets without reusing normalizer
+                # formatting or trusting a stored citation prefix.
+                times = [format(Decimal(str(segment[key])).quantize(Decimal("0.001")), "f")
+                         .rstrip("0").rstrip(".") for key in ("start", "end")]
+                assert segment["citation"] == f"{row.canonical_url}#t={','.join(times)}"
         keys = [row.transcript_s3_key, row.segments_s3_key, row.provider_transcript_s3_key]
         if row.media_s3_key:
             keys.append(row.media_s3_key)
@@ -370,6 +404,10 @@ def test_phase1_ingests_backfills_and_replays_privately(smoke, monkeypatch, capl
             assert response.status_code == 200 and response.headers["Cache-Control"] == "no-store"
             assert not any(key in response.text for key in keys)
             assert "amazonaws.com" not in response.text and "s3://" not in response.text
+            if not path.startswith("/api/"):
+                citation_urls = {link["href"] for link in BeautifulSoup(response.text, "html.parser").select(
+                    'section[aria-labelledby="citations-heading"] a')}
+                assert citation_urls == {segment["citation"] for segment in payload["segments"]}
             if path.endswith("/transcript"):
                 assert payload["segments"][0]["text"] in response.text
             else:

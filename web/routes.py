@@ -1,18 +1,22 @@
 """Private, owner-scoped workspace. Never serialize operational ORM records."""
 from datetime import date
+import json
+import math
 import re
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 from flask import Blueprint, abort, current_app, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 
 from extensions import db
-from ingestion_types import SourceDescriptor
+from ingestion_types import SourceDescriptor, normalize_public_url
 from models import (BackfillRequest, ContentItem, ContentSource, DiscoveryRun,
                     ProcessingJob, SourceItem, SOURCE_TYPES, utc_now)
 from s3_utils import get_s3_manager
-from source_classifier import CHANNEL_ID, PLAYLIST_ID, classify_source_url
+from source_classifier import CHANNEL_ID, PLAYLIST_ID, classify_source_url, youtube_locator
 
 
 workspace = Blueprint("workspace", __name__)
@@ -22,6 +26,7 @@ ORIGIN_LABELS = {"creator_caption": "Creator captions", "automatic_caption": "Au
                  "amazon_transcribe": "Amazon Transcribe"}
 PROVIDER_LABELS = {"yt-dlp": "YouTube captions", "amazon_transcribe": "Amazon Transcribe"}
 TRANSCRIPT_MAX_BYTES = 10 * 1024 * 1024
+ITEM_PAGE_SIZE = 200
 
 
 def settings():
@@ -166,9 +171,43 @@ def add_source():
 
 
 def source_items(source_id):
-    return db.session.scalars(db.select(ContentItem).join(SourceItem).where(
+    """Date/ID keyset pages, including undated items after dated history."""
+    query = db.select(ContentItem).join(SourceItem).where(
         SourceItem.source_id == source_id, ContentItem.admin_id == current_user.id)
-        .order_by(ContentItem.published_at.desc(), ContentItem.id.desc()).limit(200)).all()
+    cursors = [(key, request.args.getlist(key)) for key in ("before", "after") if key in request.args]
+    if len(cursors) > 1:
+        abort(400)
+    newer = bool(cursors and cursors[0][0] == "after")
+
+    def boundary(pivot, *, older):
+        if pivot.published_at is None:
+            return (and_(ContentItem.published_at.is_(None), ContentItem.id < pivot.id) if older else
+                or_(ContentItem.published_at.is_not(None), and_(ContentItem.published_at.is_(None), ContentItem.id > pivot.id)))
+        if older:
+            return or_(ContentItem.published_at < pivot.published_at, ContentItem.published_at.is_(None),
+                and_(ContentItem.published_at == pivot.published_at, ContentItem.id < pivot.id))
+        return or_(ContentItem.published_at > pivot.published_at,
+            and_(ContentItem.published_at == pivot.published_at, ContentItem.id > pivot.id))
+
+    page_query = query
+    if cursors:
+        values = cursors[0][1]
+        if len(values) != 1 or not re.fullmatch(r"[1-9][0-9]{0,18}", values[0]) or int(values[0]) > 2 ** 63 - 1:
+            abort(400)
+        pivot = db.session.scalar(query.where(ContentItem.id == int(values[0]))) or abort(404)
+        page_query = query.where(boundary(pivot, older=not newer))
+    order = ((ContentItem.published_at.asc().nulls_first(), ContentItem.id.asc()) if newer else
+             (ContentItem.published_at.desc().nulls_last(), ContentItem.id.desc()))
+    rows = list(db.session.scalars(page_query.order_by(*order).limit(ITEM_PAGE_SIZE)))
+    if newer:
+        rows.reverse()
+    older_url = newer_url = None
+    if rows:
+        if db.session.scalar(query.where(boundary(rows[-1], older=True)).with_only_columns(ContentItem.id).limit(1)):
+            older_url = url_for("workspace.items", source_id=source_id, before=rows[-1].id)
+        if db.session.scalar(query.where(boundary(rows[0], older=False)).with_only_columns(ContentItem.id).limit(1)):
+            newer_url = url_for("workspace.items", source_id=source_id, after=rows[0].id)
+    return dict(items=[item_view(row) for row in rows], older_url=older_url, newer_url=newer_url)
 
 
 @workspace.get("/sources/<int:source_id>")
@@ -177,7 +216,7 @@ def source(source_id):
     row = source_owned(source_id)
     backfills = db.session.scalars(db.select(BackfillRequest).filter_by(source_id=row.id)
                                    .order_by(BackfillRequest.id.desc()).limit(50)).all()
-    return render_template("source.html", source=source_view(row), items=[item_view(item) for item in source_items(row.id)],
+    return render_template("source.html", source=source_view(row), **source_items(row.id),
                            backfills=[backfill_view(backfill) for backfill in backfills])
 
 
@@ -185,7 +224,53 @@ def source(source_id):
 @login_required
 def items(source_id):
     row = source_owned(source_id)
-    return render_template("source_items.html", source=source_view(row), items=[item_view(item) for item in source_items(row.id)])
+    return render_template("source_items.html", source=source_view(row), **source_items(row.id))
+
+
+def citation_views(row):
+    """Project only public targets and numeric labels; persisted URLs/text are untrusted."""
+    if not row.segments_s3_key:
+        return []
+    try:
+        if not isinstance(row.canonical_url, str) or len(row.canonical_url) > 4096:
+            return []
+        canonical = normalize_public_url(row.canonical_url)
+        host = urlsplit(canonical).hostname
+        if any(host == domain or host.endswith("." + domain) for domain in ("amazonaws.com", "amazonaws.com.cn")):
+            return []
+        if row.platform == "youtube":
+            kind, _, identity = youtube_locator(canonical)
+            if kind != "youtube_video" or identity != row.external_id:
+                return []
+            canonical = f"https://www.youtube.com/watch?v={identity}"
+        elif row.platform != "podcast":
+            return []
+        stored = get_s3_manager(settings()).download_text_content(row.segments_s3_key, max_bytes=TRANSCRIPT_MAX_BYTES)
+        payload = json.loads(stored)
+        if not isinstance(payload, dict) or payload.get("schema") != "media-transcript-segments/v1" or any(
+            payload.get(key) != value for key, value in (
+                ("item_id", row.id), ("platform", row.platform), ("external_id", row.external_id))):
+            return []
+        segments = payload.get("segments")
+        if not isinstance(segments, list) or not 0 < len(segments) <= 100_000:
+            return []
+        citations = []
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            start, end = segment.get("start"), segment.get("end")
+            if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in (start, end)) or end < start:
+                continue
+            if row.platform == "youtube":
+                target = f"{canonical}&t={math.floor(start)}s"
+            else:
+                times = [f"{value:.3f}".rstrip("0").rstrip(".") for value in (start, end)]
+                target = f"{canonical}#t={','.join(times)}"
+            citations.append(dict(url=target, label=f"{start:.3f}–{end:.3f} seconds"))
+        return citations
+    except Exception:
+        # A missing/corrupt private artifact must not expose storage diagnostics.
+        return []
 
 
 @workspace.get("/api/items/<int:item_id>")
@@ -198,7 +283,8 @@ def item(item_id):
         return jsonify({key: value for key, value in view.items() if key != "title"})
     memberships = db.session.scalars(db.select(ContentSource).join(SourceItem).where(
         SourceItem.item_id == row.id, ContentSource.admin_id == current_user.id)).all()
-    return render_template("item.html", item=view, memberships=[source_view(source) for source in memberships])
+    return render_template("item.html", item=view, memberships=[source_view(source) for source in memberships],
+                           citations=citation_views(row))
 
 
 @workspace.get("/items/<int:item_id>/transcript")
@@ -211,7 +297,7 @@ def transcript(item_id):
         text = get_s3_manager(settings()).download_text_content(row.transcript_s3_key, max_bytes=TRANSCRIPT_MAX_BYTES)
     except Exception:
         return render_template("index.html", error="Transcript is temporarily unavailable."), 503
-    return render_template("item.html", item=item_view(row), memberships=[], transcript=text)
+    return render_template("item.html", item=item_view(row), memberships=[], transcript=text, citations=citation_views(row))
 
 
 def selector(data):

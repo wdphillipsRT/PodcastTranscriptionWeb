@@ -10,6 +10,9 @@
 </dl>
 {% if transcript is defined %}<section aria-labelledby="transcript-heading"><h2 id="transcript-heading">Transcript</h2><pre>{{ transcript }}</pre></section>
 {% elif item.transcript_available %}<p><a href="{{ url_for('workspace.transcript', item_id=item.id) }}">Read transcript</a></p>{% endif %}
+{% if citations %}<section aria-labelledby="citations-heading"><h2 id="citations-heading">Source timestamps</h2>
+<ul>{% for citation in citations %}<li><a href="{{ citation.url }}" target="_blank" rel="noopener noreferrer">{{ citation.label }}</a></li>{% endfor %}</ul>
+</section>{% endif %}
 {% if memberships %}<section aria-labelledby="membership-heading"><h2 id="membership-heading">Source memberships</h2>
 <ul>{% for source in memberships %}<li><a href="{{ url_for('workspace.source', source_id=source.id) }}">{{ source.name }}</a> · {{ source.source_type }}</li>{% endfor %}</ul></section>{% endif %}
 {% if item.status in ['failed', 'deferred', 'unavailable'] %}

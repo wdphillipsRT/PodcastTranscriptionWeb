@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "source_items.html" import item_table with context %}
+{% from "source_items.html" import item_table, item_navigation with context %}
 {% block title %}{{ source.name }} · Source{% endblock %}
 {% block content %}
 <h1>{{ source.name }}</h1>
@@ -14,6 +14,7 @@
 </dl>
 <section aria-labelledby="items-heading"><h2 id="items-heading">Items</h2>
 {{ item_table(items) }}
+{{ item_navigation() }}
 </section>
 <section aria-labelledby="backfill-heading">
   <h2 id="backfill-heading">Import older items</h2>
