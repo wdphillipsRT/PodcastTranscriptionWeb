@@ -245,8 +245,11 @@ docker compose exec worker celery -A tasks.celery_app call tasks.check_all_sourc
 ```
 
 This queues work and prints a task ID, not a completion result. Watch worker
-logs and the UI. Redis has no persistent volume, so container replacement can
-lose broker messages. Database state and S3 artifacts remain, but a lost message
+logs and the UI. Redis has no named durable Compose volume. Its image declares
+anonymous `/data` storage that can be retained during container recreation;
+never assume an ordinary replacement starts with empty queues. Redis state is
+not a durable recovery source: volume loss or renewal can lose broker messages.
+Database state and S3 artifacts remain, but a lost message
 that was already marked dispatched may need an explicit operator replay. For
 an item stuck processing after its former worker is confirmed stopped, obtain
 the numeric item ID from `/items/<id>` and replay the durable pipeline:
@@ -311,24 +314,48 @@ Keep the matching Git revision and a separately protected environment/credential
 recovery record. Keep the same checkout/project identity when using the volume;
 a different Compose project name creates a different volume.
 
+The default backup directory is a sibling of the checkout, named with a
+`-backups` suffix. Optionally set `PODCAST_BACKUP_DIR` to a dedicated directory
+outside the checkout. The command resolves symlinks and rejects the checkout,
+its descendants, and its ancestors before creating files or changing
+permissions. Use a directory owned by this administrator; do not point it at a
+shared directory. Backups use directory mode 700 and file mode 600. Git and
+Docker also exclude `backups/` and `*.dump` as defense in depth if files are
+accidentally copied into the checkout; do not override these exclusions.
+
 For a consistent database checkpoint, pause writers (allow active work to stop)
 and make a custom-format dump. `--entrypoint` is unnecessary for PostgreSQL
 exec; its environment provides the internal database identity:
 
 ```bash
-umask 077
-mkdir -p backups
-chmod 700 backups
-docker compose stop web worker beat
-backup_file="backups/postgres-$(date -u +%Y%m%dT%H%M%SZ).dump"
-if docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' > "$backup_file" && docker compose exec -T postgres pg_restore --list < "$backup_file" > /dev/null; then
-  chmod 600 "$backup_file"
-  printf 'Backup saved: %s\n' "$backup_file"
-else
-  printf 'Backup failed; do not use partial file: %s\n' "$backup_file" >&2
-fi
-unset backup_file
-docker compose up -d
+(
+  set -eu
+  umask 077
+  checkout_dir="$(pwd -P)"
+  backup_dir="$(realpath -m -- "${PODCAST_BACKUP_DIR:-${checkout_dir}-backups}")"
+  if [ "$backup_dir" = / ]; then
+    printf '%s\n' 'Use a dedicated backup directory, not the filesystem root.' >&2
+    exit 1
+  fi
+  case "$backup_dir/" in
+    "$checkout_dir/"*) printf '%s\n' 'Backup directory must be outside the checkout.' >&2; exit 1 ;;
+  esac
+  case "$checkout_dir/" in
+    "$backup_dir/"*) printf '%s\n' 'Backup directory must not be an ancestor of the checkout.' >&2; exit 1 ;;
+  esac
+  mkdir -p -- "$backup_dir"
+  chmod 700 -- "$backup_dir"
+  docker compose stop web worker beat
+  backup_file="$(mktemp "$backup_dir/postgres-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX.dump")"
+  if docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' > "$backup_file" && docker compose exec -T postgres pg_restore --list < "$backup_file" > /dev/null; then
+    chmod 600 -- "$backup_file"
+    printf 'Backup saved: %s\n' "$backup_file"
+    docker compose up -d
+  else
+    printf 'Backup failed; writers remain stopped. Do not use partial file: %s\n' "$backup_file" >&2
+    exit 1
+  fi
+)
 ```
 
 Verify command exit codes, copy a successful dump to protected off-host storage,
@@ -363,15 +390,31 @@ fi
 ```
 
 Proceed only if restore exits successfully. Redis may still contain messages
-from the replaced database. With all writers stopped, remove that stale broker
-state by recreating only Redis (it has no persistent volume):
+from the replaced database. With web, worker, and beat stopped, renew Redis's
+anonymous volume, explicitly clear all Redis databases, and verify empty state
+before migrations or writers restart. This deliberately discards stale broker,
+result, and rate-limit state. Ordinary container recreation can retain the
+image-declared anonymous `/data` volume and is insufficient. All commands are
+in a subshell that stops on failure; do not resume writers if any step fails:
 
 ```bash
 unset restore_file
-docker compose up -d --force-recreate --wait redis
-docker compose run --rm --no-deps migrate
-docker compose up -d
-docker compose exec web flask --app app:create_app system check
+(
+  set -euo pipefail
+  docker compose stop web worker beat
+  docker compose up -d --force-recreate --renew-anon-volumes --wait redis
+  test "$(docker compose exec -T redis redis-cli FLUSHALL)" = OK
+  test "$(docker compose exec -T redis redis-cli DBSIZE)" = 0
+  redis_keyspace="$(docker compose exec -T redis redis-cli INFO keyspace | tr -d '\r')"
+  [[ "$redis_keyspace" == *'# Keyspace'* ]]
+  if printf '%s\n' "$redis_keyspace" | grep -q '^db[0-9]'; then
+    printf '%s\n' 'Redis is not empty; keep writers stopped.' >&2
+    exit 1
+  fi
+  docker compose run --rm --no-deps migrate
+  docker compose up -d
+  docker compose exec web flask --app app:create_app system check
+)
 ```
 
 Run the recovery scan above, inspect source/backfill state and sample
@@ -426,7 +469,9 @@ Ordinary `docker compose down` preserves the PostgreSQL named volume.
 all sources, and processing history. Volume pruning, host disk loss, or using
 the wrong Compose project can also make the database unavailable. S3 is external
 and private; Compose shutdown does not delete it, and surviving S3 objects alone
-cannot reconstruct the application database. Redis queue state, container
+cannot reconstruct the application database. Redis has no named durable Compose
+volume; its image-declared anonymous `/data` volume may survive recreation
+unless renewed, and must not be treated as a reliable queue backup. Container
 filesystems, beat's local schedule file, and worker temporary media are
 ephemeral. Recover from tested PostgreSQL backups plus the matching private S3
 artifacts, configuration, and application revision.

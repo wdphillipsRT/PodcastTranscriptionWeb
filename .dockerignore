@@ -45,6 +45,11 @@ tmp
 *.log
 *.sqlite*
 *.db
+backups/
+**/backups
+**/backups/**
+*.dump
+**/*.dump
 *.mp3
 *.mp4
 *.m4a

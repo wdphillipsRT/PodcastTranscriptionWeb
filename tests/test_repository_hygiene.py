@@ -1,9 +1,12 @@
 """Guard the shipped runtime against accidentally restoring retired integrations."""
 
 import ast
+import fnmatch
 import os
 from pathlib import Path
 import re
+import stat
+import subprocess
 
 import pytest
 
@@ -49,7 +52,37 @@ def runtime_files(root):
                 yield path
 
 
+def documentation_violations(path, content):
+    """Exempt only complete absence statements in prose, never command blocks."""
+    name = r"(?:Heroku|Stripe|Mailgun|OpenAI|OpenRouter)"
+    subjects = name + r"(?:(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+|/)" + name + r")*"
+    noun = r"(?:integration|integrations|support|deployment)"
+    ending = r"(?:\s+(?:here|in this (?:application|stack)|to later phases))?"
+    absence = (
+        rf"(?:The\s+)?{subjects}(?:\s+{noun})?\s+"
+        r"(?:is|are|was|were|has been|have been)\s+(?:explicitly\s+)?"
+        r"(?:absent|removed|unsupported|deferred|retired|not supported|not included|not implemented)"
+        + ending
+    )
+    no_integration = rf"No\s+{subjects}\s+{noun}(?:\s+(?:is|are)\s+(?:included|implemented|provided|supported|available))?" + ending
+    found = []
+    fenced = False
+    for number, line in enumerate(content.splitlines(), 1):
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        for statement in re.split(r"[.!?;]", line):
+            if not re.search(PATTERNS["retired integration"], statement, re.IGNORECASE):
+                continue
+            prose = statement.strip().replace("`", "")
+            if not fenced and re.fullmatch(rf"(?:{absence}|{no_integration})", prose, re.IGNORECASE):
+                continue
+            found.append(f"{path}:{number}: retired integration setup or claim")
+    return found
+
+
 def violations(path, content):
+    if path.suffix == ".md":
+        return documentation_violations(path, content)
     found = []
     for number, line in enumerate(content.splitlines(), 1):
         for label, pattern in PATTERNS.items():
@@ -91,7 +124,7 @@ def test_current_documentation_has_no_deleted_links_or_legacy_setup():
         assert path.is_file(), f"Missing current documentation: {name}"
         content = path.read_text()
         assert not [obsolete for obsolete in OBSOLETE if obsolete in content], name
-        assert not re.search(PATTERNS["retired integration"], content, re.IGNORECASE), name
+        assert not violations(Path(name), content), name
     assert "docs/operations.md" in (ROOT / "README.md").read_text()
 
 
@@ -155,3 +188,129 @@ def test_template_endpoint_and_asset_links_resolve(app):
             if node.args[0].value == "static":
                 filename = next(keyword.value.value for keyword in node.kwargs if keyword.key == "filename")
                 assert (ROOT / "static" / filename).is_file(), (path, filename)
+
+
+@pytest.mark.parametrize("content", [
+    "Heroku, Stripe, and Mailgun are absent.",
+    "Stripe integration has been removed.",
+    "Heroku deployment is unsupported.",
+    "OpenAI/OpenRouter support is deferred to later phases.",
+    "No Mailgun integration is implemented.",
+])
+def test_documentation_allows_explicit_retired_integration_absence(content):
+    assert not violations(Path("guide.md"), content)
+
+
+@pytest.mark.parametrize("content", [
+    "Run heroku create to deploy.", "Configure STRIPE_SECRET_KEY in .env.",
+    "Mailgun delivers transcript emails.", "Stripe integration is available.",
+    "Heroku is unsupported; run heroku create anyway.",
+    "Heroku is absent and Stripe is supported.",
+    "```bash\n# Stripe is absent\nexport STRIPE_SECRET_KEY=value\n```",
+])
+def test_documentation_still_rejects_retired_setup_and_positive_claims(content):
+    assert violations(Path("guide.md"), content)
+
+
+def test_absence_exemption_never_applies_to_runtime():
+    assert violations(Path("runtime.py"), '"""Stripe is absent."""')
+
+
+def test_backup_files_are_ignored_by_git_and_docker():
+    paths = ("backups/archive.sql", "private.dump", "exports/private.dump", "nested/backups/archive.sql")
+    checked = subprocess.run(["git", "check-ignore", "--no-index", "--stdin"],
+                             input="\n".join(paths) + "\n", cwd=ROOT,
+                             text=True, capture_output=True, check=False)
+    assert checked.returncode == 0 and set(checked.stdout.splitlines()) == set(paths)
+    patterns = [line.strip().rstrip("/") for line in (ROOT / ".dockerignore").read_text().splitlines()
+                if line.strip() and not line.startswith("#")]
+    for name in paths:
+        assert any(fnmatch.fnmatch(name, pattern) or any(
+            fnmatch.fnmatch(str(parent), pattern) for parent in Path(name).parents)
+                   for pattern in patterns), name
+    assert "backups/" in (ROOT / ".gitignore").read_text().splitlines()
+    assert "*.dump" in (ROOT / ".gitignore").read_text().splitlines()
+    assert "backups" in patterns and "*.dump" in patterns
+
+
+def backup_block():
+    guide = (ROOT / "docs/operations.md").read_text()
+    return next(block for block in re.findall(r"```bash\n(.*?)```", guide, re.S) if "pg_dump" in block)
+
+
+@pytest.fixture
+def backup_shell(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    docker = tools / "docker"
+    docker.write_text('#!/bin/sh\ncase "$*" in\n  *pg_dump*) printf "synthetic-dump\\n" ;;\nesac\n')
+    docker.chmod(0o700)
+    environment = {**os.environ, "PATH": str(tools) + ":" + os.environ["PATH"]}
+    environment.pop("PODCAST_BACKUP_DIR", None)
+    return checkout, environment
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_backup_commands_write_private_dumps_outside_checkout(backup_shell, override):
+    checkout, environment = backup_shell
+    if override:
+        environment["PODCAST_BACKUP_DIR"] = str(checkout.parent / "chosen backups")
+    result = subprocess.run(["bash", "-c", backup_block()], cwd=checkout,
+                            env=environment, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert not list(checkout.rglob("*.dump"))
+    backups = list(checkout.parent.rglob("*.dump"))
+    assert len(backups) == 1
+    assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+    assert stat.S_IMODE(backups[0].parent.stat().st_mode) == 0o700
+    if override:
+        assert backups[0].parent == Path(environment["PODCAST_BACKUP_DIR"])
+
+
+def test_backup_commands_reject_checkout_and_ancestor_targets(backup_shell):
+    checkout, environment = backup_shell
+    for target in (checkout, checkout / "backups", checkout.parent):
+        result = subprocess.run(["bash", "-c", backup_block()], cwd=checkout,
+                                env={**environment, "PODCAST_BACKUP_DIR": str(target)},
+                                text=True, capture_output=True)
+        assert result.returncode != 0, str(target)
+    assert not list(checkout.parent.rglob("*.dump"))
+
+
+def test_restore_renews_and_verifies_redis_before_writers_restart():
+    guide = (ROOT / "docs/operations.md").read_text()
+    assert "Redis has no persistent volume" not in guide
+    assert "it has no persistent volume" not in guide
+    assert "anonymous" in guide and "no named" in guide
+    blocks = re.findall(r"```bash\n(.*?)```", guide, re.S)
+    restore = next(block for block in blocks if "--renew-anon-volumes" in block)
+    assert "docker compose stop web worker beat" in restore
+    assert "docker compose up -d --force-recreate --renew-anon-volumes --wait redis" in restore
+    assert "redis-cli FLUSHALL" in restore and "redis-cli DBSIZE" in restore
+    assert restore.index("redis-cli DBSIZE") < restore.index("docker compose up -d\n")
+
+
+@pytest.mark.parametrize("flush_reply,has_keys,expected", [("OK", "0", 0), ("ERR denied", "0", 1), ("OK", "1", 1)])
+def test_restore_keeps_writers_stopped_unless_redis_is_verified_empty(backup_shell, flush_reply, has_keys, expected):
+    checkout, environment = backup_shell
+    docker = Path(environment["PATH"].split(":")[0]) / "docker"
+    docker.write_text('''#!/bin/sh
+printf '%s\\n' "$*" >> "$DOCKER_CALL_LOG"
+case "$*" in
+  *"redis-cli FLUSHALL"*) printf '%s\\n' "$REDIS_FLUSH_REPLY" ;;
+  *"redis-cli DBSIZE"*) printf '0\\n' ;;
+  *"redis-cli INFO keyspace"*)
+    printf '# Keyspace\\r\\n'
+    if [ "$REDIS_HAS_KEYS" = 1 ]; then printf 'db1:keys=2,expires=0,avg_ttl=0\\r\\n'; fi ;;
+esac
+''')
+    log = checkout.parent / "docker.log"
+    environment.update(DOCKER_CALL_LOG=str(log), REDIS_FLUSH_REPLY=flush_reply, REDIS_HAS_KEYS=has_keys)
+    guide = (ROOT / "docs/operations.md").read_text()
+    block = next(block for block in re.findall(r"```bash\n(.*?)```", guide, re.S) if "--renew-anon-volumes" in block)
+    result = subprocess.run(["bash", "-c", block], cwd=checkout, env=environment,
+                            text=True, capture_output=True)
+    assert (result.returncode == 0) == (expected == 0), result.stderr
+    assert ("compose up -d" in log.read_text().splitlines()) == (expected == 0)

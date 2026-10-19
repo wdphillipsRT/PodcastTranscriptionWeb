@@ -87,7 +87,9 @@ logs/
 *.log
 podcasts.csv
 *.db
+backups/
+*.dump
 
-# Heroku
+# Local environment overrides
 .env.production
 *.orig
