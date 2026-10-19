@@ -78,5 +78,18 @@ services:
     entrypoint: [/app/scripts/start-beat.sh]
     command: [celery, -A, tasks.celery_app, beat, --loglevel=info, --schedule, /tmp/celerybeat-schedule, --pidfile, /tmp/celerybeat.pid]
 
+  classifier:
+    <<: *app
+    entrypoint: [/app/scripts/start-classifier.sh]
+    command: [celery, -A, tasks.celery_app, worker, --loglevel=info, --queues, classification, --concurrency, "1", --hostname, "classifier@%h"]
+    environment:
+      CLAUDE_CONFIG_DIR: /claude-config
+      DISABLE_UPDATES: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    volumes:
+      - ${CLAUDE_CONFIG_HOST_PATH:-./.runtime/claude}:/claude-config
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1770
+
 volumes:
   postgres_data:

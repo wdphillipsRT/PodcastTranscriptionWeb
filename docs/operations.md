@@ -4,16 +4,21 @@
 
 Run commands from the repository root in a Bash SSH session. The only supported
 installation is `docker-compose.yml`: `postgres`, `redis`, `migrate`, `web`,
-`worker`, and `beat`. The `migrate` service exits successfully after applying
-schema migrations; the other five services stay running. Keep one worker
-service and one beat service unless a reviewed scaling change is made.
+`worker`, `beat`, and `classifier`. The `migrate` service exits successfully after
+applying schema migrations; the other six services stay running after credentials
+are configured. Keep one media worker, one classifier, and one beat service
+unless a reviewed scaling change is made. The classifier alone consumes the
+`classification` queue; the media worker consumes exactly
+`default,discovery,downloads,transcription`.
 
 Use a Linux host with Docker Engine, the Docker Compose v2 plugin, Git,
 Python 3 for secret generation, curl, and an editor. Allow enough disk for the
 database/images and RAM for PostgreSQL, two worker processes, and the worker's
-768 MiB temporary media filesystem. The image supplies Python 3.11, FFmpeg,
-yt-dlp, and Deno; no host media tools are needed. The host needs outbound HTTPS
-to AWS, Google/YouTube, Apple, public feed/media hosts, and image/package
+768 MiB temporary media filesystem, plus one classifier process and its 256 MiB
+temporary filesystem. The non-root image supplies Python 3.11, FFmpeg,
+yt-dlp, Deno, Node 22, and Claude Code 2.1.303; no host media tools are needed.
+The host needs outbound HTTPS
+to AWS, Anthropic, Google/YouTube, Apple, public feed/media hosts, and image/package
 registries. Amazon Transcribe usage and provider quotas can incur costs.
 
 The administrator owns the Cloudflare Tunnel and DNS configuration for
@@ -197,21 +202,55 @@ use. HTTP curl health checks need no login cookie.
 
 ## Build, migrate, start, and provision the administrator
 
+Build and migrate before authenticating the isolated classifier:
+
 ```bash
 docker compose version
 docker compose config --quiet
 docker compose build
 docker compose up -d --wait postgres redis
 docker compose run --rm --no-deps migrate
+```
+
+Create the dedicated writable Claude configuration directory and authenticate
+from the SSH terminal using the device/browser flow:
+
+```bash
+install -d -m 700 .runtime/claude
+docker compose run --rm --entrypoint claude classifier auth login
+docker compose run --rm --entrypoint claude classifier auth status --text
+```
+
+Open the displayed browser/device URL on another computer if necessary and
+complete the terminal prompts. These commands bypass the startup guard only
+to perform authentication. Credentials remain in `.runtime/claude`, which is
+ignored by Git and excluded from the Docker build context; they are never copied
+into the image or repository. Do not share auth output or commit credentials.
+The container runs as UID/GID 1000:1000: this private directory must be owned
+by that identity and writable by it. If the SSH user has a different UID/GID,
+have the host administrator set ownership to 1000:1000 while retaining mode 700.
+For a different protected host directory, set `CLAUDE_CONFIG_HOST_PATH` in the
+Compose environment and create that exact directory with the same ownership
+and permissions. Only `classifier` mounts it at `/claude-config`.
+
+Then start the services:
+
+```bash
 docker compose up -d
 docker compose ps -a
-docker compose logs --tail=100 migrate web worker beat
+docker compose logs --tail=100 migrate web worker beat classifier
 ```
 
 `migrate` runs `flask --app app:create_app db upgrade`. Compose also gates
 application startup on a successful migration. The web and worker entrypoints
 check the database schema, Redis, S3, Transcribe, YouTube API, yt-dlp, and Deno
-before starting; beat checks database, Redis, and its schedule. If a provider
+before starting; beat checks database, Redis, and its schedule. Classifier
+startup pins `PYTHONPATH=/app`, requires the exact configured Claude version
+(`CLAUDE_EXPECTED_VERSION=2.1.303`), silently checks `claude auth status`, and
+checks database, Redis, and S3 before executing Celery. Authentication or version
+failure prevents the classification consumer from starting and emits only a
+safe error. `DISABLE_UPDATES=1` prevents runtime updates; classifier also sets
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. If a provider
 or credential fails, fix it and rerun `docker compose up -d`. Inspect logs and
 readiness as described below; never bypass these checks to hide a failure.
 
@@ -273,7 +312,7 @@ docker compose ps -a
 curl --fail --show-error http://localhost:8005/healthz
 curl --show-error --max-time 110 --write-out '\nHTTP %{http_code}\n' http://localhost:8005/readyz
 docker compose exec web flask --app app:create_app system check
-docker compose logs --tail=200 web worker beat
+docker compose logs --tail=200 web worker beat classifier
 docker compose logs --follow --tail=100 worker
 ```
 
@@ -287,6 +326,27 @@ fails. A targeted check is:
 ```bash
 docker compose exec web flask --app app:create_app system check --services database,redis,s3,transcribe,youtube,yt_dlp,deno,worker,beat
 ```
+
+The web `/readyz` deliberately does not probe local Claude authentication:
+web has no Claude credential mount. Web, migrations, beat, and the media worker
+remain operational without that directory or Claude login. The classifier's
+startup guard protects its own consumer; web readiness alone does not establish
+classifier health. Verify the separate service and its named worker:
+
+```bash
+docker compose ps -a classifier
+docker compose logs --tail=100 classifier
+docker compose exec classifier celery -A tasks.celery_app inspect --timeout 5 --destination "classifier@$(docker compose exec -T classifier hostname)" ping
+docker compose exec classifier claude auth status --text
+docker compose exec classifier flask --app app:create_app system check --services database,redis,s3
+```
+
+The inspect destination must be the classifier hostname shown in its startup
+logs (`classifier@<container-hostname>`); it prevents a media-worker reply from
+being mistaken for classifier health. Inspect auth output only in a private
+terminal. If credentials expire, stop `classifier`, repeat the dedicated
+`auth login`/`auth status --text` commands above, then run
+`docker compose up -d classifier`. Other services do not need Claude credentials.
 
 The `beat` probe validates the configured hourly task; it is not a live
 scheduler heartbeat. Confirm that the beat container is running and its logs
@@ -409,7 +469,7 @@ provider evidence automatically. Record only status, origin, hashes, row counts,
 and job success privately; never copy transcript bodies, keys, signed URLs, or
 credentials into tickets, terminal output, or shared logs.
 
-After live checks, verify the actual six-service stack with the health/readiness
+After live checks, verify the actual seven-service stack with the health/readiness
 commands above. Add the selected video, RSS, channel, and playlist through the
 authenticated UI, confirm origin labels and backfill progress, and replay
 discovery. Inspect UI and local logs privately for any credential, private key,
@@ -424,10 +484,20 @@ For a disposable Docker acceptance run, first inspect `docker compose ls`,
 that replaces each app service's `env_file` with that path and uses a unique
 image tag; `--env-file` alone does not replace the service-level `.env` reference.
 Use the same explicit project name, files, and env file for every command.
-Use no existing application volume or administrator. Verify migration
-`0001_media_foundation`, provision a temporary sole admin, record all eight table
-counts, perform ordinary project `down`/`up` without volume deletion, then compare
-counts. Only web may publish loopback port 8005; if occupied, document an isolated
+Use no existing application volume, Claude credential directory, or administrator.
+Override the classifier's credential bind with a unique private disposable host
+directory (owned by 1000:1000, mode 700), even when testing its unauthenticated
+failure. Never reuse the deployed Claude mount. Verify migration head
+`0002_commercial_classification`, provision a temporary sole admin, and record
+all thirteen table counts: `admins`, `content_sources`, `content_items`,
+`source_items`, `backfill_requests`, `discovery_runs`, `discovery_candidates`,
+`processing_jobs`, `classification_revisions`, `classification_blocks`,
+`segment_overrides`, `source_classification_rules`, and `classification_sweeps`
+(plus Alembic's `alembic_version` metadata table). Perform ordinary project
+`down`/`up` without volume deletion, then compare counts. Without Claude
+authentication, confirm only the classifier fails closed and the media/web
+services remain independent; authenticated classification is a separately
+authorized live check. Only web may publish loopback port 8005; if occupied, document an isolated
 loopback port override. Full readiness requires real configured providers. Clean
 up only resources carrying that exact disposable project label and its temporary
 files. Never remove volumes from the deployed application to run this gate.
@@ -436,10 +506,17 @@ files. Never remove volumes from the deployed application to run this gate.
 
 Record the current Git revision and take a database backup before upgrading.
 Review release notes and security changes before altering dependencies. Current
-pins are `yt-dlp[default]==2026.8.19` in `requirements.txt` and Deno `2.9.7`
-in `Dockerfile`; yt-dlp reports `2026.08.19` at runtime. Version expectations
+pins are `yt-dlp[default]==2026.8.19` in `requirements.txt`, Deno `2.9.7`, and
+`@anthropic-ai/claude-code@2.1.303` in `Dockerfile`; yt-dlp reports `2026.08.19`
+and Claude reports exactly `2.1.303 (Claude Code)` at runtime. The Node 22
+Bookworm build stage installs Claude; the final image copies only Node and
+the installed Claude package, without npm. Claude 2.1.303 installs its native
+launcher at `bin/claude.exe`; the final image symlinks that installed executable.
+Both build stages validate the exact Claude version, including as UID/GID
+1000:1000 in the final Python runtime. Version expectations
 also live in `config.py`, `.env.example`, `youtube_media.py`,
-`system_checks.py`, and their tests. Update all applicable pins, runtime checks,
+`system_checks.py`, `scripts/start-classifier.sh`, `claude_classifier.py`, and
+their tests. Update all applicable pins, runtime checks,
 and the deployed `.env` together in a reviewed change. Do not enable runtime
 self-updates, plugins, remote components, external configs, or browser cookies.
 
@@ -454,7 +531,7 @@ docker compose build --pull
 On the deployed checkout, pause writers, migrate the new image, then restart:
 
 ```bash
-docker compose stop web worker beat
+docker compose stop web worker beat classifier
 docker compose run --rm --no-deps migrate
 docker compose up -d
 docker compose ps -a
@@ -508,7 +585,7 @@ exec; its environment provides the internal database identity:
   esac
   mkdir -p -- "$backup_dir"
   chmod 700 -- "$backup_dir"
-  docker compose stop web worker beat
+  docker compose stop web worker beat classifier
   backup_file="$(mktemp "$backup_dir/postgres-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX.dump")"
   if docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' > "$backup_file" && docker compose exec -T postgres pg_restore --list < "$backup_file" > /dev/null; then
     chmod 600 -- "$backup_file"
@@ -534,7 +611,7 @@ select a known successful dump, inspect its archive, and only then run the
 restore command. No volume deletion is required:
 
 ```bash
-docker compose stop web worker beat
+docker compose stop web worker beat classifier
 docker compose up -d --wait postgres redis
 read -r -p 'Path to the reviewed PostgreSQL dump: ' restore_file
 if [ -f "$restore_file" ]; then
@@ -553,7 +630,7 @@ fi
 ```
 
 Proceed only if restore exits successfully. Redis may still contain messages
-from the replaced database. With web, worker, and beat stopped, renew Redis's
+from the replaced database. With web, worker, beat, and classifier stopped, renew Redis's
 anonymous volume, explicitly clear all Redis databases, and verify empty state
 before migrations or writers restart. This deliberately discards stale broker,
 result, and rate-limit state. Ordinary container recreation can retain the
@@ -564,7 +641,7 @@ in a subshell that stops on failure; do not resume writers if any step fails:
 unset restore_file
 (
   set -euo pipefail
-  docker compose stop web worker beat
+  docker compose stop web worker beat classifier
   docker compose up -d --force-recreate --renew-anon-volumes --wait redis
   test "$(docker compose exec -T redis redis-cli FLUSHALL)" = OK
   test "$(docker compose exec -T redis redis-cli DBSIZE)" = 0
@@ -596,7 +673,7 @@ credentials. `docker compose restart` alone does not load new environment values
 
 ```bash
 chmod 600 .env
-docker compose up -d --force-recreate web worker beat
+docker compose up -d --force-recreate web worker beat classifier
 docker compose exec web flask --app app:create_app system check
 ```
 
@@ -604,7 +681,7 @@ For PostgreSQL password rotation, stop writers and use the interactive psql
 password command so the new password does not enter shell history or SQL text:
 
 ```bash
-docker compose stop web worker beat
+docker compose stop web worker beat classifier
 docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 ```
 
@@ -617,7 +694,7 @@ change an initialized database role. Then run:
 chmod 600 .env
 docker compose up -d --force-recreate --wait postgres
 docker compose run --rm --no-deps migrate
-docker compose up -d --force-recreate web worker beat
+docker compose up -d --force-recreate web worker beat classifier
 docker compose exec web flask --app app:create_app system check
 ```
 
