@@ -70,6 +70,80 @@ def service(adapter, dispatch=None, **config):
                                    dispatch or (lambda name, ident, **kwargs: None))
 
 
+@pytest.mark.parametrize("state", ["pending", "scanning", "finalizing", "completed", "cancelled", "failed"])
+@pytest.mark.parametrize("entry", ["scan", "continue"])
+def test_source_disable_uses_terminal_aware_standalone_run_cancellation(store, state, entry):
+    from models import utc_now
+    source = store()
+    source.enabled = False
+    run = DiscoveryRun(source_id=source.id, run_type="initial", state=state, error_category="preserved",
+                       completed_at=utc_now(), items_scanned=3, items_accepted=2)
+    db.session.add(run)
+    db.session.commit()
+    before = (run.state, run.error_category, run.completed_at, run.items_scanned, run.items_accepted)
+    svc = service(Adapter([]))
+    if entry == "scan":
+        svc._scan(run)
+    else:
+        svc.continue_discovery(run.id)
+    if state in {"completed", "cancelled", "failed"}:
+        assert (run.state, run.error_category, run.completed_at, run.items_scanned, run.items_accepted) == before
+    else:
+        assert run.state == "cancelled" and run.items_scanned == 3 and run.items_accepted == 2
+
+
+@pytest.mark.parametrize("terminal", ["completed", "cancelled", "failed"])
+def test_standalone_disable_guard_preserves_terminal_commit_after_locked_reads(store, monkeypatch, terminal):
+    from models import utc_now
+    source = store()
+    source.enabled = False
+    run = DiscoveryRun(source_id=source.id, run_type="initial", state="scanning", items_scanned=3)
+    db.session.add(run)
+    db.session.commit()
+    run_id, finished = run.id, utc_now()
+    svc = service(Adapter([]))
+    original = svc._locked
+    def complete_after_disabled_source_read(model, identity):
+        value = original(model, identity)
+        if model is ContentSource:
+            with db.engine.begin() as connection:
+                connection.execute(sa.update(DiscoveryRun).where(DiscoveryRun.id == run_id).values(
+                    state=terminal, error_category="preserved", completed_at=finished))
+        return value
+    monkeypatch.setattr(svc, "_locked", complete_after_disabled_source_read)
+    svc.continue_discovery(run_id)
+    assert run.state == terminal and run.error_category == "preserved" and run.completed_at == finished
+    assert run.items_scanned == 3
+
+
+@pytest.mark.parametrize("state", ["pending", "scanning", "finalizing", "failed"])
+def test_standalone_replay_cannot_clear_failure_after_enabled_check_then_disable(store, monkeypatch, state):
+    from models import utc_now
+    source = store()
+    run = DiscoveryRun(source_id=source.id, run_type="initial", state=state, error_category="preserved",
+                       completed_at=utc_now(), items_scanned=3)
+    db.session.add(run)
+    db.session.commit()
+    before = (run.state, run.error_category, run.completed_at, run.items_scanned)
+    svc = service(Adapter([]))
+    original, interleaved = svc._cancel_disabled_run, False
+    def disable_after_false(identity):
+        nonlocal interleaved
+        stopped = original(identity)
+        if not stopped and not interleaved:
+            interleaved = True
+            source.enabled = False
+            db.session.commit()
+        return stopped
+    monkeypatch.setattr(svc, "_cancel_disabled_run", disable_after_false)
+    svc.continue_discovery(run.id)
+    assert interleaved
+    if state == "failed":
+        assert (run.state, run.error_category, run.completed_at, run.items_scanned) == before
+    else:
+        assert run.state == "cancelled" and run.error_category == "source_disabled" and run.items_scanned == 3
+
+
 @pytest.mark.parametrize("youtube", [False, True])
 def test_initial_newest_25_order_independent_and_replay(store, youtube):
     source = store("youtube_channel" if youtube else "podcast_rss")

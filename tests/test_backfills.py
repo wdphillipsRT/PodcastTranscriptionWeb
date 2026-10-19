@@ -678,3 +678,83 @@ def test_source_disable_cannot_turn_failed_backfill_into_cancelled_during_replay
     svc.run_backfill(row.id)
     assert row.state == run.state == "failed"
     assert row.cancel_requested is False and row.error_category == "preserved"
+
+
+@pytest.mark.parametrize("state", ["pending", "running", "failed", "completed", "cancelled"])
+def test_disable_after_initial_cancellation_check_preserves_terminal_diagnosis(store, monkeypatch, state):
+    from models import utc_now
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    row.state = state
+    run.state = "scanning" if state in {"pending", "running"} else state
+    row.error_category = run.error_category = "preserved"
+    row.completed_at = run.completed_at = utc_now()
+    db.session.commit()
+    before = (row.state, run.state, row.error_category, run.error_category, row.completed_at, run.completed_at,
+              row.items_scanned, row.items_accepted, run.items_scanned, run.items_accepted)
+    original, interleaved = svc._cancelled, False
+    def disable_after_false(active):
+        nonlocal interleaved
+        stopped = original(active)
+        if not stopped and not interleaved:
+            interleaved = True
+            source.enabled = False
+            db.session.commit()
+        return stopped
+    monkeypatch.setattr(svc, "_cancelled", disable_after_false)
+    svc.run_backfill(row.id)
+    if state in {"pending", "running"}:
+        assert interleaved and row.state == run.state == "cancelled"
+        assert row.error_category == "source_disabled"
+        assert row.items_scanned == 2 and row.items_accepted == 0
+    else:
+        assert interleaved is (state == "failed")
+        assert (row.state, run.state, row.error_category, run.error_category, row.completed_at, run.completed_at,
+                row.items_scanned, row.items_accepted, run.items_scanned, run.items_accepted) == before
+
+
+@pytest.mark.parametrize("run_state", ["completed", "cancelled", "failed"])
+def test_source_disable_cannot_cancel_an_active_request_with_terminal_related_run(store, run_state):
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    run.state, run.error_category = run_state, "preserved"
+    source.enabled = False
+    db.session.commit()
+    svc._cancelled(row)
+    assert row.state == "running" and row.error_category is None
+    assert run.state == run_state and run.error_category == "preserved"
+
+
+@pytest.mark.parametrize("state", ["pending", "running", "failed"])
+def test_replay_activation_guard_rechecks_source_disable_after_locked_enabled_read(store, monkeypatch, state):
+    from models import ContentSource
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    row.state = state
+    run.state = "failed" if state == "failed" else "scanning"
+    row.error_category = run.error_category = "preserved"
+    db.session.commit()
+    original, source_reads = svc._locked, 0
+    source_id = source.id
+    def disable_after_activation_reads_enabled(model, identity):
+        nonlocal source_reads
+        value = original(model, identity)
+        if model is ContentSource:
+            source_reads += 1
+            if source_reads == 2:
+                assert value.enabled
+                with db.engine.begin() as connection:
+                    connection.execute(sa.update(ContentSource).where(ContentSource.id == source_id).values(enabled=False))
+        return value
+    monkeypatch.setattr(svc, "_locked", disable_after_activation_reads_enabled)
+    svc.run_backfill(row.id)
+    assert source_reads >= 2
+    if state == "failed":
+        assert row.state == run.state == "failed"
+        assert row.error_category == run.error_category == "preserved"
+    else:
+        assert row.state == run.state == "cancelled" and row.error_category == "source_disabled"
+    assert row.items_scanned == 2 and row.items_accepted == run.items_accepted == 0

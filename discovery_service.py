@@ -149,7 +149,13 @@ class DiscoveryService:
             if request is None:
                 self.session.commit()
                 return True
-            enabled = self.session.query(ContentSource.enabled).filter_by(id=request.source_id).scalar()
+            # Even a replayable failure must retain the source lock until its
+            # enabled-only replay transition commits.
+            run_ids = self.session.query(DiscoveryRun.id).filter_by(backfill_id=request.id).order_by(DiscoveryRun.id).all()
+            for (run_id,) in run_ids:
+                self._locked(DiscoveryRun, run_id)
+            source = self._locked(ContentSource, request.source_id)
+            enabled = source is not None and source.enabled
             if request.state in terminal:
                 # Failed requests without cancellation remain explicitly
                 # replayable while enabled; source disable/cancellation cannot
@@ -160,11 +166,6 @@ class DiscoveryService:
                 return stop
             if not request.cancel_requested and enabled:
                 return False
-            # Match failure/finalization lock order: request -> run -> source.
-            run_ids = self.session.query(DiscoveryRun.id).filter_by(backfill_id=request.id).order_by(DiscoveryRun.id).all()
-            for (run_id,) in run_ids:
-                self._locked(DiscoveryRun, run_id)
-            source = self._locked(ContentSource, request.source_id)
             if source is None:
                 self.session.commit()
                 return True
@@ -179,6 +180,7 @@ class DiscoveryService:
             changed = self.session.query(BackfillRequest).filter(
                 BackfillRequest.id == request.id,
                 BackfillRequest.state.in_(("pending", "running")),
+                ~sa.exists().where(DiscoveryRun.backfill_id == request.id, DiscoveryRun.state.in_(terminal)),
                 sa.or_(BackfillRequest.cancel_requested.is_(True), sa.exists().where(
                     ContentSource.id == request.source_id, ContentSource.enabled.is_(False)))
             ).update(values, synchronize_session=False)
@@ -191,6 +193,30 @@ class DiscoveryService:
             self.session.commit()
             return True
 
+    def _cancel_disabled_run(self, run_id):
+        """Cancel standalone discovery only while the run is nonterminal."""
+        with self.session.no_autoflush:
+            # Resolve the association without taking a run lock before a
+            # backfill request lock, matching the failure/cancellation order.
+            request_id = self.session.query(DiscoveryRun.backfill_id).filter_by(id=run_id).scalar()
+            if request_id:
+                return self._cancelled(self._locked(BackfillRequest, request_id))
+            run = self._locked(DiscoveryRun, run_id)
+            if run is None:
+                self.session.commit()
+                return True
+            source = self._locked(ContentSource, run.source_id)
+            if source is not None and source.enabled:
+                return False
+            self.session.query(DiscoveryRun).filter(
+                DiscoveryRun.id == run_id, DiscoveryRun.backfill_id.is_(None),
+                DiscoveryRun.state.in_(("pending", "scanning", "finalizing")),
+                sa.exists().where(ContentSource.id == run.source_id, ContentSource.enabled.is_(False))
+            ).update({"state": "cancelled", "completed_at": utc_now(), "error_category": "source_disabled"},
+                     synchronize_session=False)
+        self.session.commit()
+        return True
+
     def _scan(self, run, request=None):
         source = run.source
         adapter = self.adapter_factory(source)
@@ -200,6 +226,8 @@ class DiscoveryService:
                 request = self._locked(BackfillRequest, request.id)
             if self._cancelled(request):
                 return False
+            if request is None and self._cancel_disabled_run(run.id):
+                return False
             run = self._locked(DiscoveryRun, run.id)
             if run.state in {"completed", "cancelled"}:
                 self.session.commit()
@@ -208,8 +236,10 @@ class DiscoveryService:
                 return True
             self.session.refresh(source)
             if not source.enabled:
-                run.state, run.completed_at = "cancelled", utc_now()
-                self.session.commit()
+                if request is not None:
+                    self._cancelled(request)
+                else:
+                    self._cancel_disabled_run(run.id)
                 return False
             page = adapter.discover_page(descriptor, run.cursor)
             cursor = self._cursor(page.next_cursor)
@@ -286,13 +316,19 @@ class DiscoveryService:
             self.session.commit()
             self.replay_pending_dispatches(run.source_id)
             return run.id
-        if not run.source.enabled:
-            run.state, run.completed_at = "cancelled", utc_now()
-            self.session.commit()
+        if self._cancel_disabled_run(run.id):
             return run.id
-        run.started_at, run.error_category = run.started_at or utc_now(), None
-        if run.state != "finalizing":
-            run.state = "scanning"
+        observed_state = run.state
+        activated = self.session.query(DiscoveryRun).filter(
+            DiscoveryRun.id == run.id, DiscoveryRun.state == observed_state,
+            DiscoveryRun.state.in_(("pending", "scanning", "finalizing", "failed")),
+            sa.exists().where(ContentSource.id == run.source_id, ContentSource.enabled.is_(True))
+        ).update({"started_at": run.started_at or utc_now(), "error_category": None,
+                  "state": "finalizing" if observed_state == "finalizing" else "scanning"}, synchronize_session=False)
+        if not activated:
+            self.session.rollback()
+            self._cancel_disabled_run(run.id)
+            return run.id
         self.session.commit()
         try:
             if run.state == "finalizing" or self._scan(run):
@@ -455,13 +491,29 @@ class DiscoveryService:
             return request.id
         if self._cancelled(request):
             return request.id
-        if not request.source.enabled:
-            request.state, request.completed_at, request.error_category = "cancelled", utc_now(), "source_disabled"
+        request = self._locked(BackfillRequest, request_id)
+        if request is None:
             self.session.commit()
-            return request.id
-        request.state, request.started_at = "running", request.started_at or utc_now()
-        request.error_category = None
+            return None
+        observed_state = request.state
         run = self._backfill_run(request)
+        run = self._locked(DiscoveryRun, run.id)
+        source = self._locked(ContentSource, request.source_id)
+        if source is None or not source.enabled:
+            self._cancelled(request)
+            return request.id
+        # SQLite ignores row locks: a disable committed after the enabled read
+        # must also prevent replay from clearing a terminal failure diagnosis.
+        activated = self.session.query(BackfillRequest).filter(
+            BackfillRequest.id == request.id, BackfillRequest.state == observed_state,
+            BackfillRequest.state.in_(("pending", "running", "failed")),
+            sa.exists().where(ContentSource.id == request.source_id, ContentSource.enabled.is_(True))
+        ).update({"state": "running", "started_at": request.started_at or utc_now(), "error_category": None},
+                 synchronize_session=False)
+        if not activated:
+            self.session.rollback()
+            self._cancelled(request)
+            return request.id
         run.started_at, run.error_category = run.started_at or utc_now(), None
         if run.state == "failed":
             run.state = "finalizing" if request.cursor and "after" in json.loads(request.cursor) else "scanning"
