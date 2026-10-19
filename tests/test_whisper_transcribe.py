@@ -239,6 +239,20 @@ def test_parser_round_trip_and_expected_lineage(adapter):
         whisper.parse_whisper_result(result.to_bytes(), expected_audio_sha256="b" * 64)
 
 
+@pytest.mark.parametrize("input_type", [str, bytes])
+def test_parser_rejects_oversized_utf8_before_whitespace_normalization(adapter, monkeypatch, input_type):
+    result = adapter.run()
+    payload = result.to_dict()
+    payload["segments"][0]["text"] = "Hello" + "\u2003" * 32 + "world."
+    raw = whisper.canonical_json(payload)
+    maximum = len(raw)
+    assert len(result.to_bytes()) < maximum < len(raw.encode("utf-8"))
+    monkeypatch.setattr(whisper, "MAX_RESULT_BYTES", maximum)
+    raw_input = raw if input_type is str else raw.encode("utf-8")
+    with pytest.raises(whisper.WhisperError, match="invalid_whisper_output"):
+        whisper.parse_whisper_result(raw_input)
+
+
 def test_adapter_has_no_application_or_shell_imports_and_runtime_import_is_lazy():
     tree = ast.parse((ROOT / "whisper_transcribe.py").read_text())
     banned = {"flask", "sqlalchemy", "celery", "boto3", "s3_utils", "models", "app", "subprocess", "config"}

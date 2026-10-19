@@ -210,7 +210,10 @@ def parse_whisper_result(raw, *, expected_job_name=None, expected_audio_sha256=N
         return result
 
     try:
-        if not isinstance(raw, (str, bytes)) or len(raw) > MAX_RESULT_BYTES:
+        if not isinstance(raw, (str, bytes)):
+            _fail()
+        raw = raw.encode("utf-8") if isinstance(raw, str) else raw
+        if len(raw) > MAX_RESULT_BYTES:
             _fail()
         payload = json.loads(raw, object_pairs_hook=unique)
         if not isinstance(payload, dict):
