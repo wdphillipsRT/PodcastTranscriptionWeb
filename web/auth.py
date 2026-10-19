@@ -3,7 +3,7 @@
 from urllib.parse import unquote, urlsplit
 
 from email_validator import EmailNotValidError
-from flask import Blueprint, current_app, jsonify, redirect, render_template_string, request, session, url_for
+from flask import Blueprint, current_app, jsonify, redirect, render_template, request, session, url_for
 from flask_login import login_required, login_user, logout_user
 from werkzeug.security import check_password_hash
 
@@ -20,19 +20,6 @@ _DUMMY_HASH = (
     "81490a1c2d29d9302cdbf2267b9dc959247e9b251471df1b240e524b6ac8432467"
     "ceaf6a36ef4844c1ce0badf3ce88e5665bd04f105ed0377a49e2b9ddc84c35"
 )
-
-_LOGIN_FORM = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Administrator login</title></head>
-<body><main><h1>Administrator login</h1>
-{% if error %}<p role="alert">{{ error }}</p>{% endif %}
-<form method="post">
-<input type="hidden" name="csrf_token" value="{{ csrf_token() if config.WTF_CSRF_ENABLED else '' }}">
-<input type="hidden" name="next" value="{{ next_url }}">
-<label>Email <input type="email" name="email" autocomplete="username" required></label>
-<label>Password <input type="password" name="password" autocomplete="current-password" required></label>
-<button type="submit">Log in</button>
-</form></main></body></html>"""
-
 
 @login_manager.user_loader
 def load_admin(user_id):
@@ -94,7 +81,7 @@ def login():
             login_user(admin)
             return redirect(next_url)
         error = "Invalid email or password"
-    return render_template_string(_LOGIN_FORM, error=error, next_url=next_url), 401 if error else 200
+    return render_template("login.html", error=error, next_url=next_url), 401 if error else 200
 
 
 @auth.post("/logout")

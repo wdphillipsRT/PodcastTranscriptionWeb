@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% from "source_items.html" import item_table with context %}
+{% block title %}{{ source.name }} · Source{% endblock %}
+{% block content %}
+<h1>{{ source.name }}</h1>
+<dl>
+  <dt>Source type</dt><dd>{{ source.source_type }}</dd>
+  <dt>Canonical identity</dt><dd>{{ source.canonical_url }}</dd>
+  <dt>Health</dt><dd>{{ source.health }} · {{ 'Enabled' if source.enabled else 'Disabled' }}</dd>
+  <dt>Discovery</dt><dd>{{ source.discovery_state }} · initial import: newest 25 items</dd>
+  <dt>Imported items</dt><dd>{{ source.item_count }}</dd>
+  <dt>Last successful check</dt><dd>{{ source.last_success_at or 'Not checked yet' }}</dd>
+  <dt>Next check</dt><dd>{{ source.next_check_at or 'Waiting' }}</dd>
+</dl>
+<section aria-labelledby="items-heading"><h2 id="items-heading">Items</h2>
+{{ item_table(items) }}
+</section>
+<section aria-labelledby="backfill-heading">
+  <h2 id="backfill-heading">Import older items</h2>
+  <p>Choose exactly one selector. Dates include both endpoints. Count is limited to 5000 items. An explicit URL selects one episode or video belonging to this source. RSS history is limited to what the feed provides.</p>
+  <form method="post" action="{{ url_for('workspace.create_backfill', source_id=source.id) }}" data-backfill-form>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() if config.WTF_CSRF_ENABLED else '' }}">
+    <label for="selector">Backfill selector</label>
+    <select id="selector" name="selector_type" required>
+      <option value="count">Item count</option><option value="date_range">Inclusive date range</option><option value="explicit_url">One item URL</option>
+    </select>
+    <fieldset data-selector="count"><legend>Item count</legend><label>Requested count <input name="requested_count" type="number" min="1" max="5000"></label></fieldset>
+    <fieldset data-selector="date_range"><legend>Inclusive date range</legend>
+      <label>Start date <input name="start_date" type="date"></label><label>End date <input name="end_date" type="date"></label>
+    </fieldset>
+    <fieldset data-selector="explicit_url"><legend>One episode or video</legend><label>Item URL <input type="url" name="explicit_url" maxlength="4096"></label></fieldset>
+    <button type="submit">Request backfill</button>
+    <noscript><p>Enter values only for the selected selector; leave all other fields empty.</p></noscript>
+  </form>
+</section>
+<section aria-labelledby="progress-heading"><h2 id="progress-heading">Backfill progress</h2>
+{% for backfill in backfills %}
+<article><h3>Backfill {{ backfill.id }} · {{ backfill.selector_type|replace('_', ' ') }}</h3>
+  <p>Status: {{ backfill.state }}{% if backfill.cancel_requested %} · cancellation requested{% endif %}</p>
+  <p>{{ backfill.items_scanned }} scanned · {{ backfill.items_accepted }} accepted · {{ backfill.items_queued }} queued</p>
+  {% if backfill.history_limited %}<p>The requested history is not available in this RSS feed.</p>{% endif %}
+  {% if backfill.state in ['pending', 'running'] and not backfill.cancel_requested %}
+  <details><summary>Cancel this backfill</summary><p>Future pages will stop. Already imported items and artifacts are preserved.</p>
+    <form method="post" action="{{ url_for('workspace.cancel_backfill', backfill_id=backfill.id) }}" data-confirm="Cancel this backfill and stop future imports?">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() if config.WTF_CSRF_ENABLED else '' }}">
+      <button type="submit">Confirm cancellation</button>
+    </form>
+  </details>{% endif %}
+</article>{% else %}<p>No historical backfills requested.</p>{% endfor %}
+<p>Reload this page to update progress.</p>
+</section>
+{% endblock %}

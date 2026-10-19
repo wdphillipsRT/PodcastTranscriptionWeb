@@ -1,41 +1,14 @@
 {% extends "base.html" %}
-
-{% block title %}Login - Podcast Transcription Service{% endblock %}
-
+{% block title %}Administrator login{% endblock %}
 {% block content %}
-<div class="row justify-content-center">
-    <div class="col-md-6">
-        <div class="card">
-            <div class="card-header text-center">
-                <h3><i class="fas fa-sign-in-alt"></i> Login</h3>
-            </div>
-            <div class="card-body">
-                <form method="POST">
-                    <div class="mb-3">
-                        <label for="email" class="form-label">Email</label>
-                        <input type="email" class="form-control" id="email" name="email" required>
-                    </div>
-                    
-                    <div class="mb-3">
-                        <label for="password" class="form-label">Password</label>
-                        <input type="password" class="form-control" id="password" name="password" required>
-                    </div>
-                    
-                    <div class="d-grid">
-                        <button type="submit" class="btn btn-primary">
-                            <i class="fas fa-sign-in-alt"></i> Login
-                        </button>
-                    </div>
-                </form>
-                
-                <div class="text-center mt-3">
-                    <p class="mb-0">
-                        Don't have an account? 
-                        <a href="{{ url_for('register') }}" class="text-decoration-none">Register here</a>
-                    </p>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
+<h1>Administrator login</h1>
+<p>This is a private workspace.</p>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() if config.WTF_CSRF_ENABLED else '' }}">
+  <input type="hidden" name="next" value="{{ next_url }}">
+  <label>Email <input type="email" name="email" autocomplete="username" required></label>
+  <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+  <button type="submit">Log in</button>
+</form>
 {% endblock %}

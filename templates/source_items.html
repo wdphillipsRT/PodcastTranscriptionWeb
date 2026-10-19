@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% macro item_table(items) %}
+{% if items %}
+<p>Showing up to 200 newest imported items.</p>
+<div class="table-scroll"><table>
+  <caption>Imported items and transcript status</caption>
+  <thead><tr><th scope="col">Item</th><th scope="col">Status</th><th scope="col">Transcript origin</th><th scope="col">Transcript</th></tr></thead>
+  <tbody>{% for item in items %}<tr>
+    <th scope="row"><a href="{{ url_for('workspace.item', item_id=item.id) }}">{{ item.title }}</a></th>
+    <td>{{ item.status }}</td><td>{{ item.transcript_origin }}</td>
+    <td>{% if item.transcript_available %}<a href="{{ url_for('workspace.transcript', item_id=item.id) }}">Read transcript</a>{% else %}Not available{% endif %}</td>
+  </tr>{% endfor %}</tbody>
+</table></div>
+{% else %}<p>No imported items yet. Discovery may still be pending.</p>{% endif %}
+{% endmacro %}
+{% block title %}Items · {{ source.name }}{% endblock %}
+{% block content %}
+<h1>{{ source.name }} items</h1>
+<p><a href="{{ url_for('workspace.source', source_id=source.id) }}">Source and backfills</a></p>
+{{ item_table(items) }}
+{% endblock %}
