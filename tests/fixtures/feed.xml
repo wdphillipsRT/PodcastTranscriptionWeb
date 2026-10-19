@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <title>Example Podcast</title><description>A test podcast.</description>
+  <item><title>Older</title><guid isPermaLink="false">episode-old</guid>
+    <pubDate>Mon, 12 Oct 2026 09:00:00 -0400</pubDate>
+    <enclosure url="audio/old.mp3" type="audio/mpeg" length="12"/>
+  </item>
+  <item><title>Newest</title><guid isPermaLink="false">episode-new</guid>
+    <link>episodes/new</link><pubDate>Tue, 13 Oct 2026 10:00:00 +0200</pubDate>
+    <enclosure url="https://cdn.example/new.mp3?token=secret" type="audio/mpeg"/>
+  </item>
+  <item><title>No GUID</title><pubDate>2026-10-11T12:00:00</pubDate>
+    <enclosure url="audio/fallback.mp3" type="audio/mpeg"/>
+  </item>
+  <item><title>Non audio</title><enclosure url="video.mp4" type="video/mp4"/></item>
+</channel></rss>

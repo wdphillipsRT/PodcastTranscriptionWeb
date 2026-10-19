@@ -1,213 +1,163 @@
+"""Deterministic podcast discovery and bounded, atomic media acquisition."""
+
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import os
-import subprocess
-import feedparser
-import requests
-from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import re
+import tempfile
+from urllib.parse import urljoin
+
 from dateutil import parser as dtparse
-from typing import List, Dict, Optional, Any
-from tenacity import retry, stop_after_attempt, wait_exponential
-import logging
-from urllib.parse import urlparse, urljoin
-import hashlib
+import requests
 
-logger = logging.getLogger(__name__)
+from config import Settings
+from feed_resolver import bounded_chunks, fetch_body, http_response, parse_feed
+from ingestion_types import (DiscoveryPage, DownloadedMedia, IngestionError,
+    ItemDescriptor, SourceDescriptor, normalize_public_url, utc_datetime)
 
-def list_audio_items(feed_url: str) -> List[Dict[str, Any]]:
-    """Parse RSS feed and extract audio episodes."""
-    logger.info(f"Parsing RSS feed: {feed_url}")
-    
+
+def _publication(entry):
+    value = entry.get("published") or entry.get("updated")
     try:
-        # Parse the feed
-        feed = feedparser.parse(feed_url)
-        
-        if feed.bozo and feed.bozo_exception:
-            logger.warning(f"Feed parsing warning: {feed.bozo_exception}")
-        
-        if not hasattr(feed, 'entries') or not feed.entries:
-            logger.error("No entries found in feed")
-            return []
-        
-        items = []
-        
-        for entry in feed.entries:
-            # Parse publication date
-            published = None
-            if hasattr(entry, "published"):
-                try:
-                    published = dtparse.parse(entry.published)
-                    # Ensure timezone awareness
-                    if published.tzinfo is None:
-                        published = published.replace(tzinfo=timezone.utc)
-                except Exception as e:
-                    logger.debug(f"Could not parse published date '{entry.published}': {e}")
-            
-            # Extract audio enclosures
-            enclosures = getattr(entry, "enclosures", [])
-            
-            for enclosure in enclosures:
-                enc_type = enclosure.get("type", "").lower()
-                href = enclosure.get("href")
-                
-                if href and enc_type.startswith("audio"):
-                    # Generate a unique ID for this episode
-                    episode_id = entry.get("guid") or entry.get("id") or href
-                    
-                    episode_item = {
-                        "title": entry.get("title", "Untitled Episode"),
-                        "link": entry.get("link"),
-                        "published": published,
-                        "audio_url": href,
-                        "guid": episode_id,
-                        "description": entry.get("summary", ""),
-                        "duration": enclosure.get("length"),
-                        "file_size": enclosure.get("length"),  # Some feeds use length for file size
-                    }
-                    
-                    items.append(episode_item)
-                    break  # Take the first audio enclosure
-        
-        # Sort by publication date (newest first)
-        items.sort(
-            key=lambda x: x["published"] or datetime(1970, 1, 1, tzinfo=timezone.utc),
-            reverse=True
-        )
-        
-        logger.info(f"Found {len(items)} audio episodes in feed")
-        return items
-        
-    except Exception as e:
-        logger.error(f"Error parsing RSS feed: {e}")
-        raise
+        return utc_datetime(dtparse.parse(value, default=datetime(1970, 1, 1))) if value else None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
-def filter_items(items: List[Dict[str, Any]], last_n: Optional[int] = None, days: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Filter episodes by count or date range."""
-    original_count = len(items)
-    
-    if days is not None:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        items = [item for item in items if item["published"] and item["published"] >= cutoff]
-        logger.info(f"Filtered to {len(items)} episodes from last {days} days")
-    
-    if last_n is not None:
-        items = items[:last_n]
-        logger.info(f"Limited to last {last_n} episodes")
-    
-    logger.info(f"Filtered {original_count} episodes down to {len(items)}")
-    return items
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def download_audio_with_aria2(audio_url: str, dest_path: str) -> str:
-    """Download audio file using aria2c for robustness."""
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    
-    # Check if aria2c is available
+def _duration(value):
+    if value is None:
+        return None
     try:
-        subprocess.run(["aria2c", "--version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        logger.warning("aria2c not found, falling back to requests")
-        return download_audio_with_requests(audio_url, dest_path)
-    
-    logger.info(f"Downloading with aria2c: {audio_url}")
-    
-    try:
-        cmd = [
-            "aria2c",
-            "--auto-file-renaming=false",
-            "--allow-overwrite=true",
-            "-x", "8",  # 8 connections
-            "-s", "8",  # 8 splits
-            "-o", os.path.basename(dest_path),
-            "--user-agent", "Mozilla/5.0 (compatible; PodcastTranscriptionBot/1.0)",
-            audio_url
-        ]
-        
-        result = subprocess.run(
-            cmd,
-            cwd=os.path.dirname(dest_path),
-            check=True,
-            capture_output=True,
-            text=True
-        )
-        
-        if result.returncode == 0 and os.path.exists(dest_path):
-            file_size = os.path.getsize(dest_path)
-            logger.info(f"Successfully downloaded {file_size} bytes to {dest_path}")
-            return dest_path
-        else:
-            raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
-            
-    except subprocess.CalledProcessError as e:
-        logger.error(f"aria2c download failed: {e.stderr}")
-        raise
+        parts = [int(part) for part in str(value).split(":")]
+        if not 1 <= len(parts) <= 3 or any(part < 0 for part in parts):
+            return None
+        result = 0
+        for part in parts:
+            result = result * 60 + part
+        return result
+    except ValueError:
+        return None
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def download_audio_with_requests(audio_url: str, dest_path: str) -> str:
-    """Download audio file using requests as fallback."""
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    
-    logger.info(f"Downloading with requests: {audio_url}")
-    
+
+def discover_podcast_items(source, settings, session, *, limit=None,
+        published_after=None, published_before=None, cursor=None) -> DiscoveryPage:
+    """Select a bounded feed snapshot inclusively by UTC date, then by count.
+
+    RSS offsets apply only to an unchanged feed snapshot. Orchestration must use
+    durable identities to deduplicate between fetches, not offset checkpoints.
+    """
+    limit = settings.PODCAST_INITIAL_ITEM_LIMIT if limit is None else limit
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("limit must be a positive integer")
+    after, before = utc_datetime(published_after), utc_datetime(published_before)
+    if after is not None and before is not None and after > before:
+        raise ValueError("invalid publication range")
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; PodcastTranscriptionBot/1.0)"
-        }
-        
-        with requests.get(audio_url, headers=headers, stream=True, timeout=60) as response:
+        offset = int(cursor) if cursor is not None else 0
+        if offset < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("invalid discovery cursor") from None
+    body, feed_url = fetch_body(source.canonical_url, settings, session)
+    parsed = parse_feed(body)
+    items, seen = [], set()
+    for entry in parsed.entries:
+        enclosure = next((enc for enc in entry.get("enclosures", ())
+            if enc.get("href") and enc.get("type", "").lower().startswith("audio/")), None)
+        if not enclosure:
+            continue
+        try:
+            media_url = normalize_public_url(urljoin(feed_url, enclosure["href"]))
+            canonical_url = normalize_public_url(urljoin(feed_url, entry.get("link") or media_url))
+        except IngestionError:
+            continue
+        guid = str(entry.get("id") or entry.get("guid") or media_url)
+        external_id = sha256((source.external_id + guid).encode("utf-8")).hexdigest()
+        if external_id in seen:
+            continue
+        seen.add(external_id)
+        items.append(ItemDescriptor(source_type="podcast_rss", source_external_id=source.external_id,
+            external_id=external_id, title=entry.get("title") or "Untitled Episode",
+            published_at=_publication(entry), media_url=media_url, canonical_url=canonical_url,
+            description=entry.get("summary", ""), guid=guid,
+            creator_name=entry.get("author"), duration_seconds=_duration(entry.get("itunes_duration"))))
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    items.sort(key=lambda item: (item.published_at or epoch, item.external_id), reverse=True)
+    if after is not None:
+        items = [item for item in items if item.published_at is not None and item.published_at >= after]
+    if before is not None:
+        items = [item for item in items if item.published_at is not None and item.published_at <= before]
+    selected = items[offset:offset + limit]
+    exhausted = offset + len(selected) >= len(items)
+    return DiscoveryPage(items=selected, exhausted=exhausted,
+        next_cursor=None if exhausted else str(offset + len(selected)))
+
+
+def download_podcast_audio(url, destination, settings, session) -> DownloadedMedia:
+    """Stream into a unique sibling file; replace the destination on success."""
+    destination = Path(destination)
+    partial = None
+    try:
+        with http_response(session, "GET", url, settings) as response:
             response.raise_for_status()
-            
-            total_size = int(response.headers.get('content-length', 0))
-            
-            with open(dest_path, 'wb') as f:
-                downloaded = 0
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        if total_size > 0:
-                            progress = (downloaded / total_size) * 100
-                            if downloaded % (1024 * 1024) == 0:  # Log every MB
-                                logger.debug(f"Download progress: {progress:.1f}%")
-            
-            file_size = os.path.getsize(dest_path)
-            logger.info(f"Successfully downloaded {file_size} bytes to {dest_path}")
-            return dest_path
-            
-    except Exception as e:
-        logger.error(f"Requests download failed: {e}")
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-        raise
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            digest, size = sha256(), 0
+            with tempfile.NamedTemporaryFile(dir=destination.parent,
+                    prefix=f".{destination.name}.", suffix=".part", delete=False) as handle:
+                partial = Path(handle.name)
+                for chunk in bounded_chunks(response, settings.MAX_AUDIO_BYTES):
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            if not size:
+                raise IngestionError("empty_media")
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip() or None
+            os.replace(partial, destination)
+            partial = None
+            return DownloadedMedia(path=destination, size_bytes=size,
+                content_type=content_type, sha256=digest.hexdigest())
+    except OSError:
+        raise IngestionError("media_write_failed") from None
+    finally:
+        if partial is not None:
+            partial.unlink(missing_ok=True)
 
-def download_audio(audio_url: str, dest_path: str) -> str:
-    """
-    Download audio file using the best available method.
-    Prefers aria2c for robustness, falls back to requests.
-    """
-    if os.path.exists(dest_path):
-        file_size = os.path.getsize(dest_path)
-        if file_size > 0:
-            logger.info(f"Audio file already exists: {dest_path} ({file_size} bytes)")
-            return dest_path
-        else:
-            logger.warning(f"Removing empty file: {dest_path}")
-            os.remove(dest_path)
-    
-    try:
-        return download_audio_with_aria2(audio_url, dest_path)
-    except Exception as e:
-        logger.warning(f"aria2c download failed, trying requests: {e}")
-        return download_audio_with_requests(audio_url, dest_path)
 
-def generate_episode_id(guid: str, audio_url: str) -> str:
-    """Generate a short, filesystem-safe episode ID."""
-    source = guid or audio_url
-    return hashlib.md5(source.encode("utf-8")).hexdigest()[:12]
+def list_audio_items(feed_url, settings=None, session=None):
+    """Legacy dictionary projection with the same bounded network intake."""
+    settings = settings or Settings
+    source = SourceDescriptor(source_type="podcast_rss",
+        external_id=sha256(normalize_public_url(feed_url).encode()).hexdigest(),
+        canonical_url=feed_url, title="Podcast")
+    if session is None:
+        with requests.Session() as client:
+            client.trust_env = False
+            return list_audio_items(feed_url, settings, client)
+    page = discover_podcast_items(source, settings, session, limit=settings.BACKFILL_REQUEST_MAX_ITEMS)
+    return [{"title": item.title, "link": item.canonical_url, "published": item.published_at,
+        "audio_url": item.media_url, "guid": item.guid, "description": item.description,
+        "duration": item.duration_seconds} for item in page.items]
 
-def slugify(text: str) -> str:
-    """Convert text to filesystem-safe slug."""
-    import re
-    # Remove/replace problematic characters
-    slug = re.sub(r'[^\w\s-]', '', text.lower())
-    slug = re.sub(r'[-\s]+', '-', slug)
-    return slug.strip('-')[:50]  # Limit length
+
+def filter_items(items, last_n=None, days=None, *, now=None):
+    if days is not None:
+        cutoff = utc_datetime(now or datetime.now(timezone.utc)) - timedelta(days=days)
+        items = [item for item in items if item["published"] and utc_datetime(item["published"]) >= cutoff]
+    return items[:last_n] if last_n is not None else items
+
+
+def download_audio(audio_url, dest_path, settings=None, session=None):
+    if session is not None:
+        return str(download_podcast_audio(audio_url, dest_path, settings or Settings, session).path)
+    with requests.Session() as client:
+        client.trust_env = False
+        return str(download_podcast_audio(audio_url, dest_path, settings or Settings, client).path)
+
+
+def generate_episode_id(guid, audio_url):
+    return sha256((guid or normalize_public_url(audio_url)).encode("utf-8")).hexdigest()
+
+
+def slugify(text):
+    return re.sub(r"[-\s]+", "-", re.sub(r"[^\w\s-]", "", text.lower())).strip("-")[:50]
