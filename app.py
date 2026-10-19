@@ -1,230 +1,33 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, session, flash
-from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime, timezone
-import os
-import requests
-from dotenv import load_dotenv
-import logging
+"""Import-safe Flask application construction."""
 
-# Load environment variables
-load_dotenv()
+from collections.abc import Mapping
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-in-production')
+from flask import Flask
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Fix DATABASE_URL for SQLAlchemy 1.4+ and Heroku
-database_url = os.environ.get('DATABASE_URL', 'postgresql://localhost/podcast_transcription')
-if database_url.startswith('postgres://'):
-    database_url = database_url.replace('postgres://', 'postgresql+psycopg2://', 1)
-elif database_url.startswith('postgresql://') and '+psycopg2' not in database_url:
-    database_url = database_url.replace('postgresql://', 'postgresql+psycopg2://', 1)
+from config import load_settings
+from extensions import csrf, db, limiter, login_manager, migrate
 
-app.config['SQLALCHEMY_DATABASE_URI'] = database_url
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Import models and initialize db
-from models import db, User, Podcast, Episode, ProcessingJob, EmailNotification
-db.init_app(app)
+def create_app(config_override: Mapping | None = None) -> Flask:
+    """Build an application without connecting services or creating its schema."""
+    app = Flask(__name__)
+    app.config.from_object(load_settings())
+    if config_override is not None:
+        app.config.update(config_override)
 
-# Initialize other extensions
-login_manager = LoginManager()
-login_manager.init_app(app)
-login_manager.login_view = 'login'
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1
+    )
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+    db.init_app(app)
+    migrate.init_app(app, db)
+    login_manager.init_app(app)
+    csrf.init_app(app)
+    limiter.init_app(app)
 
-@login_manager.user_loader
-def load_user(user_id):
-    return User.query.get(int(user_id))
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
 
-@app.route('/')
-def index():
-    if current_user.is_authenticated:
-        return redirect(url_for('dashboard'))
-    return render_template('index.html')
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'POST':
-        data = request.get_json() if request.is_json else request.form
-        email = data.get('email')
-        password = data.get('password')
-        
-        if User.query.filter_by(email=email).first():
-            if request.is_json:
-                return jsonify({'error': 'Email already registered'}), 400
-            flash('Email already registered')
-            return redirect(url_for('register'))
-        
-        user = User(email=email, password_hash=generate_password_hash(password))
-        db.session.add(user)
-        db.session.commit()
-        
-        login_user(user)
-        if request.is_json:
-            return jsonify({'success': True, 'redirect': url_for('dashboard')})
-        return redirect(url_for('dashboard'))
-    
-    return render_template('register.html')
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        data = request.get_json() if request.is_json else request.form
-        email = data.get('email')
-        password = data.get('password')
-        
-        user = User.query.filter_by(email=email).first()
-        
-        if user and check_password_hash(user.password_hash, password):
-            login_user(user)
-            if request.is_json:
-                return jsonify({'success': True, 'redirect': url_for('dashboard')})
-            return redirect(url_for('dashboard'))
-        
-        if request.is_json:
-            return jsonify({'error': 'Invalid credentials'}), 401
-        flash('Invalid credentials')
-    
-    return render_template('login.html')
-
-@app.route('/logout')
-@login_required
-def logout():
-    logout_user()
-    return redirect(url_for('index'))
-
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    podcasts = Podcast.query.filter_by(user_id=current_user.id).all()
-    recent_episodes = Episode.query.join(Podcast).filter(
-        Podcast.user_id == current_user.id
-    ).order_by(Episode.created_at.desc()).limit(10).all()
-    
-    return render_template('dashboard.html', 
-                         podcasts=podcasts, 
-                         recent_episodes=recent_episodes,
-                         user=current_user)
-
-@app.route('/add-podcast', methods=['POST'])
-@login_required
-def add_podcast():
-    data = request.get_json()
-    podcast_url = data.get('url')
-    name = data.get('name')
-    
-    # Check if podcast already exists for this user
-    existing = Podcast.query.filter_by(user_id=current_user.id, url=podcast_url).first()
-    if existing:
-        return jsonify({'error': 'Podcast already added'}), 400
-    
-    # Resolve RSS feed from URL
-    try:
-        from feed_resolver import resolve_feed
-        rss_url = resolve_feed(podcast_url)
-        
-        podcast = Podcast(
-            user_id=current_user.id,
-            name=name,
-            url=podcast_url,
-            rss_url=rss_url,
-            created_at=datetime.now(timezone.utc)
-        )
-        
-        db.session.add(podcast)
-        db.session.commit()
-        
-        # Queue episodes for processing
-        from tasks import queue_podcast_processing
-        queue_podcast_processing.delay(podcast.id)
-        
-        return jsonify({'success': True, 'podcast_id': podcast.id})
-        
-    except Exception as e:
-        logger.error(f"Error adding podcast: {e}")
-        return jsonify({'error': 'Failed to add podcast'}), 500
-
-@app.route('/podcast/<int:podcast_id>/episodes')
-@login_required
-def podcast_episodes(podcast_id):
-    podcast = Podcast.query.filter_by(
-        id=podcast_id, 
-        user_id=current_user.id
-    ).first_or_404()
-    
-    episodes = Episode.query.filter_by(podcast_id=podcast_id)\
-        .order_by(Episode.published_at.desc()).all()
-    
-    return render_template('episodes.html', 
-                         podcast=podcast, 
-                         episodes=episodes, 
-                         user=current_user)
-
-@app.route('/api/episodes/<int:episode_id>')
-@login_required
-def get_episode(episode_id):
-    episode = Episode.query.join(Podcast).filter(
-        Episode.id == episode_id,
-        Podcast.user_id == current_user.id
-    ).first_or_404()
-    
-    return jsonify({
-        'id': episode.id,
-        'title': episode.title,
-        'description': episode.description,
-        'transcript_path': episode.transcript_path,
-        'summary_path': episode.summary_path,
-        'status': episode.status,
-        'published_at': episode.published_at.isoformat() if episode.published_at else None,
-        'created_at': episode.created_at.isoformat() if episode.created_at else None
-    })
-
-@app.route('/api/episodes/<int:episode_id>/trigger-transcription', methods=['POST'])
-@login_required
-def trigger_transcription(episode_id):
-    episode = Episode.query.join(Podcast).filter(
-        Episode.id == episode_id,
-        Podcast.user_id == current_user.id
-    ).first_or_404()
-    
-    if episode.status == 'completed':
-        return jsonify({'error': 'Episode already processed'}), 400
-    
-    # Import tasks here to avoid circular imports
-    from tasks import process_episode
-    
-    # Reset episode status and trigger processing
-    episode.status = 'pending'
-    db.session.commit()
-    
-    process_episode.delay(episode_id)
-    
-    return jsonify({'success': True, 'message': 'Transcription triggered'})
-
-@app.route('/api/episodes/<int:episode_id>/trigger-summary', methods=['POST'])
-@login_required
-def trigger_summary(episode_id):
-    episode = Episode.query.join(Podcast).filter(
-        Episode.id == episode_id,
-        Podcast.user_id == current_user.id
-    ).first_or_404()
-    
-    if not episode.transcript_path:
-        return jsonify({'error': 'Episode must be transcribed first'}), 400
-    
-    # Import tasks here to avoid circular imports  
-    from tasks import summarize_episode
-    
-    summarize_episode.delay(episode_id)
-    
-    return jsonify({'success': True, 'message': 'Summary triggered'})
-
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    return app
