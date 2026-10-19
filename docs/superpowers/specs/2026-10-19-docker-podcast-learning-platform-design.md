@@ -1,6 +1,6 @@
-# Docker Podcast Learning Platform Design
+# Docker Podcast and Video Learning Platform Design
 
-**Status:** Approved  
+**Status:** Approved with YouTube amendment
 **Date:** 2026-10-19  
 **Primary URL:** `https://podcasts.ennovocon.com`  
 **Installation path:** `/home/wdphillips/PodcastTranscriptionWeb`  
@@ -8,12 +8,12 @@
 
 ## 1. Goal
 
-Turn PodcastTranscriptionWeb into an admin-only podcast learning workspace that runs on this machine with Docker Compose. The application will let the administrator add podcasts, discover and transcribe episodes, extract lessons with the locally authenticated Claude CLI, search and learn from the resulting knowledge, and automatically publish every completed episode to Lamad, Ebenezer, and Agent Factory.
+Turn PodcastTranscriptionWeb into an admin-only podcast and public-YouTube learning workspace that runs on this machine with Docker Compose. The application will let the administrator add podcast feeds, YouTube videos, channels, and playlists; discover and transcribe their items; extract lessons with the locally authenticated Claude CLI; search and learn from the resulting knowledge; and automatically publish every completed item to Lamad, Ebenezer, and Agent Factory.
 
 The system is not merely a transcript archive. It must support a closed learning loop:
 
 ```text
-podcast source
+podcast or YouTube source
   -> timestamped transcript
   -> structured claims, teachings, and exercises
   -> governed memory and learning intake
@@ -37,7 +37,7 @@ The following decisions are fixed for this design:
 - `s3://podcast-transcriptions-web-2025` is the canonical audio, transcript, and learning-bundle store.
 - Claude Code runs in non-interactive `claude -p` mode for summaries and structured teaching extraction.
 - PostgreSQL plus Celery provides the publication outbox. S3 Events, SQS, and Lambda are not required.
-- Every completed episode is automatically submitted to Lamad, Ebenezer, and Agent Factory.
+- Every completed podcast episode or YouTube video is automatically submitted to Lamad, Ebenezer, and Agent Factory.
 - Automatic submission does not silently convert a speaker's claim or a model inference into verified truth.
 - Agent Factory may automatically ingest candidate evidence, but trusted skill or agent releases remain versioned and governed.
 
@@ -49,12 +49,14 @@ The following decisions are fixed for this design:
 - PostgreSQL, Redis, web, worker, and scheduler services.
 - Single-administrator provisioning and login.
 - Apple Podcasts URL and RSS-feed intake.
-- Periodic episode discovery.
+- Public YouTube video, channel, and playlist intake without cookies or account authentication.
+- Periodic podcast-episode and YouTube-video discovery.
+- Initial intake of the newest 25 items plus controlled historical backfill by date range, item count, or explicit item URL.
 - Amazon Transcribe integration using the designated S3 bucket.
 - Timestamped transcript normalization.
 - Restricted Claude CLI summarization and teaching extraction.
-- Immutable, versioned episode learning bundles.
-- A browsable podcast, episode, transcript, lesson, and knowledge interface.
+- Immutable, versioned content-item learning bundles.
+- A browsable source, item, transcript, lesson, and knowledge interface.
 - An Ask & Learn interface that produces cited lessons and implementation plans.
 - Reliable automatic publishing to Lamad, Ebenezer, and Agent Factory.
 - Per-destination delivery state, retries, and administrator-visible failures.
@@ -70,6 +72,7 @@ The following decisions are fixed for this design:
 - Automatically asserting that podcast advice is scientifically or factually correct.
 - Automatically publishing copyrighted full transcripts to Git or a public endpoint.
 - Silently modifying a trusted Agent Factory skill without versioning, evaluation, and promotion.
+- Authenticated, private, members-only, age-restricted, or cookie-dependent YouTube intake.
 
 ## 4. Existing Repository Findings
 
@@ -109,12 +112,12 @@ Cloudflare Tunnel
         +-------------+-------------+
                       |
                  Celery workers
-          ingestion / transcription /
+       discovery / ingestion / transcription /
           extraction / publication
                       |
        +--------------+-------------------+
        |              |                   |
- Amazon Transcribe  Claude CLI       downstream adapters
+Amazon Transcribe / yt-dlp captions / Claude CLI / downstream adapters
        |              |             /        |          \
        +------ S3 learning bundle -+      Ebenezer    Agent Factory
                                       Lamad
@@ -126,7 +129,7 @@ Cloudflare Tunnel
 | --- | --- | --- |
 | `web` | Flask UI/API under Gunicorn | `127.0.0.1:8005` |
 | `worker` | Celery ingestion, transcription, extraction, and publication queues | None |
-| `beat` | Scheduled RSS discovery | None |
+| `beat` | Scheduled RSS and YouTube discovery | None |
 | `postgres` | Durable application state and outbox | None |
 | `redis` | Celery broker and result backend | None |
 | `migrate` | One-shot versioned database migration | None |
@@ -163,19 +166,21 @@ Security controls include:
 - `.env` and credential directories excluded from Git and restricted to the owner.
 - Log redaction for credentials, signed URLs, transcript bodies, and authorization headers.
 - Explicit request timeouts and response-size limits for remote fetches.
-- Server-side authorization checks on every podcast, episode, artifact, and lesson route.
+- Server-side authorization checks on every source, item, artifact, and lesson route.
 
 Cloudflare supplies public TLS. Cloudflare Access may be added as defense in depth, but application login remains mandatory.
 
-## 7. Episode Processing Workflow
+## 7. Content Processing Workflow
 
 ### 7.1 Discovery
 
-The administrator adds either an Apple Podcasts URL or an RSS URL. The application resolves and stores the canonical feed URL. Celery Beat checks enabled feeds on a configurable interval and creates idempotent episode records using the feed identity and episode GUID.
+The administrator adds an Apple Podcasts URL, RSS URL, public YouTube video, public YouTube channel, or public YouTube playlist. Podcast URLs resolve to a canonical feed. YouTube URLs resolve through the official YouTube Data API to canonical public identities. Celery Beat checks enabled sources on a configurable interval and creates idempotent items using feed-plus-GUID identity for podcast episodes and YouTube video ID identity for videos.
+
+New sources import the newest 25 items. Historical backfill accepts a date range, requested item count, or explicit episode/video URL and runs in bounded, cancellable batches. A YouTube video that appears in both a channel and a playlist is stored and processed once while retaining both source memberships.
 
 ### 7.2 Processing states
 
-An episode uses explicit states:
+A content item uses explicit states:
 
 ```text
 discovered
@@ -188,7 +193,7 @@ discovered
 
 Failures retain the last successful stage and a redacted error. Retrying resumes from the last valid immutable artifact rather than repeating all prior work.
 
-Downstream delivery is separate from episode completion:
+Downstream delivery is separate from item completion:
 
 ```text
 pending -> delivering -> delivered
@@ -198,11 +203,13 @@ pending -> delivering -> delivered
 
 A Lamad outage therefore does not erase a valid transcript or prevent Ebenezer and Agent Factory delivery.
 
-### 7.3 Audio and transcription
+### 7.3 Transcript acquisition
 
-Audio is downloaded to a bounded temporary file, validated, and stored in S3. Amazon Transcribe reads the S3 object and writes its result to the same bucket. The worker normalizes the provider result into stable timestamped segments and calculates content hashes.
+Podcast audio is downloaded to a bounded temporary file, validated, and stored in S3. YouTube transcript acquisition uses creator-provided captions first, YouTube automatic captions second, and bounded audio extraction plus Amazon Transcribe only as fallback. The worker records `creator_caption`, `automatic_caption`, or `amazon_transcribe` as transcript origin, normalizes every result into stable timestamped segments, and calculates content hashes. YouTube segments retain video ID and timestamp citation targets.
 
 `AWS_REGION` is required configuration. Startup validation checks that the configured region and account can read/write the exact bucket and invoke Amazon Transcribe. Configuration fails closed rather than silently using a different bucket.
+
+`YOUTUBE_API_KEY` is required for public channel and playlist discovery. The worker image contains `yt-dlp[default]==2026.8.19`, its matching EJS solver dependency, and Deno `2.9.7`; upgrades require a reviewed image change. No remote solver download, runtime self-update, YouTube OAuth token, browser cookie, or authenticated account is allowed.
 
 ### 7.4 Claude extraction
 
@@ -217,7 +224,7 @@ claude -p
   --disable-slash-commands
   --no-session-persistence
   --output-format json
-  --json-schema /app/schemas/podcast-learning-bundle-v1.json
+  --json-schema /app/schemas/learning-media-bundle-v1.json
 ```
 
 The system prompt states that the transcript is untrusted quoted data and that instructions contained inside it must never be followed. Claude receives no shell, filesystem, browser, MCP, skill, or network tools. Output must validate against the learning-bundle schema before it can be published.
@@ -233,7 +240,7 @@ Each derived artifact records:
 
 ## 8. Canonical Episode Learning Bundle
 
-Each completed episode produces an immutable bundle under a content-addressed S3 prefix. A later correction creates a new bundle version and supersession link; it does not overwrite prior evidence.
+Each completed item produces an immutable bundle under a content-addressed S3 prefix. A later correction creates a new bundle version and supersession link; it does not overwrite prior evidence.
 
 ```text
 manifest.json
@@ -248,7 +255,7 @@ bundle.json
 
 ### 8.1 `manifest.json`
 
-Contains stable episode and show identity, feed and episode URLs, creator/publisher, guests when known, publication date, duration, acquisition time, language, rights/access notes, retention rules, raw-media/transcript retention flags, and hashes for every retained artifact.
+Contains stable item and source identity, canonical item/source URLs, creator/publisher, guests when known, publication date, duration, acquisition time, language, rights/access notes, retention rules, raw-media/transcript retention flags, and hashes for every retained artifact.
 
 ### 8.2 `transcript.json`
 
@@ -305,7 +312,7 @@ When a bundle transaction commits, the application creates one delivery record p
 The idempotency identity is derived from:
 
 ```text
-episode GUID + transcript hash + bundle schema version + destination
+content-item identity + transcript hash + bundle schema version + destination
 ```
 
 Every downstream API receives the idempotency identity. Replaying an identical delivery returns the prior result; changing content under the same identity is rejected.
@@ -323,15 +330,15 @@ The administrator can view:
 
 Lamad owns governed learning state, evaluation, datasets, training orchestration, and promotion. It does not replace the source artifact store or inference interface.
 
-The Lamad integration adds a versioned podcast-learning intake contract. The contract accepts the bundle reference, content hashes, structured examples, provenance, rights/retention classification, and proposed capabilities. It does not embed an uncontrolled duplicate of the raw transcript in a cognitive-outcome envelope.
+The Lamad integration adds a versioned learning-media intake contract. The contract accepts the item type, bundle reference, content hashes, structured examples, provenance, rights/retention classification, and proposed capabilities. It does not embed an uncontrolled duplicate of the raw transcript in a cognitive-outcome envelope.
 
-Every completed episode is registered automatically with initial `unassessed` learning state. Structured items may be available for provisional, provenance-visible retrieval immediately, while promotion into approved datasets, durable methods, or released capabilities follows Lamad evaluation policy.
+Every completed item is registered automatically with initial `unassessed` learning state. Structured items may be available for provisional, provenance-visible retrieval immediately, while promotion into approved datasets, durable methods, or released capabilities follows Lamad evaluation policy.
 
 The intake supports:
 
-- Podcast/source artifact registration.
+- Podcast/YouTube source artifact registration.
 - Topic and teaching-example registration.
-- Cross-episode clustering and contradiction detection.
+- Cross-item clustering and contradiction detection.
 - Verification and applicability state.
 - Candidate learning generation.
 - Links to Agent Factory skill candidates and releases.
@@ -342,25 +349,25 @@ Automatic intake means Lamad sees all information. It does not mean every assert
 
 ## 11. Ebenezer Integration
 
-Ebenezer owns durable memory, provenance, retention, correction, supersession, and retrieval. The integration adds `podcast` as an explicit source system and enables its governed event projection.
+Ebenezer owns durable memory, provenance, retention, correction, supersession, and retrieval. The integration adds `podcast` and `youtube` as explicit source systems and enables their governed event projections.
 
 Each bundle produces:
 
 - Artifact references for the transcript, summary, and teaching bundle.
 - Evidence records for explicit source claims.
 - Lesson-memory candidates for derived frameworks and practices.
-- Relationships linking lessons and claims to exact episode segments.
+- Relationships linking lessons and claims to exact podcast/video segments.
 - Supersession records when corrected transcripts or interpretations replace older versions.
 
 The append-only records are canonical memory. Semantic/vector indexes are derived and rebuildable. Retrieval returns authority, verification, freshness, and source reasons rather than unlabelled text.
 
-Podcast memory is available to Ask & Learn as soon as it is admitted, but unverified claims remain visibly unverified.
+Podcast and YouTube memory is available to Ask & Learn as soon as it is admitted, but unverified claims remain visibly unverified.
 
 ## 12. Agent Factory Integration
 
-Agent Factory builds portable external skills, not an uncontrolled second memory or model-training system. The integration adds a `podcast_episode` source adapter and uses existing corpus, evidence, claim, source-quality, freshness, challenge, and publication contracts.
+Agent Factory builds portable external skills, not an uncontrolled second memory or model-training system. The integration adds `podcast_episode` and `youtube_video` source adapters and uses existing corpus, evidence, claim, source-quality, freshness, challenge, and publication contracts.
 
-For every completed episode, the adapter:
+For every completed item, the matching adapter:
 
 1. Adds or updates the corpus manifest item.
 2. Records rights/access and retention state.
@@ -372,7 +379,7 @@ For every completed episode, the adapter:
 
 The raw transcript remains private in S3 and is accessed through an authorized source adapter. It is not committed automatically to Agent Factory Git. Canonical published artifacts contain lawful derived material, source references, hashes, and provenance.
 
-A podcast cannot silently rewrite a trusted skill. New evidence can trigger a candidate skill revision; Lamad evaluation and the Agent Factory release workflow govern promotion.
+A podcast or YouTube source cannot silently rewrite a trusted skill. New evidence can trigger a candidate skill revision; Lamad evaluation and the Agent Factory release workflow govern promotion.
 
 ## 13. Ask & Learn
 
@@ -394,7 +401,7 @@ question
 
 For a question such as “Teach me how to implement a habit discussed by a Mel Robbins guest,” the answer must:
 
-- Identify the source episode, speaker/guest, and timestamps.
+- Identify the source episode/video, speaker/guest/creator, and timestamps.
 - Separate the guest's claim from external verification.
 - Prefer evaluated or corroborated guidance while retaining useful provisional material with labels.
 - Produce concrete steps, boundaries, exceptions, and follow-up checks.
@@ -409,7 +416,7 @@ Learning outcomes become episodic memory in Ebenezer and governed evidence in La
 
 - Add Apple Podcasts or RSS URL.
 - Enable, pause, refresh, or remove a subscription from active discovery.
-- Show canonical feed, last check, episode counts, and health.
+- Show canonical source, last check, item counts, and health.
 
 ### 14.2 Episode Queue
 
@@ -428,7 +435,7 @@ Learning outcomes become episodic memory in Ebenezer and governed evidence in La
 ### 14.4 Learning Library
 
 - Search by topic, podcast, speaker/guest, framework, program, verification state, and date.
-- Browse cross-episode topic clusters and contradictions.
+- Browse cross-item topic clusters and contradictions.
 - Distinguish provisional memory from promoted learning.
 
 ### 14.5 Ask & Learn
@@ -447,10 +454,14 @@ Learning outcomes become episodic memory in Ebenezer and governed evidence in La
 
 ## 15. Domain Model Changes
 
-The existing user, podcast, episode, and processing-job models remain where suitable. Versioned migrations add or revise the following concepts:
+The podcast-only source model is replaced with a source-neutral model. Versioned migrations add or revise the following concepts:
 
 - `Admin`: the single authorized account, enforced by application and database rules.
-- `EpisodeArtifact`: immutable S3 URI, hash, media type, schema version, and supersession link.
+- `ContentSource`: RSS podcast, YouTube channel, YouTube playlist, or individual YouTube video with canonical identity and discovery state.
+- `ContentItem`: podcast episode or YouTube video with globally stable platform identity and processing state.
+- `SourceItem`: many-to-many membership that permits one YouTube video to belong to a channel and playlists without duplicate processing.
+- `BackfillRequest`: selector, cursor, bounded batch progress, cancellation, and redacted failure state.
+- `ItemArtifact`: immutable S3 URI, hash, media type, transcript origin, schema version, and supersession link.
 - `TranscriptSegment`: stable timestamped segment identity and source hash, or an indexed projection of the canonical S3 object.
 - `TeachingItem`: structured derived material with source references and epistemic state.
 - `LearningBundle`: immutable bundle identity, version, hashes, and completion state.
@@ -482,10 +493,12 @@ The application exposes loopback-accessible liveness and readiness endpoints. Re
 - Celery Beat schedule presence.
 - S3 bucket access and configured region.
 - Amazon Transcribe client initialization.
+- YouTube Data API public-access validation.
+- Pinned `yt-dlp` binary/version availability.
 - Claude binary availability and authentication status.
 - Lamad, Ebenezer, and Agent Factory adapter health.
 
-Logs are structured and correlate podcast, episode, job, bundle, and delivery IDs. Metrics include queue age, stage duration, failures by class, delivery lag, Claude extraction failures, and downstream success rates.
+Logs are structured and correlate source, item, job, bundle, and delivery IDs. Metrics include queue age, stage duration, discovery quota/throttling failures, failures by class, delivery lag, Claude extraction failures, and downstream success rates.
 
 Operations documentation includes:
 
@@ -495,7 +508,8 @@ Operations documentation includes:
 - Cloudflare Tunnel target configuration.
 - PostgreSQL backup and restore.
 - Credential rotation.
-- Reprocessing and republishing an episode safely.
+- Reprocessing and republishing an item safely.
+- Running, monitoring, cancelling, and resuming historical backfills.
 - Diagnosing each health-check failure.
 
 ## 18. Testing Strategy
@@ -503,7 +517,11 @@ Operations documentation includes:
 ### 18.1 Unit tests
 
 - Apple URL and RSS resolution.
-- Episode identity and deduplication.
+- YouTube video/channel/playlist URL classification and canonical resolution.
+- YouTube API pagination, newest-25 selection, and scheduled discovery.
+- Date-range, item-count, and explicit-URL backfill selection.
+- Podcast and YouTube item identity, source membership, and cross-source deduplication.
+- Creator-caption, automatic-caption, and Amazon Transcribe fallback priority.
 - Transcript normalization and content hashing.
 - Learning-bundle schema validation.
 - Explicit/inferred epistemic classification.
@@ -525,16 +543,18 @@ Operations documentation includes:
 
 - PostgreSQL and Redis startup/health behavior.
 - Amazon Transcribe and S3 adapters with recorded or stubbed responses.
+- YouTube Data API and pinned `yt-dlp` adapters with deterministic fixtures.
+- An opt-in live public-YouTube smoke test that is excluded from the normal suite.
 - Claude JSON contract with a deterministic fixture and a live opt-in smoke test.
-- Lamad podcast-intake contract and idempotent replay.
-- Ebenezer podcast memory admission, retrieval, correction, and supersession.
-- Agent Factory `podcast_episode` corpus/evidence import and routing.
+- Lamad learning-media intake contract and idempotent replay.
+- Ebenezer podcast/YouTube memory admission, retrieval, correction, and supersession.
+- Agent Factory `podcast_episode` and `youtube_video` corpus/evidence import and routing.
 - Partial downstream outage and independent recovery.
 
 ### 18.4 End-to-end tests
 
-- Add a feed, discover one episode, transcribe it, extract a bundle, publish to all destinations, retrieve it, and generate a cited lesson.
-- Recreate all application containers and verify the episode, bundle, delivery state, and learning session remain available.
+- Add a feed and a YouTube channel, discover items, acquire transcripts through captions and Amazon Transcribe fallback, extract bundles, publish to all destinations, retrieve them, and generate a cited lesson.
+- Recreate all application containers and verify the item, bundle, delivery state, and learning session remain available.
 - Record a lesson outcome and verify its Lamad and Ebenezer lineage.
 
 ## 19. Delivery Phases
@@ -546,27 +566,30 @@ Operations documentation includes:
 - Remove Heroku, Stripe, Mailgun, registration, and obsolete OpenAI behavior.
 - Add single-admin provisioning.
 - Harden Compose and bind only `127.0.0.1:8005`.
-- Validate AWS, S3, Redis, PostgreSQL, and basic episode processing.
+- Add public YouTube video, channel, and playlist discovery through the YouTube Data API.
+- Add creator-caption, automatic-caption, and `yt-dlp` audio-fallback ingestion.
+- Add newest-25 intake and controlled historical backfills for podcast and YouTube sources.
+- Validate AWS, S3, YouTube, Redis, PostgreSQL, and basic content-item processing.
 
-**Exit condition:** The admin can log in, add a feed, process an episode, and retain state across container recreation.
+**Exit condition:** The admin can log in; add a podcast feed, YouTube video, channel, or playlist; import the newest 25 items; run a controlled historical backfill; process an item with the correct transcript-source priority; and retain state across container recreation.
 
-### Phase 2: Podcast learning workspace
+### Phase 2: Media learning workspace
 
 - Add restricted Claude extraction.
 - Define and validate the learning-bundle schema.
 - Store versioned bundles in S3.
-- Add episode learning views, knowledge library, and publication outbox.
+- Add item learning views, knowledge library, and publication outbox.
 
-**Exit condition:** Every completed episode has a valid, browsable learning bundle and durable delivery jobs.
+**Exit condition:** Every completed podcast episode or YouTube video has a valid, browsable learning bundle and durable delivery jobs.
 
 ### Phase 3: Learning-system adapters
 
-- Add the Lamad podcast-learning intake contract.
-- Add the Ebenezer podcast source/projection and retrieval path.
-- Add the Agent Factory `podcast_episode` adapter and program routing.
+- Add the Lamad learning-media intake contract for podcast episodes and YouTube videos.
+- Add the Ebenezer podcast/YouTube source projections and retrieval paths.
+- Add the Agent Factory `podcast_episode` and `youtube_video` adapters and program routing.
 - Enable automatic, idempotent publishing to all three.
 
-**Exit condition:** A completed episode is visible with intact lineage in Lamad, Ebenezer, and Agent Factory, and replays create no duplicates.
+**Exit condition:** A completed podcast episode or YouTube video is visible with intact lineage in Lamad, Ebenezer, and Agent Factory, and replays create no duplicates.
 
 ### Phase 4: Ask & Learn feedback loop
 
@@ -586,14 +609,16 @@ The complete design is delivered when:
 1. `https://podcasts.ennovocon.com` serves the application through the administrator-managed Cloudflare Tunnel.
 2. Only the single provisioned administrator can log in; no registration, payment, or email-delivery workflow remains.
 3. Docker Compose starts cleanly without conflicting host PostgreSQL or Redis ports.
-4. A podcast can be added from an Apple Podcasts or RSS URL and checked periodically.
-5. An episode can be downloaded, transcribed with Amazon Transcribe, and converted into a valid learning bundle with restricted Claude CLI extraction.
-6. Canonical artifacts are private and durable in `podcast-transcriptions-web-2025`.
-7. Every completed episode creates and completes idempotent deliveries to Lamad, Ebenezer, and Agent Factory.
-8. The UI exposes transcript, lesson, provenance, verification, inference, and delivery state.
-9. Ask & Learn returns actionable answers with exact episode/segment citations and visible trust state.
-10. Administrator feedback becomes traceable Lamad learning evidence and Ebenezer memory without altering the original source.
-11. Tests and live health checks pass, and durable state survives container recreation.
+4. A podcast can be added from an Apple Podcasts or RSS URL, and a public YouTube video, channel, or playlist can be added and checked periodically.
+5. A new channel or playlist imports the newest 25 videos, automatically discovers later uploads, and supports date-range, count, and explicit-URL historical backfill.
+6. YouTube transcript acquisition uses creator captions, then automatic captions, then audio extraction plus Amazon Transcribe, and records the selected origin.
+7. A podcast episode or YouTube video can be converted into a valid learning bundle with restricted Claude CLI extraction.
+8. Canonical artifacts are private and durable in `podcast-transcriptions-web-2025`.
+9. Every completed item creates and completes idempotent deliveries to Lamad, Ebenezer, and Agent Factory.
+10. The UI exposes transcript, lesson, provenance, verification, inference, and delivery state.
+11. Ask & Learn returns actionable answers with exact episode/video segment citations and visible trust state.
+12. Administrator feedback becomes traceable Lamad learning evidence and Ebenezer memory without altering the original source.
+13. Tests and live health checks pass, and durable state survives container recreation.
 
 ## 21. Key Risks and Mitigations
 
@@ -604,7 +629,11 @@ The complete design is delivered when:
 | Copyrighted transcripts are redistributed | Keep raw transcripts private in S3; publish references and permitted derivatives only |
 | Prompt injection inside a transcript | Restricted Claude mode, no tools, no skills, no sessions, explicit untrusted-data prompt, schema validation |
 | One downstream system is unavailable | Transactional outbox, independent delivery states, bounded retries |
-| Duplicate episodes or deliveries | Stable GUID/content hashes and destination-scoped idempotency identities |
+| Duplicate items or deliveries | Stable platform identities/content hashes and destination-scoped idempotency identities |
+| The same YouTube video appears in several sources | Global YouTube video identity plus `SourceItem` membership; process once |
+| YouTube quota or throttling interrupts discovery | Official API pagination, bounded polling, exponential retry, and visible per-source state |
+| YouTube extraction behavior changes | Pinned `yt-dlp`, adapter contract tests, opt-in live smoke test, deliberate upgrade procedure |
+| Public video availability is mistaken for redistribution permission | Keep captions, audio, and transcripts private; publish citations and permitted derivatives only |
 | Low-quality advice becomes a trusted skill | Immediate provisional retrieval with labels; governed evaluation and versioned promotion |
 | Health advice causes harm | ASP-90 evidence hierarchy, safety escalation, explicit limits, and non-medical framing |
 | Claude OAuth material leaks into an image or repo | Dedicated runtime mount, secret exclusions, no credential copying into the image |
