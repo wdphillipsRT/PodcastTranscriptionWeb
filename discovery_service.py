@@ -7,6 +7,7 @@ may redeliver that ID; process_item must claim the durable job idempotently.
 from datetime import datetime, timedelta
 import json
 
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from ingestion_types import SourceDescriptor, normalize_public_url
@@ -193,13 +194,50 @@ class DiscoveryService:
 
     def _fail(self, run_id, request_id=None):
         self.session.rollback()
-        run = self.session.get(DiscoveryRun, run_id)
-        run.state, run.error_category = "failed", "discovery_failed"
-        run.source.error_category = "discovery_failed"
-        if request_id:
-            request = self.session.get(BackfillRequest, request_id)
-            request.state, request.error_category = "failed", "discovery_failed"
-        self.session.commit()
+        terminal = ("completed", "cancelled")
+        try:
+            with self.session.no_autoflush:
+                if request_id is None:
+                    # Read only the association, without locking/mutating the
+                    # run before its request. All authoritative reads follow.
+                    request_id = self.session.query(DiscoveryRun.backfill_id).filter_by(id=positive_id(run_id)).scalar()
+                request = self._locked(BackfillRequest, request_id) if request_id else None
+                run = self._locked(DiscoveryRun, run_id)
+                if (run is None or run.state in terminal or (request_id and request is None)
+                        or (request and (request.state in terminal or run.backfill_id != request.id))):
+                    self.session.commit()
+                    return False
+                source = self._locked(ContentSource, run.source_id)
+                if source is None:
+                    self.session.commit()
+                    return False
+                # PostgreSQL locks serialize request -> run -> source. Guarded
+                # writes also protect terminal rows when SQLite ignores those
+                # locks or a future caller changes a row between the reads.
+                run_update = self.session.query(DiscoveryRun).filter(
+                    DiscoveryRun.id == run_id, DiscoveryRun.state.notin_(terminal))
+                if request:
+                    run_update = run_update.filter(sa.exists().where(
+                        BackfillRequest.id == request_id, BackfillRequest.state.notin_(terminal)))
+                if not run_update.update({"state": "failed", "error_category": "discovery_failed"}, synchronize_session=False):
+                    self.session.commit()
+                    return False
+                if request:
+                    changed = self.session.query(BackfillRequest).filter(
+                        BackfillRequest.id == request_id, BackfillRequest.state.notin_(terminal)
+                    ).update({"state": "failed", "error_category": "discovery_failed"}, synchronize_session=False)
+                    if not changed:
+                        self.session.rollback()
+                        return False
+                self.session.query(ContentSource).filter_by(id=source.id).update(
+                    {"error_category": "discovery_failed"}, synchronize_session=False)
+            self.session.commit()
+            return True
+        except Exception:
+            # Failure recording must not leave an unusable transaction or expose
+            # the original provider/transport exception. Durable work can replay.
+            self.session.rollback()
+            return False
 
     def continue_discovery(self, run_id):
         run = self._locked(DiscoveryRun, run_id)

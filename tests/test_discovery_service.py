@@ -332,3 +332,31 @@ def test_shared_pending_item_can_dispatch_via_another_enabled_membership(store):
     svc.replay_pending_dispatches(disabled.id)
     assert sent == [("process_item", ContentItem.query.one().id)]
     assert ProcessingJob.query.one().error_category is None
+
+
+@pytest.mark.parametrize("terminal", ["completed", "cancelled"])
+def test_delayed_discovery_failure_preserves_terminal_run(store, terminal):
+    source = store()
+    run = DiscoveryRun(source_id=source.id, run_type="initial", state=terminal, items_scanned=3, items_accepted=2)
+    db.session.add(run)
+    db.session.commit()
+    service(Adapter([]))._fail(run.id)
+    assert run.state == terminal and run.items_accepted == 2
+    assert run.error_category is source.error_category is None
+
+
+def test_discovery_failure_locks_run_before_source(store, monkeypatch):
+    source = store()
+    run = DiscoveryRun(source_id=source.id, run_type="initial", state="scanning")
+    db.session.add(run)
+    db.session.commit()
+    svc = service(Adapter([]))
+    locked = []
+    original = svc._locked
+    def record(model, identity):
+        locked.append(model)
+        return original(model, identity)
+    monkeypatch.setattr(svc, "_locked", record)
+    svc._fail(run.id)
+    assert locked == [DiscoveryRun, ContentSource]
+    assert run.state == "failed" and source.error_category == "discovery_failed"

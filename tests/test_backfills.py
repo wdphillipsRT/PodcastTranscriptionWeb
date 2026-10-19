@@ -379,3 +379,185 @@ def test_disabled_completed_backfill_does_not_publish_pending_jobs(store):
     svc.run_backfill(row.id)
     assert row.state == "completed" and sent == []
     assert ProcessingJob.query.one().error_category == "dispatch_pending"
+
+
+@pytest.mark.parametrize("terminal", ["completed", "cancelled"])
+def test_delayed_failure_after_rollback_cannot_overwrite_other_worker_terminal_state(store, monkeypatch, terminal):
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    run_id, request_id = run.id, row.id
+    # A has changes that must be discarded when its operation fails.
+    row.cursor, run.error_category = "uncommitted-A", "uncommitted-secret"
+    original_rollback = db.session.rollback
+    interleaved = False
+    expected = {}
+    def state():
+        return (row.state, row.items_accepted, row.items_queued, row.cursor, row.error_category, row.completed_at,
+                run.state, run.items_accepted, run.items_queued, run.error_category, run.completed_at, source.error_category)
+    def b_finishes_after_a_rolls_back():
+        nonlocal interleaved
+        original_rollback()
+        if interleaved:
+            return
+        interleaved = True
+        if terminal == "completed":
+            svc._finalize_backfill(run, row)
+        else:
+            svc._accept(source, svc._ordered_candidates(run, 1)[0])
+            row.items_accepted = row.items_queued = run.items_accepted = run.items_queued = 1
+            db.session.commit()
+            svc.cancel_backfill(request_id)
+        expected["state"] = state()
+    monkeypatch.setattr(db.session, "rollback", b_finishes_after_a_rolls_back)
+    svc._fail(run_id, request_id)
+    assert interleaved and row.state == run.state == terminal
+    assert state() == expected["state"]
+    assert BackfillRequest.query.count() == DiscoveryRun.query.count() == 1
+
+
+def test_failure_lock_order_matches_request_run_source_and_never_autoflushes_early(store):
+    from models import ContentSource
+    from sqlalchemy.dialects import postgresql
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    session = db.session()
+    locks, sql = [], []
+    def before_read(context):
+        if context.is_select and context.statement._for_update_arg is not None:
+            entity = context.statement.column_descriptions[0].get("entity")
+            locks.append(entity)
+            sql.append(str(context.statement.compile(dialect=postgresql.dialect())))
+    def before_flush(session, context, instances):
+        if any(isinstance(value, (DiscoveryRun, ContentSource)) for value in session.dirty):
+            assert locks[:2] == [BackfillRequest, DiscoveryRun], "failure writes must not precede request/run locks"
+    sa.event.listen(session, "do_orm_execute", before_read)
+    sa.event.listen(session, "before_flush", before_flush)
+    try:
+        svc._fail(run.id, row.id)
+    finally:
+        sa.event.remove(session, "do_orm_execute", before_read)
+        sa.event.remove(session, "before_flush", before_flush)
+    assert locks == [BackfillRequest, DiscoveryRun, ContentSource]
+    assert all("FOR UPDATE" in value for value in sql)
+    assert row.state == run.state == "failed"
+    assert row.error_category == run.error_category == source.error_category == "discovery_failed"
+    assert db.session.query(BackfillRequest).count() == 1
+
+
+@pytest.mark.parametrize("terminal", ["completed", "cancelled"])
+def test_conditional_failure_updates_guard_terminal_state_when_sqlite_ignores_row_locks(store, monkeypatch, terminal):
+    from models import ContentSource, utc_now
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    request_id, run_id = row.id, run.id
+    original_locked = svc._locked
+    interleaved = False
+    def b_commits_after_a_reads_active_rows(model, identity):
+        nonlocal interleaved
+        value = original_locked(model, identity)
+        if model is ContentSource and not interleaved:
+            interleaved = True
+            with db.engine.begin() as connection:
+                connection.execute(sa.update(BackfillRequest).where(BackfillRequest.id == request_id).values(
+                    state=terminal, items_accepted=2, completed_at=utc_now()))
+                connection.execute(sa.update(DiscoveryRun).where(DiscoveryRun.id == run_id).values(
+                    state=terminal, items_accepted=2, completed_at=utc_now()))
+        return value
+    monkeypatch.setattr(svc, "_locked", b_commits_after_a_reads_active_rows)
+    svc._fail(run_id, request_id)
+    db.session.expire_all()
+    assert interleaved and row.state == run.state == terminal
+    assert row.items_accepted == run.items_accepted == 2
+    assert row.error_category is run.error_category is source.error_category is None
+
+
+def test_backfill_failure_without_explicit_request_id_still_locks_request_first(store, monkeypatch):
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    locked = []
+    original = svc._locked
+    def record(model, identity):
+        locked.append(model)
+        return original(model, identity)
+    monkeypatch.setattr(svc, "_locked", record)
+    svc._fail(run.id)
+    assert locked[:2] == [BackfillRequest, DiscoveryRun]
+    assert row.state == run.state == "failed"
+
+
+@pytest.mark.parametrize("boundary", ["lock", "commit"])
+def test_failure_recording_error_rolls_back_and_leaves_session_usable_without_secrets(store, monkeypatch, boundary):
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    if boundary == "lock":
+        original = svc._locked
+        def error(model, identity):
+            original(model, identity)
+            raise RuntimeError("secret-provider-token")
+        monkeypatch.setattr(svc, "_locked", error)
+    else:
+        monkeypatch.setattr(db.session, "commit", lambda: (_ for _ in ()).throw(RuntimeError("secret-provider-token")))
+    assert svc._fail(run.id, row.id) is False
+    assert not db.session().in_transaction()
+    assert row.state == "running" and run.state == "finalizing"
+    assert row.error_category is run.error_category is source.error_category is None
+    assert BackfillRequest.query.count() == 1
+
+
+def test_concurrent_failure_and_finalizer_finish_and_preserve_recoverable_work(app_factory, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from models import Admin, ContentSource
+    app = app_factory(SQLALCHEMY_DATABASE_URI=f"sqlite:///{tmp_path / 'failure-finalizer.sqlite'}",
+                      SQLALCHEMY_ENGINE_OPTIONS={"connect_args": {"timeout": 2}})
+    page = DiscoveryPage((descriptor(0), descriptor(1)))
+    with app.app_context():
+        db.create_all()
+        owner = Admin(email="concurrent@example.com", password_hash="hash")
+        db.session.add(owner)
+        db.session.flush()
+        source = ContentSource(admin_id=owner.id, source_type="podcast_rss", external_id="concurrent",
+                               canonical_url="https://example.com/concurrent", name="Concurrent")
+        db.session.add(source)
+        db.session.commit()
+        row, run = staged_request(source, service(Adapter([page])), 2)
+        request_id, run_id = row.id, run.id
+    start = Barrier(2)
+    def worker(fail):
+        with app.app_context():
+            svc = service(Adapter([page]))
+            order = []
+            original = svc._locked
+            def record(model, identity):
+                order.append(model)
+                return original(model, identity)
+            svc._locked = record
+            start.wait(timeout=5)
+            if fail:
+                svc._fail(run_id, request_id)
+            else:
+                svc.run_backfill(request_id)
+            assert order[0] is BackfillRequest
+            if DiscoveryRun in order:
+                assert order.index(BackfillRequest) < order.index(DiscoveryRun)
+            # A handler returning after a failed recording still leaves a usable session.
+            assert db.session.query(BackfillRequest).count() == 1
+            return order
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = executor.submit(worker, True), executor.submit(worker, False)
+        first.result(timeout=10)
+        second.result(timeout=10)
+    with app.app_context():
+        svc = service(Adapter([page]))
+        svc.run_backfill(request_id)
+        row, run = db.session.get(BackfillRequest, request_id), db.session.get(DiscoveryRun, run_id)
+        assert row.state == run.state == "completed"
+        assert row.items_accepted == run.items_accepted == ContentItem.query.count() == 2
+        assert SourceItem.query.count() == ProcessingJob.query.count() == 2
+        db.session.remove()
+        db.drop_all()
