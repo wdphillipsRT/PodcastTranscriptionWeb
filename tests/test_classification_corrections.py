@@ -1,5 +1,6 @@
 """Immutable administrator corrections and bounded source-rule recovery, offline."""
 from datetime import timedelta
+from hashlib import sha256
 import json
 
 import pytest
@@ -9,6 +10,7 @@ from extensions import db
 import models as m
 import tasks
 from s3_utils import StorageTransientError
+from transcripts import normalize_vtt
 from tests.test_classification_service import env, add_item, finish, artifacts
 from tests.test_classification_tasks import worker
 
@@ -185,6 +187,8 @@ def test_sweep_storage_failure_retains_cursor_and_active_revision_then_resumes(e
     assert result.items_scanned == 1 and result.items_queued == 0 and result.state == "running"
     assert env.item.active_classification_revision_id == active
     monkeypatch.setattr(env.storage, "get_bytes", original)
+    failed_at = db.session.get(m.ClassificationSweep, correction.sweep_id).updated_at
+    monkeypatch.setattr(env.module, "utc_now", lambda: failed_at + timedelta(seconds=30))
     result = env.service.scan_source_rule(correction.sweep_id)
     assert result.state == "completed" and result.items_scanned == 2 and result.items_queued == 1
 
@@ -328,3 +332,157 @@ def test_sweep_task_result_is_json_serializable_for_celery_backend(worker):
     correction = record(env, active, 1)
     result = tasks.scan_source_rule.run(correction.sweep_id)
     assert json.loads(json.dumps(result))["state"] == "completed"
+
+
+def replace_canonical(env, item, text):
+    """Install a distinct immutable artifact, changing only the current pointer."""
+    transcript = normalize_vtt("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n" + text,
+        platform=item.platform, external_id=item.external_id, item_id=item.id,
+        source_id=env.source.id, language="en", tool_version="test", origin="creator_caption",
+        provider_version="test", canonical_url=item.canonical_url)
+    raw = transcript.to_json().encode()
+    item.transcript_sha256, item.segments_sha256 = transcript.transcript_sha256, sha256(raw).hexdigest()
+    item.segments_s3_key = f"items/{item.platform}/{item.external_id}/transcripts/{item.transcript_sha256}.json"
+    item.transcript_s3_key = item.segments_s3_key.removesuffix(".json") + ".txt"
+    env.storage.objects[item.segments_s3_key] = raw
+    db.session.commit()
+    return transcript
+
+
+@pytest.mark.parametrize("timing", ["before_preparation", "during_preparation", "after_preparation"])
+def test_sweep_matches_are_bound_to_the_canonical_snapshot_until_insertion(env, monkeypatch, timing):
+    active, _ = finish(env)
+    correction = record(env, active, 1)
+    target, _ = add_item(env, external_id="race-target", texts=("Buy now with promo code",))
+    original = env.service.prepare_revision_request
+    original_read = env.storage.get_bytes
+    replaced = []
+    def racing(item_id, **kwargs):
+        if item_id != target.id or replaced:
+            return original(item_id, **kwargs)
+        if timing == "before_preparation":
+            replaced.append(replace_canonical(env, target, "Replacement with no matching commercial"))
+        if timing == "during_preparation":
+            def read_then_replace(key, **options):
+                raw = original_read(key, **options)
+                if "/race-target/" in key and not replaced:
+                    replaced.append(replace_canonical(env, target, "Replacement with no matching commercial"))
+                return raw
+            monkeypatch.setattr(env.storage, "get_bytes", read_then_replace)
+        request = original(item_id, **kwargs)
+        if timing == "after_preparation":
+            replaced.append(replace_canonical(env, target, "Replacement with no matching commercial"))
+        return request
+    monkeypatch.setattr(env.service, "prepare_revision_request", racing)
+    first = env.service.scan_source_rule(correction.sweep_id)
+    assert replaced and first.state == "running"
+    assert first.cursor_item_id == env.item.id and first.items_scanned == 1 and first.items_queued == 0
+    assert not m.ClassificationRevision.query.filter_by(item_id=target.id).count()
+    assert env.item.active_classification_revision_id == active
+    second = env.service.scan_source_rule(correction.sweep_id)
+    assert second.state == "completed" and second.items_scanned == 2 and second.items_queued == 0
+    assert not m.ClassificationRevision.query.filter_by(item_id=target.id).count()
+
+
+def test_repeated_transient_sweep_failures_have_a_durable_thirty_second_floor(worker, monkeypatch):
+    env = worker.env
+    active, _ = finish(env)
+    correction = record(env, active, 1)
+    add_item(env, external_id="delayed-target", texts=("Buy now with promo code",))
+    now = [m.utc_now()]
+    monkeypatch.setattr(env.module, "utc_now", lambda: now[0])
+    monkeypatch.setattr(m, "utc_now", lambda: now[0])
+    original = env.storage.get_bytes
+    failures = []
+    def broken(key, **kwargs):
+        if "/delayed-target/" in key:
+            failures.append(now[0])
+            raise StorageTransientError("private storage message")
+        return original(key, **kwargs)
+    monkeypatch.setattr(env.storage, "get_bytes", broken)
+    tasks.scan_source_rule.run(correction.sweep_id)
+    assert not [entry for entry in worker.sent if entry[0] == "tasks.scan_source_rule"]
+    sweep = db.session.get(m.ClassificationSweep, correction.sweep_id)
+    task_id = sweep.celery_task_id
+    assert sweep.error_category == "storage_transient" and sweep.updated_at == now[0]
+    for elapsed in (0, 29):
+        now[0] = failures[0] + timedelta(seconds=elapsed)
+        tasks.scan_source_rule.run(correction.sweep_id)
+        assert tasks._publish_source_sweep(correction.sweep_id) is False
+        tasks._reconcile_source_sweeps()
+        assert len(failures) == 1 and not worker.sent
+        assert sweep.updated_at == failures[0]
+    now[0] = failures[0] + timedelta(seconds=30)
+    tasks._reconcile_source_sweeps()
+    assert worker.sent[-1][1] == [correction.sweep_id] and worker.sent[-1][2]["task_id"] == task_id
+    tasks.scan_source_rule.run(correction.sweep_id)
+    assert len(failures) == 2 and sweep.error_category == "storage_transient"
+    assert sweep.updated_at == now[0]
+    worker.sent.clear()
+    tasks._reconcile_source_sweeps()
+    assert tasks._publish_source_sweep(correction.sweep_id) is False and not worker.sent
+    now[0] += timedelta(seconds=30)
+    monkeypatch.setattr(env.storage, "get_bytes", original)
+    tasks._reconcile_source_sweeps()
+    tasks.scan_source_rule.run(correction.sweep_id)
+    assert sweep.state == "completed" and sweep.items_scanned == 2 and sweep.items_queued == 1
+    assert env.item.active_classification_revision_id == active
+
+
+def test_delayed_sweep_unknown_broker_outcome_and_disabled_rollout_preserve_eligibility(worker, monkeypatch):
+    env = worker.env
+    active, _ = finish(env)
+    correction = record(env, active, 1)
+    now = [m.utc_now()]
+    monkeypatch.setattr(env.module, "utc_now", lambda: now[0])
+    monkeypatch.setattr(m, "utc_now", lambda: now[0])
+    original = env.storage.get_bytes
+    monkeypatch.setattr(env.storage, "get_bytes", lambda *a, **kw: (_ for _ in ()).throw(StorageTransientError("private")))
+    tasks.scan_source_rule.run(correction.sweep_id)
+    sweep = db.session.get(m.ClassificationSweep, correction.sweep_id)
+    failed_at, task_id = sweep.updated_at, sweep.celery_task_id
+    attempts = []
+    def unknown(*args, **kwargs):
+        attempts.append(now[0])
+        raise RuntimeError("private broker message")
+    monkeypatch.setattr(tasks.celery_app, "send_task", unknown)
+    now[0] = failed_at + timedelta(seconds=29)
+    assert tasks._publish_source_sweep(correction.sweep_id) is False
+    tasks._reconcile_source_sweeps()
+    assert attempts == []
+    worker.app.config["CLASSIFICATION_ENABLED"] = False
+    tasks.scan_source_rule.run(correction.sweep_id)
+    assert sweep.error_category == "storage_transient" and sweep.updated_at == failed_at
+    worker.app.config["CLASSIFICATION_ENABLED"] = True
+    now[0] = failed_at + timedelta(seconds=30)
+    tasks._reconcile_source_sweeps()
+    assert attempts == [now[0]] and sweep.error_category == "storage_transient" and sweep.updated_at == failed_at
+    monkeypatch.setattr(tasks.celery_app, "send_task", worker.send)
+    tasks._reconcile_source_sweeps()
+    assert worker.sent[-1][2]["task_id"] == task_id
+    monkeypatch.setattr(env.storage, "get_bytes", original)
+    tasks.scan_source_rule.run(correction.sweep_id)
+    assert sweep.state == "completed" and env.item.active_classification_revision_id == active
+
+
+def test_retry_publication_cleanup_preserves_faster_failure_at_the_same_cursor(worker, monkeypatch):
+    env = worker.env
+    active, _ = finish(env)
+    correction = record(env, active, 1)
+    now = [m.utc_now()]
+    monkeypatch.setattr(env.module, "utc_now", lambda: now[0])
+    monkeypatch.setattr(m, "utc_now", lambda: now[0])
+    monkeypatch.setattr(env.storage, "get_bytes", lambda *a, **kw: (_ for _ in ()).throw(StorageTransientError("private")))
+    tasks.scan_source_rule.run(correction.sweep_id)
+    sweep = db.session.get(m.ClassificationSweep, correction.sweep_id)
+    task_id = sweep.celery_task_id
+    now[0] = sweep.updated_at + timedelta(seconds=30)
+    def fast(name, *, args=None, **kwargs):
+        worker.send(name, args=args, **kwargs)
+        tasks.scan_source_rule.run(*args)
+    monkeypatch.setattr(tasks.celery_app, "send_task", fast)
+    tasks._reconcile_source_sweeps()
+    assert len(worker.sent) == 1
+    assert sweep.error_category == "storage_transient" and sweep.updated_at == now[0]
+    assert sweep.celery_task_id == task_id and sweep.items_scanned == 0
+    assert tasks._publish_source_sweep(correction.sweep_id) is False

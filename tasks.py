@@ -1106,7 +1106,9 @@ def scan_source_rule(sweep_id):
             from extensions import db
             from models import ClassificationSweep
             db.session.execute(sa.update(ClassificationSweep).where(ClassificationSweep.id == sweep_id,
-                ClassificationSweep.state.in_(("pending", "running"))).values(error_category="dispatch_pending"))
+                ClassificationSweep.state.in_(("pending", "running")),
+                sa.or_(ClassificationSweep.error_category.is_(None), ClassificationSweep.error_category == "dispatch_pending"))
+                .values(error_category="dispatch_pending"))
             db.session.commit()
             return
         if current_app.config["CLASSIFICATION_ENABLED"]:
@@ -1137,11 +1139,17 @@ def _publish_source_sweep(sweep_id):
     """Publish only a committed stable cursor outbox; never erase newer work."""
     import sqlalchemy as sa
     from extensions import db
-    from models import ClassificationSweep
+    from models import ClassificationSweep, utc_now
+    from classification_service import SOURCE_SWEEP_RETRY_ERRORS, source_sweep_retry_at
     if not current_app.config["CLASSIFICATION_ENABLED"]:
         return False
     sweep = db.session.get(ClassificationSweep, sweep_id, populate_existing=True)
-    if sweep is None or sweep.state not in {"pending", "running"} or sweep.error_category != "dispatch_pending":
+    if (sweep is None or sweep.state not in {"pending", "running"}
+            or sweep.error_category not in SOURCE_SWEEP_RETRY_ERRORS | {"dispatch_pending"}):
+        db.session.commit()
+        return False
+    retry_at = source_sweep_retry_at(sweep)
+    if retry_at is not None and utc_now() < retry_at:
         db.session.commit()
         return False
     task_id = f"source-rule-{sweep.id}-after-{sweep.cursor_item_id or 0}"
@@ -1149,7 +1157,8 @@ def _publish_source_sweep(sweep_id):
         db.session.commit()
         return False
     generation = dict(state=sweep.state, cursor_item_id=sweep.cursor_item_id,
-        items_scanned=sweep.items_scanned, items_queued=sweep.items_queued, updated_at=sweep.updated_at)
+        items_scanned=sweep.items_scanned, items_queued=sweep.items_queued,
+        updated_at=sweep.updated_at, error_category=sweep.error_category)
     db.session.commit()
     try:
         celery_app.send_task("tasks.scan_source_rule", args=[sweep_id], queue="classification", task_id=task_id)
@@ -1157,8 +1166,7 @@ def _publish_source_sweep(sweep_id):
         db.session.rollback()
         return False
     try:
-        conditions = [ClassificationSweep.id == sweep_id, ClassificationSweep.celery_task_id == task_id,
-            ClassificationSweep.error_category == "dispatch_pending"]
+        conditions = [ClassificationSweep.id == sweep_id, ClassificationSweep.celery_task_id == task_id]
         conditions.extend(getattr(ClassificationSweep, name) == value for name, value in generation.items())
         db.session.execute(sa.update(ClassificationSweep).where(*conditions).values(error_category=None))
         db.session.commit()
@@ -1182,16 +1190,22 @@ def _reconcile_source_sweeps():
     import celeryconfig
     from extensions import db
     from models import ClassificationSweep, utc_now
-    cutoff = utc_now() - timedelta(seconds=celeryconfig.task_time_limit + 300)
+    from classification_service import SOURCE_SWEEP_RETRY_DELAY_SECONDS, SOURCE_SWEEP_RETRY_ERRORS
+    now = utc_now()
+    cutoff = now - timedelta(seconds=celeryconfig.task_time_limit + 300)
+    retry_cutoff = now - timedelta(seconds=SOURCE_SWEEP_RETRY_DELAY_SECONDS)
+    aged_delivery = sa.and_(ClassificationSweep.error_category.is_(None), ClassificationSweep.updated_at < cutoff)
+    retry_ready = sa.and_(ClassificationSweep.error_category.in_(SOURCE_SWEEP_RETRY_ERRORS),
+        ClassificationSweep.updated_at <= retry_cutoff)
     identities = list(db.session.scalars(sa.select(ClassificationSweep.id).where(
         ClassificationSweep.state.in_(("pending", "running")),
-        sa.or_(ClassificationSweep.error_category == "dispatch_pending", ClassificationSweep.updated_at < cutoff))
+        sa.or_(ClassificationSweep.error_category == "dispatch_pending", retry_ready, aged_delivery))
         .order_by(ClassificationSweep.id).limit(50)))
     db.session.commit()
     for identity in identities:
         db.session.execute(sa.update(ClassificationSweep).where(ClassificationSweep.id == identity,
             ClassificationSweep.state.in_(("pending", "running")),
-            sa.or_(ClassificationSweep.error_category == "dispatch_pending", ClassificationSweep.updated_at < cutoff))
+            aged_delivery)
             .values(error_category="dispatch_pending"))
         db.session.commit()
         _publish_source_sweep(identity)

@@ -6,6 +6,7 @@ broker publication, retries, and stale-claim reclamation belong to the worker.
 
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+from datetime import timedelta
 from hashlib import sha256
 import hmac
 import json
@@ -35,6 +36,8 @@ RETRYABLE_CLASSIFICATION_ERRORS = frozenset({"claude_timeout", "claude_unavailab
     "claude_invalid_output", "storage_transient", "dispatch_pending", "worker_timeout"})
 PERMANENT_CLASSIFICATION_ERRORS = frozenset({"claude_auth", "claude_config", "model_mismatch",
     "invalid_canonical", "invalid_policy", "revision_budget_exhausted"})
+SOURCE_SWEEP_RETRY_DELAY_SECONDS = 30
+SOURCE_SWEEP_RETRY_ERRORS = RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}
 _LOCK_NAMESPACE = 0x434C5346
 _BLOCK_SCHEMA = "commercial-block-decisions/v1"
 _ITEM_FIELDS = ("id", "admin_id", "platform", "external_id", "transcript_s3_key",
@@ -147,6 +150,13 @@ def _fail(category="invalid_policy", *, record=True):
 
 def _hash(value):
     return sha256(canonical_json(value).encode()).hexdigest()
+
+
+def source_sweep_retry_at(sweep):
+    """The last committed retryable failure starts a durable fixed delay."""
+    if sweep.error_category in SOURCE_SWEEP_RETRY_ERRORS:
+        return sweep.updated_at + timedelta(seconds=SOURCE_SWEEP_RETRY_DELAY_SECONDS)
+    return None
 
 
 def _values(row, fields):
@@ -606,6 +616,11 @@ class ClassificationService:
         return SweepResult(sweep.id, sweep.state, sweep.cursor_item_id, sweep.items_scanned,
             sweep.items_queued, tuple(revisions), sweep.celery_task_id if sweep.state in {"pending", "running"} else None)
 
+    def _same_sweep_snapshot(self, item, snapshot, status, source_id):
+        return (item.status == status and _values(item, _ITEM_FIELDS) == snapshot
+            and bool(self.session.scalar(sa.select(SourceItem.id).where(
+                SourceItem.item_id == item.id, SourceItem.source_id == source_id))))
+
     def scan_source_rule(self, sweep_id):
         """Process at most fifty source memberships, committing each keyset step.
 
@@ -618,6 +633,9 @@ class ClassificationService:
             with self._transaction():
                 sweep = self._sweep_lock(sweep_id)
                 if sweep.state in {"completed", "failed"}:
+                    return self._sweep_result(sweep)
+                retry_at = source_sweep_retry_at(sweep)
+                if retry_at is not None and utc_now() < retry_at:
                     return self._sweep_result(sweep)
                 source = self.session.get(ContentSource, sweep.source_id)
                 rule = self.session.get(SourceClassificationRule, sweep.rule_id)
@@ -660,6 +678,7 @@ class ClassificationService:
                 with self._transaction():
                     item = self._item_lock(item_id)
                     eligible = item.status == "completed"
+                    status, snapshot = item.status, _values(item, _ITEM_FIELDS)
                     if item.admin_id != owner_id:
                         _fail()
                 request = None
@@ -668,12 +687,35 @@ class ClassificationService:
                     if snapshot["admin_id"] != owner_id or transcript.source_id != source_id:
                         _fail()
                     if match_exact_rules(transcript.segments, (exact_rule,)):
-                        request = self.prepare_revision_request(item_id)
+                        try:
+                            request = self.prepare_revision_request(item_id)
+                        except ClassificationServiceError:
+                            # Input preparation can itself observe a replacement
+                            # during artifact I/O. Rematch that member rather
+                            # than interpreting a stale read as a failed sweep.
+                            with self._transaction():
+                                sweep = self._sweep_lock(sweep_id)
+                                item = self._item_lock(item_id)
+                                if (sweep.state != "running" or sweep.cursor_item_id != cursor
+                                        or not self._same_sweep_snapshot(item, snapshot, status, source_id)):
+                                    return self._sweep_result(sweep, revisions)
+                            raise
                 with self._transaction():
                     sweep = self._sweep_lock(sweep_id)
                     if sweep.state != "running" or sweep.cursor_item_id != cursor:
                         return self._sweep_result(sweep, revisions)
+                    # The match, prepared proof, and insertion must refer to
+                    # the same canonical. Hold this item lock through insertion
+                    # and cursor advancement; a replacement must be rematched
+                    # in a fresh invocation before the membership can advance.
+                    item = self._item_lock(item_id)
+                    if not self._same_sweep_snapshot(item, snapshot, status, source_id):
+                        return self._sweep_result(sweep, revisions)
                     if request is not None:
+                        if (request._source_id != source_id
+                                or request._previous_revision_id != item.active_classification_revision_id
+                                or request._identity != self._input_identity(snapshot, self._metadata(item, source_id))[2]):
+                            return self._sweep_result(sweep, revisions)
                         existing = self.session.scalar(sa.select(ClassificationRevision.id).where(
                             ClassificationRevision.item_id == item_id,
                             ClassificationRevision.input_identity_sha256 == request._identity,
@@ -698,7 +740,12 @@ class ClassificationService:
                 sweep = self._sweep_lock(sweep_id)
                 if sweep.state not in {"completed", "failed"}:
                     sweep.state = "running" if error.retryable else "failed"
-                    sweep.error_category = "dispatch_pending" if error.retryable else error.category
+                    sweep.error_category = error.category
+                    if error.retryable:
+                        # Keep the closed category and failure time until an
+                        # eligible publication succeeds. Neither a premature
+                        # replay nor an unknown send may reset this deadline.
+                        sweep.updated_at = utc_now()
                 return self._sweep_result(sweep, revisions)
 
     @contextmanager
