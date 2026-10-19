@@ -80,6 +80,7 @@ Thumbs.db
 # Project specific
 data/
 logs/
+.worktrees/
 *.log
 podcasts.csv
 *.db
