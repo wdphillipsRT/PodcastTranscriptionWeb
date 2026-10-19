@@ -155,6 +155,24 @@ def test_provenance_requires_bounded_versioned_public_values(sample, field, valu
         replace(sample[2], **{field: value})
 
 
+@pytest.mark.parametrize("field", ["cli_version", "requested_model", "resolved_model"])
+def test_provenance_constructor_rejects_all_unicode_control_characters(sample, field):
+    # Unicode Cc comprises the C0 controls, DEL, and every C1 control.
+    for codepoint in (*range(0x20), *range(0x7F, 0xA0)):
+        with pytest.raises(ValueError):
+            replace(sample[2], **{field: f"model{chr(codepoint)}identity"})
+
+
+@pytest.mark.parametrize("field", ["cli_version", "requested_model", "resolved_model"])
+def test_policy_parser_rejects_all_unicode_control_characters_in_provenance(sample, field):
+    data = policy_for(sample).to_dict()
+    for codepoint in (*range(0x20), *range(0x7F, 0xA0)):
+        data["classifier"][field] = f"model{chr(codepoint)}identity"
+        raw = canonical_json(rehash(data, "policy_sha256"))
+        with pytest.raises(ValueError):
+            SegmentPolicy.from_json(raw, transcript=sample[0])
+
+
 def test_every_identity_input_changes_policy_hash(sample):
     baseline = policy_for(sample).policy_sha256
     for field, value in [("cli_version", "2.2.0"), ("requested_model", "opus"),

@@ -9,6 +9,7 @@ from hashlib import sha256
 import json
 import math
 import re
+import unicodedata
 
 from s3_utils import DEFAULT_MAX_BYTES
 from transcripts import (CanonicalTranscript, TranscriptSegment, MAX_SEGMENTS,
@@ -72,7 +73,7 @@ def _number(value, *, maximum=None):
 
 def _public_text(value):
     if (not isinstance(value, str) or not 0 < len(value) <= 128 or value != value.strip()
-            or any(ord(c) < 32 or ord(c) == 127 for c in value)
+            or any(unicodedata.category(c) == "Cc" for c in value)
             or re.search(r"(?:s3://|https?://[^\s<>]*amazonaws\.com|[?&]x-amz-|[?&](?:signature|token|credential)=)", value, re.I)):
         _invalid()
 
