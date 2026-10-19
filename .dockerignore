@@ -1,70 +1,58 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Environment
+# Credentials, environment settings and local operational material.
 .env
-.env.local
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Git
-.git/
-.gitignore
-
-# Documentation
-README.md
-*.md
-claudedocs/
-
-# Test files
-tests/
+.env.*
+**/.env
+**/.env.*
+.aws
+**/.aws
+*credentials*
+**/*credentials*
+*secrets*
+**/*secrets*
+*.pem
+*.key
+*.p12
+*.pfx
+.git
+.git/**
+.worktrees
+.superpowers
+.claude
+.codex
+.planning
+.github
+.idea
+.vscode
+.venv
+venv
+env
+**/__pycache__
+__pycache__
+*.py[cod]
+**/*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage*
+htmlcov
+tests
 test_*.py
 *_test.py
-
-# Data and logs
+data
+logs
+downloads
+tmp
 *.log
-*.sqlite
+*.sqlite*
 *.db
-data/
-logs/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Docker
-Dockerfile
-.dockerignore
-docker-compose.yml
-
-# CI/CD
-.github/
-.gitlab-ci.yml
-.travis.yml
+*.mp3
+*.mp4
+*.m4a
+*.wav
+*.webm
+node_modules
+build
+dist
+*.egg-info
+*.md
+# Migrations, templates, static assets and startup scripts remain included.

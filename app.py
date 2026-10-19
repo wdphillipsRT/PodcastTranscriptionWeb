@@ -28,6 +28,7 @@ def create_app(config_override: Mapping | None = None) -> Flask:
     limiter.init_app(app)
 
     from admin_cli import admin_cli
+    from system_checks import ReadinessCache, system_cli
     from web.auth import auth
     from web.routes import workspace
 
@@ -40,6 +41,8 @@ def create_app(config_override: Mapping | None = None) -> Flask:
     csrf.init_app(app)
 
     app.cli.add_command(admin_cli)
+    app.cli.add_command(system_cli)
+    readiness = ReadinessCache()
     app.register_blueprint(auth)
     app.register_blueprint(workspace)
 
@@ -69,5 +72,10 @@ def create_app(config_override: Mapping | None = None) -> Flask:
     @app.get("/healthz")
     def healthz():
         return {"status": "ok"}
+
+    @app.get("/readyz")
+    def readyz():
+        results = readiness.get(app.config)
+        return results, 200 if all(value == "ok" for value in results.values()) else 503
 
     return app

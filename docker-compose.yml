@@ -1,97 +1,84 @@
-version: '3.8'
+# The user-managed Cloudflare Tunnel connects to the host's loopback port.
+x-app: &app
+  build: .
+  image: podcast-transcription:local
+  env_file: [.env]
+  init: true
+  restart: unless-stopped
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
 
 services:
-  # PostgreSQL database
-  db:
-    image: postgres:15-alpine
-    restart: always
+  postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     environment:
-      POSTGRES_DB: podcast_transcription
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-podcasts}
+      POSTGRES_USER: ${POSTGRES_USER:-podcasts}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
-  # Redis for Celery
   redis:
-    image: redis:7-alpine
-    restart: always
-    ports:
-      - "6379:6379"
+    image: redis:7.4.5-alpine
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [CMD, redis-cli, ping]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # Flask web application
-  web:
-    build: .
-    restart: always
-    ports:
-      - "8005:8005"
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/podcast_transcription
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY:-dev-key-change-in-production}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION:-us-west-2}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
-      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-meta-llama/llama-3.1-70b-instruct:free}
-      - TRANSCRIBE_MODEL=${TRANSCRIBE_MODEL:-basic}
-      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
-      - STRIPE_PUBLISHABLE_KEY=${STRIPE_PUBLISHABLE_KEY}
-      - STRIPE_PRICE_ID=${STRIPE_PRICE_ID}
-      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+  migrate:
+    <<: *app
+    restart: "no"
+    entrypoint: []
+    command: [flask, --app, "app:create_app", db, upgrade]
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./data:/app/data
-    command: >
-      sh -c "flask db upgrade &&
-             gunicorn --bind 0.0.0.0:8005 --workers 2 --timeout 120 app:app"
 
-  # Celery worker for background tasks
-  celery:
-    build: .
-    restart: always
-    command: celery -A tasks worker --loglevel=info
+  web:
+    <<: *app
+    entrypoint: [/app/scripts/start-web.sh]
+    command: [gunicorn, --bind, "0.0.0.0:8005", --workers, "2", --timeout, "120", "app:create_app()"]
+    ports: ["127.0.0.1:8005:8005"]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/healthz', timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 75s
+
+  worker:
+    <<: *app
+    entrypoint: [/app/scripts/start-worker.sh]
+    command: [celery, -A, tasks.celery_app, worker, --loglevel=info, --queues, "default,discovery,downloads,transcription", --concurrency, "2"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=768m,uid=1000,gid=1000,mode=1770
+
+  beat:
+    <<: *app
+    entrypoint: [/app/scripts/start-worker.sh]
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/podcast_transcription
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY:-dev-key-change-in-production}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION:-us-west-2}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
-      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-meta-llama/llama-3.1-70b-instruct:free}
-      - TRANSCRIBE_MODEL=${TRANSCRIBE_MODEL:-basic}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./data:/app/data
+      SYSTEM_CHECK_SERVICES: database,redis,beat
+    command: [celery, -A, tasks.celery_app, beat, --loglevel=info, --schedule, /tmp/celerybeat-schedule, --pidfile, /tmp/celerybeat.pid]
 
 volumes:
   postgres_data:
