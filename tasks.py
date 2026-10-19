@@ -1,5 +1,7 @@
 """ID-only task boundary; application/provider clients are created lazily."""
 from contextlib import contextmanager
+import logging
+from time import monotonic
 from types import SimpleNamespace
 
 from celery import Celery
@@ -7,6 +9,51 @@ from flask import current_app, has_app_context
 
 celery_app = Celery("podcast_transcription")
 celery_app.config_from_object("celeryconfig")
+
+
+def _observe_classification(event, identity, started, *, result=None, retry_category=None,
+                            rule_match_counts=None):
+    """Closed event encoder: never accept a payload, exception or artifact.
+
+    Identity is an integer-only item/source/revision snapshot. Policy version
+    and event names are code-owned. Counts come from committed service results;
+    logging adds no storage reads, database work, or task failure boundary.
+    """
+    from commercial_policy import POLICY_VERSION
+    from classification_service import (FinalizationResult, RETRYABLE_CLASSIFICATION_ERRORS,
+                                        PERMANENT_CLASSIFICATION_ERRORS)
+    if event not in {"prepare", "block", "finalize", "failed", "source_rule"}:
+        return
+    if len(identity) != 3 or any(type(value) is not int or value <= 0 for value in identity):
+        return
+    payload = dict(zip(("item_id", "source_id", "revision_id"), identity))
+    payload.update(policy_version=POLICY_VERSION, stage_duration_ms=max(0, round((monotonic() - started) * 1000)))
+    if retry_category in RETRYABLE_CLASSIFICATION_ERRORS | PERMANENT_CLASSIFICATION_ERRORS:
+        payload["retry_category"] = retry_category
+    valid_totals = (type(result) is FinalizationResult and all(
+        type(getattr(result, name)) is int and getattr(result, name) >= 0
+        for name in ("included_segments", "excluded_segments", "uncertain_segments",
+            "included_milliseconds", "excluded_milliseconds", "uncertain_milliseconds"))
+        and type(result.review_required) is bool)
+    if valid_totals and event == "finalize" and result.state == "completed":
+        payload["label_counts"] = dict(editorial=result.included_segments,
+            excluded=result.excluded_segments, uncertain=result.uncertain_segments)
+        durations = dict(included=result.included_milliseconds, excluded=result.excluded_milliseconds,
+            uncertain=result.uncertain_milliseconds)
+        total = sum(durations.values())
+        payload["duration_ratios"] = {key: value / total if total else 0 for key, value in durations.items()}
+        payload["review_required"] = result.review_required
+    if rule_match_counts is not None:
+        # Reconstruct only the known count fields, never forward caller extras.
+        counts = {key: rule_match_counts.get(key) for key in ("scanned", "matched")}
+        if all(type(value) is int and value >= 0 for value in counts.values()):
+            payload["rule_match_counts"] = counts
+    try:
+        logging.getLogger(__name__).info("commercial_classification_" + event,
+            extra={"commercial_event": payload})
+    except Exception:
+        # An unavailable log sink cannot change a durable checkpoint or retry.
+        pass
 
 
 @contextmanager
@@ -899,7 +946,9 @@ def _classification_step(service, revision_id, phase, ordinal=None, *, handoff_s
         db.session.commit()
         return None, None, None
     item_id = revision.item_id
+    observation_identity = (item_id, revision.source_id, revision.id)
     db.session.commit()
+    started = monotonic()
     try:
         if phase == "block":
             result = service.run_block(revision_id, ordinal)
@@ -910,7 +959,10 @@ def _classification_step(service, revision_id, phase, ordinal=None, *, handoff_s
         if not error.record:
             # A live/stale claim or ambiguous commit is repaired by reconciliation.
             return None, None, None
-        return _classification_failed(revision_id, phase, ordinal, error.category)
+        outcome = _classification_failed(revision_id, phase, ordinal, error.category)
+        _observe_classification("failed", observation_identity, started, retry_category=outcome[2])
+        return outcome
+    _observe_classification(phase, observation_identity, started, result=result)
     if result.next_dispatch is not None:
         return _prepare_classification_publication(result.next_dispatch), None, None
     if result.state == "superseded" and handoff_superseded:
@@ -1113,12 +1165,22 @@ def scan_source_rule(sweep_id):
             return
         if current_app.config["CLASSIFICATION_ENABLED"]:
             from extensions import db
-            from models import ClassificationRevision
+            from models import ClassificationRevision, ClassificationSweep, SourceClassificationRule, SegmentOverride
             from sqlalchemy.exc import SQLAlchemyError
             try:
+                identity = db.session.query(SegmentOverride.item_id, ClassificationSweep.source_id,
+                    SegmentOverride.policy_revision_id).select_from(ClassificationSweep).join(
+                    SourceClassificationRule, SourceClassificationRule.id == ClassificationSweep.rule_id).join(
+                    SegmentOverride, SegmentOverride.id == SourceClassificationRule.originating_override_id).filter(
+                    ClassificationSweep.id == sweep_id).one_or_none()
+                db.session.commit()
+                started = monotonic()
                 result = get_classification_service().scan_source_rule(sweep_id)
                 if result is None:
                     return
+                if identity is not None:
+                    _observe_classification("source_rule", identity, started,
+                        rule_match_counts=dict(scanned=result.items_scanned, matched=result.items_queued))
                 for revision_id in result.revision_ids:
                     revision = db.session.get(ClassificationRevision, revision_id)
                     dispatch = _revision_dispatch(revision)

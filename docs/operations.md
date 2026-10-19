@@ -111,6 +111,87 @@ revision gating. No promotional artifact is stored in the revision, and the
 stored learning projection is not read for this research path. Neither path
 loads the full text artifact as a fallback.
 
+## Commercial acceptance, evaluation, and observations
+
+Run the offline commercial gate before promoting a classification policy:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_commercial_classification_smoke.py tests/eval/test_commercial_policy_eval.py
+.venv/bin/python -m pytest -q
+.venv/bin/python -m compileall -q .
+git diff --check
+```
+
+No live Claude, authentication, AWS, RSS, YouTube, Redis, or broker is needed.
+The smoke test injects only external storage/classifier/broker/provider boundaries
+and exercises real final-stage hooks, SQLite outboxes, worker checkpoints, artifact
+validation, owner review routes, correction sweeps, and filtered loaders. It covers
+both podcast and YouTube completed canonical items without reacquiring media.
+The crash case kills the task after block 1 commits and before publication, then
+reconciles/replays a multi-block revision without another paid call for block 1.
+
+All ten section-13 invariants are checked at their implemented boundaries:
+canonical bytes/IDs/times/hashes remain unchanged; coverage is exact; citations
+require editorial IDs; general payloads omit all excluded/uncertain content;
+promotional research has a separate type rejected by the citation gateway;
+rules stay source-scoped; corrections retain prior artifacts and revision lineage;
+retries select one shared active revision; failures never return a full transcript;
+and backlog classification never invokes media/providers. Summaries, teachings,
+claims, evidence indexes, embeddings, immutable bundles, and actual Lamad,
+Ebenezer, and Agent Factory publishers are deferred to Phases 2/3. Their eventual
+release gates must extend these assertions through actual extraction and delivery.
+The authorized owner review page intentionally reads canonical segments with a
+validated policy; it is an audit interface, not a general-learning consumer.
+
+`tests/fixtures/commercial-eval.json` is wholly synthetic, with independent truth
+labels and supplied classifier outputs for every label, adjacent/repeated ads,
+editorial introductions/teaching calls to action/closing summaries, and exact
+confidence thresholds and ambiguous boundaries. The deterministic harness builds
+real policies and projections; it measures policy behavior, not live-model accuracy.
+Metrics are nested by numeric source ID and label. Precision is correct predicted
+segments / predicted segments; recall is correct predicted segments / truth
+segments. False-exclusion rate is truth-editorial segments withheld (including
+uncertain) / truth-editorial segments. Uncertain-duration rate is uncertain segment
+milliseconds / all segment milliseconds (gaps are excluded). A boundary is an
+adjacent-segment label transition; accuracy uses matching boundaries / the union
+of truth and predicted boundaries, also computed per label for its incident edges.
+The source report retains truth/predicted boundary counts for inspection.
+Reports contain only integer numerators/denominators and label/source identifiers;
+divide counts to obtain rates and treat a zero denominator as undefined.
+The release fixture allows zero editorial false exclusions. A policy-version
+change fails until `expected_metrics.policy_version` and reviewed expected metrics
+are updated together. Mutation tests check imperfect metrics and prevent changing
+expected counts from accepting an editorial false exclusion.
+
+Any later opt-in, administrator-reviewed real evaluation corpus must live only
+under the Git-ignored `.runtime/eval/` directory with restricted local access.
+Never commit its transcripts, annotations, classifier outputs, prompts, or
+per-example results; never print or log them, including on test failure. Export
+only aggregate counts by label/source ID. Keep real evaluation opt-in and separate
+from the synthetic default suite; do not substitute private data into Git fixtures.
+
+Task observations use the `tasks` logger at INFO with fixed event messages
+`commercial_classification_prepare`, `_block`, `_finalize`, `_failed`, and
+`_source_rule`. Configure a structured log handler to serialize only the
+`commercial_event` extra field and the fixed event name. That field allows only
+`item_id`, `source_id`, `revision_id`, `policy_version`, `stage_duration_ms`,
+`label_counts`, `duration_ratios`, `review_required`, `retry_category`, and
+`rule_match_counts`. The encoder takes integer item/source/revision identities,
+uses the running code's policy version, and omits unknown retry categories and
+unexpected count fields. Finalization counts use `editorial`, aggregated `excluded`
+(the four noneditorial/nonuncertain labels), and `uncertain`; duration ratios use
+`included`, `excluded`, and `uncertain`. Source-rule counts are cumulative `scanned`
+and `matched` (items queued by that sweep); its revision ID identifies the
+originating reviewed policy. Stage duration uses a monotonic clock. Events can
+repeat on replay and are observations, not a billing ledger or activation signal.
+Use durable revision/block state for costs and completion. Log-sink failure cannot
+fail an otherwise committed checkpoint.
+
+Never add transcript bodies, segment IDs, prompts, model output, source URLs,
+private artifact keys, hashes, credentials, provider diagnostics, exception text,
+or tracebacks to these events. The acceptance tests inspect log records and
+structured fields against the allowlist and synthetic leak sentinels.
+
 ## Credentials and environment
 
 Protect the checkout, Docker access, backups, and `.env` as administrator data.
