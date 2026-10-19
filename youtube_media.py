@@ -298,7 +298,7 @@ class YouTubeMediaClient:
                 _fail("invalid_inventory")
             if type(data.get("age_limit", 0)) not in {int, float}:
                 _fail("invalid_inventory")
-            if (data.get("availability") not in {None, "public", "unlisted"}
+            if (data.get("availability") != "public"
                     or data.get("live_status") not in {None, "not_live", "was_live"}
                     or data.get("age_limit", 0) != 0):
                 _fail("unavailable")
@@ -308,6 +308,10 @@ class YouTubeMediaClient:
                 if not isinstance(languages, dict):
                     _fail("invalid_inventory")
                 for language, formats in sorted(languages.items()):
+                    # Completed public streams may expose chat replay here.
+                    # It is a reserved pseudo-track, not a caption language.
+                    if language == "live_chat":
+                        continue
                     if not _LANGUAGE.fullmatch(language) or not isinstance(formats, list):
                         _fail("invalid_inventory")
                     for format_ in formats:

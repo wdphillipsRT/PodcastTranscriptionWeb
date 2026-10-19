@@ -436,3 +436,35 @@ def test_oversized_error_body_stops_reading_and_falls_back_to_http_status(status
         client.resolve_video(f"https://youtu.be/{VIDEO}")
     assert caught.value.category == category
     result.close.assert_called_once()
+
+
+@pytest.mark.parametrize("privacy,category", [("unlisted", "unlisted"), (None, "invalid_response"),
+                                            ("unknown", "invalid_response"), ("", "invalid_response")])
+@pytest.mark.parametrize("operation", ["resolve_video", "resolve_source", "discover_page"])
+def test_discovery_requires_explicit_public_video_privacy(privacy, category, operation):
+    payload = fixture("public_video")
+    payload["items"][0]["status"]["privacyStatus"] = privacy
+    client, _ = client_with(response(payload))
+    with pytest.raises(YouTubeDiscoveryError) as caught:
+        if operation == "discover_page":
+            source = SourceDescriptor("youtube_video", VIDEO, f"https://youtube.com/watch?v={VIDEO}", "Public video")
+            client.discover_page(source)
+        else:
+            getattr(client, operation)(f"https://youtu.be/{VIDEO}")
+    assert caught.value.category == category and not caught.value.retryable
+
+
+def test_discovery_missing_video_privacy_fails_closed():
+    payload = fixture("public_video")
+    del payload["items"][0]["status"]["privacyStatus"]
+    client, _ = client_with(response(payload))
+    with pytest.raises(YouTubeDiscoveryError, match="^invalid_response$"):
+        client.resolve_video(f"https://youtu.be/{VIDEO}")
+
+
+def test_public_completed_livestream_remains_discoverable():
+    payload = fixture("public_video")
+    payload["items"][0]["liveStreamingDetails"] = {
+        "actualStartTime": "2026-10-18T11:00:00Z", "actualEndTime": "2026-10-18T12:00:00Z"}
+    client, _ = client_with(response(payload))
+    assert client.resolve_video(f"https://youtu.be/{VIDEO}").external_id == VIDEO

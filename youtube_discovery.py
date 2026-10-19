@@ -282,7 +282,9 @@ class YouTubeDiscoveryClient:
         privacy = _text(status.get("privacyStatus"), required=True)
         if privacy == "private":
             _fail("private")
-        if privacy not in {"public", "unlisted"}:
+        if privacy == "unlisted":
+            _fail("unlisted")
+        if privacy != "public":
             _fail("invalid_response")
         upload = _text(status.get("uploadStatus", "processed"), required=True)
         if upload == "deleted":

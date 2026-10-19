@@ -449,3 +449,51 @@ def test_runtime_cache_does_not_pollute_download_output(settings, process, tmp_p
     media = YouTubeMediaClient(settings).extract_audio(URL, tmp_path)
     assert media.path.read_bytes() == b"synthetic mp3"
     assert list(media.path.parent.iterdir()) == [media.path]
+
+
+@pytest.mark.parametrize("availability", ["unlisted", "private", "needs_auth", "premium_only", "subscriber_only", "unknown", "", None])
+def test_inventory_requires_explicit_public_availability(settings, process, availability):
+    process[0]["payload"]["availability"] = availability
+    with pytest.raises(YouTubeMediaError, match="^unavailable$") as caught:
+        YouTubeMediaClient(settings).inventory(URL)
+    assert caught.value.category == "unavailable" and not caught.value.retryable
+
+
+def test_inventory_missing_availability_fails_closed(settings, process):
+    del process[0]["payload"]["availability"]
+    with pytest.raises(YouTubeMediaError, match="^unavailable$"):
+        YouTubeMediaClient(settings).inventory(URL)
+
+
+@pytest.mark.parametrize("live_status", ["not_live", "was_live"])
+def test_explicit_public_completed_video_is_eligible(settings, process, live_status):
+    process[0]["payload"].update(availability="public", live_status=live_status)
+    assert YouTubeMediaClient(settings).inventory(URL).video_id == VIDEO
+
+
+@pytest.mark.parametrize("field,kind", [("subtitles", "creator"), ("automatic_captions", "automatic")])
+@pytest.mark.parametrize("with_vtt", [False, True])
+def test_reserved_live_chat_is_ignored_without_losing_vtt(settings, process, field, kind, with_vtt):
+    process[0]["payload"]["live_status"] = "was_live"
+    # yt-dlp exposes completed recordings' chat replay as a pseudo-subtitle.
+    process[0]["payload"][field] = {"live_chat": [{"ext": "json", "protocol": "youtube_live_chat_replay"}]}
+    if with_vtt:
+        process[0]["payload"][field].update(tracks("en"))
+    inventory = YouTubeMediaClient(settings).inventory(URL)
+    expected = CaptionCandidate(kind, "en") if with_vtt else None
+    assert select_caption(inventory) == expected
+    assert inventory.candidates == ((expected,) if with_vtt else ())
+
+
+@pytest.mark.parametrize("language", ["LIVE_CHAT", "live_chat_extra", "live_chat/../en", "--exec"])
+def test_live_chat_exception_is_exact_and_does_not_hide_other_invalid_keys(settings, process, language):
+    process[0]["payload"]["subtitles"] = {"live_chat": [{"ext": "json"}], language: [{"ext": "vtt"}]}
+    with pytest.raises(YouTubeMediaError, match="^invalid_inventory$"):
+        YouTubeMediaClient(settings).inventory(URL)
+
+
+@pytest.mark.parametrize("track", ["malformed", [{"ext": "--exec"}], [None]])
+def test_live_chat_exception_does_not_hide_malformed_real_tracks(settings, process, track):
+    process[0]["payload"]["subtitles"] = {"live_chat": [{"ext": "json"}], "en": track}
+    with pytest.raises(YouTubeMediaError, match="^invalid_inventory$"):
+        YouTubeMediaClient(settings).inventory(URL)
