@@ -269,6 +269,86 @@ Amazon Transcribe jobs have deterministic names, so the pipeline checks and
 reuses the existing job. Monitor the item after replay; escalating repeated
 failures requires examining its safe error category and dependencies.
 
+## Controlled live verification
+
+Run the deterministic acceptance proof before using provider credentials:
+
+```bash
+.venv/bin/python -m pytest tests/test_phase1_smoke.py -q
+.venv/bin/python -m pytest -q
+```
+
+The smoke proof uses the real administrator CLI, CSRF-protected login and API,
+RSS and YouTube adapters, durable discovery/backfill tasks, caption normalization,
+private storage wrapper, Amazon job logic, and authenticated transcript views.
+Only HTTP, downloader execution, AWS SDK transport, and queue delivery are stubbed.
+It proves 60 canonical items, 91 source memberships, three backfill selectors,
+121 processing stages attempted once, origin/hash/citation lineage, and artifact
+reuse after scheduled discovery and task replay. It blocks socket access.
+
+Live tests require both explicit selection of `tests/live/test_youtube_live.py`
+and `RUN_LIVE_YOUTUBE=1`. An ordinary full-suite run skips them even if the opt-in
+environment remains set. Each test skips clearly when its settings are missing.
+Export credentials privately through your normal environment management; pytest
+does not load `.env`. Never put credential values in command arguments or enable
+verbose HTTP/debug logs. Use this bounded invocation without captured output or
+local-variable tracebacks:
+
+```bash
+RUN_LIVE_YOUTUBE=1 .venv/bin/python -m pytest tests/live/test_youtube_live.py -q -rs --tb=short --show-capture=no
+```
+
+Set `YOUTUBE_API_KEY` and `AWS_REGION` to the configured bucket region. Select a
+public, completed video at most 300 seconds long in `LIVE_YOUTUBE_VIDEO_URL` and
+set `LIVE_YOUTUBE_EXPECTED_ORIGIN` to `creator_caption` or `automatic_caption`.
+The check downloads the highest usable preferred-language captions, normalizes
+them, and verifies timestamp citations. Run once for each caption origin using
+deliberately chosen videos. No artifact is uploaded by this check.
+
+Set `LIVE_YOUTUBE_CHANNEL_URL` and `LIVE_YOUTUBE_PLAYLIST_URL` to small public
+sources with at most ten discovery pages; prefer 26–50 videos so historical
+progress is observable. The checks use disposable SQLite state, import the
+newest 25 (or all available when fewer), compare identities against a second
+scan, request a 26-item count backfill, and replay it without duplicate rows.
+They never dispatch to your running worker. Discovery and backfill consume quota;
+avoid large channels and playlists. Set `LIVE_RSS_FEED_URL` to a small public
+feed to resolve and discover at most 25 episodes without downloading audio.
+
+Amazon fallback is a separate deliberate action: set
+`RUN_LIVE_AWS_TRANSCRIBE=1`, valid AWS SDK credentials, and
+`LIVE_YOUTUBE_FALLBACK_URL` to a caption-free public video at most 300 seconds
+long. The check refuses videos with preferred-language captions, uploads private
+audio to `podcast-transcriptions-web-2025`, runs Amazon Transcribe, reads its
+private result, normalizes it, and checks deterministic job replay. This incurs
+provider charges and leaves private audio, result, transcript, and segment
+artifacts plus a Transcribe job for administrator review. It does not delete
+provider evidence automatically. Record only status, origin, hashes, row counts,
+and job success privately; never copy transcript bodies, keys, signed URLs, or
+credentials into tickets, terminal output, or shared logs.
+
+After live checks, verify the actual six-service stack with the health/readiness
+commands above. Add the selected video, RSS, channel, and playlist through the
+authenticated UI, confirm origin labels and backfill progress, and replay
+discovery. Inspect UI and local logs privately for any credential, private key,
+URL, or transcript-body leak. Live adapter checks alone do not prove a running
+worker, full readiness, browser behavior, or S3/Transcribe write permissions for
+every deployed container. Without credentials, report those requirements as
+unverified; passing the offline proof does not establish live provider success.
+
+For a disposable Docker acceptance run, first inspect `docker compose ls`,
+`docker ps`, and volumes read-only. Choose a fresh random project name and a
+0600 temporary env file outside the checkout. Supply a temporary Compose override
+that replaces each app service's `env_file` with that path and uses a unique
+image tag; `--env-file` alone does not replace the service-level `.env` reference.
+Use the same explicit project name, files, and env file for every command.
+Use no existing application volume or administrator. Verify migration
+`0001_media_foundation`, provision a temporary sole admin, record all eight table
+counts, perform ordinary project `down`/`up` without volume deletion, then compare
+counts. Only web may publish loopback port 8005; if occupied, document an isolated
+loopback port override. Full readiness requires real configured providers. Clean
+up only resources carrying that exact disposable project label and its temporary
+files. Never remove volumes from the deployed application to run this gate.
+
 ## Reviewed upgrades
 
 Record the current Git revision and take a database backup before upgrading.

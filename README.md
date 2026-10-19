@@ -28,3 +28,11 @@ Python 3.11 virtual environment, then run:
 ```
 
 The default tests use synthetic credentials and make no live provider calls.
+The integrated acceptance proof is `tests/test_phase1_smoke.py`: it exercises
+admin login, RSS and YouTube intake, newest-25 discovery, all backfill selectors,
+caption priority, private transcript retrieval, and idempotent replay.
+
+Controlled provider checks require explicit file selection and
+`RUN_LIVE_YOUTUBE=1`; they skip until each check's required settings are supplied.
+See [controlled live verification](docs/operations.md#controlled-live-verification)
+for the bounded inputs, additional AWS opt-in, costs, and remaining manual gates.
