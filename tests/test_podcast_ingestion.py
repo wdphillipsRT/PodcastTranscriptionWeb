@@ -341,12 +341,22 @@ def test_cursor_reads_same_snapshot_and_invalid_cursor_is_rejected(source, setti
             discover_podcast_items(source, settings, Session(), cursor=cursor)
 
 
-def test_redirect_loop_is_bounded_and_closes_every_response(settings):
-    redirects = [Response(status=302, headers={"Location": "/loop"}) for _ in range(6)]
+def test_six_redirects_reach_the_final_response_and_close_every_response(settings):
+    redirects = [Response(status=302, headers={"Location": "/hop"}) for _ in range(6)]
+    final, feed = Response(), Response(FEED)
+    session = Session(*redirects, final, feed)
+    resolved = resolve_podcast_source(URL, settings, session)
+    assert resolved.canonical_url == URL
+    assert len(session.calls) == 8
+    assert all(response.closed for response in (*redirects, final, feed))
+
+
+def test_redirect_loop_beyond_six_is_bounded_and_closes_every_response(settings):
+    redirects = [Response(status=302, headers={"Location": "/loop"}) for _ in range(7)]
     session = Session(*redirects)
     with pytest.raises(IngestionError, match="redirect_failed"):
         resolve_podcast_source(URL, settings, session)
-    assert len(session.calls) == 6 and all(response.closed for response in redirects)
+    assert len(session.calls) == 7 and all(response.closed for response in redirects)
 
 
 def test_apple_spoof_is_not_sent_to_lookup(settings):

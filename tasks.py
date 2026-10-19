@@ -746,7 +746,8 @@ def _processing_failure(error):
             return "unavailable", False, True
     if isinstance(error, IngestionError):
         # Podcast adapter errors are stable categories; allow only known values.
-        if error.args and error.args[0] in {"http_failed", "incomplete_response", "media_write_failed"}:
+        if error.args and error.args[0] in {
+                "http_failed", "incomplete_response", "media_write_failed", "redirect_failed"}:
             return "http_transient", True, False
         if error.args and error.args[0] in {"source_unavailable", "item_not_found", "unsafe_destination"}:
             return "unavailable", False, True

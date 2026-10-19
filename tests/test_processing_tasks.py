@@ -724,6 +724,12 @@ def test_http_status_failure_categories_are_safe(status, category, retryable, un
     assert tasks._processing_failure(error) == (category, retryable, unavailable)
 
 
+def test_redirect_exhaustion_is_retryable_http_failure():
+    from ingestion_types import IngestionError
+    assert tasks._processing_failure(IngestionError("redirect_failed")) == (
+        "http_transient", True, False)
+
+
 def test_repaired_provider_tuple_cannot_reuse_stale_canonical_lineage(pipeline):
     row = pipeline.item(youtube=True)
     tasks.process_item.run(row.id)

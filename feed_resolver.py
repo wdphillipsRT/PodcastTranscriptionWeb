@@ -22,7 +22,7 @@ from source_classifier import classify_source_url
 
 
 CHUNK_SIZE = 64 * 1024
-MAX_REDIRECTS = 5
+MAX_REDIRECTS = 6
 APPLE_HOSTS = {"podcasts.apple.com", "itunes.apple.com"}
 APPLE_ID_RE = re.compile(r"(?:^|/)id(\d+)(?:/|$)")
 
