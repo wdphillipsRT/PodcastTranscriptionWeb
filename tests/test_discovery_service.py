@@ -147,6 +147,24 @@ def test_fast_worker_changes_survive_dispatch_return(store):
     assert (job.state, job.attempts, job.error_category) == ("running", 1, None)
 
 
+@pytest.mark.parametrize("replacement", ["retrying", "new_task_id"])
+def test_fast_worker_retry_outbox_marker_survives_discovery_send_return(store, replacement):
+    source = store()
+    def dispatch(name, ident, **kwargs):
+        if name == "process_item":
+            job = ProcessingJob.query.filter_by(item_id=ident).one()
+            job.attempts += 1
+            job.state = "retrying" if replacement == "retrying" else "pending"
+            job.error_category = "dispatch_pending"
+            if replacement == "new_task_id":
+                job.celery_task_id = "replacement-task-generation"
+            db.session.commit()
+    service(Adapter([DiscoveryPage((descriptor(1),))]), dispatch).discover_source(source.id)
+    job = ProcessingJob.query.one()
+    assert job.error_category == "dispatch_pending"
+    assert job.attempts == 1
+
+
 def test_disabled_skips_and_check_all_failures_are_independent(store):
     disabled, bad, good = store(identity="disabled"), store(identity="bad"), store(identity="good")
     disabled.enabled = False

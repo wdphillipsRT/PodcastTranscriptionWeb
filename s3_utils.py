@@ -1,6 +1,7 @@
 """Private, region-pinned artifact storage. Public URLs are not capabilities."""
 
 from collections.abc import Mapping
+from contextlib import closing
 from pathlib import Path
 import re
 
@@ -26,6 +27,10 @@ class StorageTransientError(StorageError):
 
 class StoragePermanentError(StorageError):
     """Invalid configuration, input, or denied operation."""
+
+
+class StorageIntegrityError(StoragePermanentError):
+    """Missing or corrupt artifact; a pipeline may repair its own references."""
 
 
 def setting(settings, name):
@@ -186,7 +191,7 @@ class S3Manager:
         except Exception as error:
             _failure(error)
 
-    def get_bytes(self, s3_key, *, max_bytes=DEFAULT_MAX_BYTES):
+    def _object_chunks(self, s3_key, *, max_bytes):
         validate_artifact_key(s3_key)
         if type(max_bytes) is not int or max_bytes <= 0:
             raise StoragePermanentError("invalid artifact byte limit")
@@ -197,23 +202,26 @@ class S3Manager:
             self._check_response(response)
             length = response.get("ContentLength")
             if type(length) is not int or not 0 <= length <= max_bytes:
-                raise StoragePermanentError("invalid artifact content length")
-            chunks, total = [], 0
+                raise StorageIntegrityError("invalid artifact content length")
+            total = 0
             while True:
                 chunk = body.read(min(65536, max_bytes - total + 1))
                 if not isinstance(chunk, bytes):
-                    raise StoragePermanentError("invalid artifact body")
+                    raise StorageIntegrityError("invalid artifact body")
                 if not chunk:
                     break
                 total += len(chunk)
                 if total > max_bytes or total > length:
-                    raise StoragePermanentError("artifact exceeds declared byte limit")
-                chunks.append(chunk)
+                    raise StorageIntegrityError("artifact exceeds declared byte limit")
+                yield chunk
             if total != length:
-                raise StoragePermanentError("artifact content length mismatch")
-            return b"".join(chunks)
+                raise StorageIntegrityError("artifact content length mismatch")
         except StorageError:
             raise
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+                raise StorageIntegrityError("artifact unavailable") from None
+            _failure(error)
         except Exception as error:
             _failure(error)
         finally:
@@ -222,6 +230,25 @@ class S3Manager:
                     body.close()
                 except Exception:
                     pass
+
+    def get_bytes(self, s3_key, *, max_bytes=DEFAULT_MAX_BYTES):
+        with closing(self._object_chunks(s3_key, max_bytes=max_bytes)) as chunks:
+            return b"".join(chunks)
+
+    def verify_sha256(self, s3_key, *, expected_sha256=None, max_bytes=DEFAULT_MAX_BYTES):
+        """Hash bounded object chunks without retaining an audio-sized buffer."""
+        from hashlib import sha256
+        if expected_sha256 is not None and (not isinstance(expected_sha256, str)
+                or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None):
+            raise StoragePermanentError("invalid artifact hash")
+        digest = sha256()
+        with closing(self._object_chunks(s3_key, max_bytes=max_bytes)) as chunks:
+            for chunk in chunks:
+                digest.update(chunk)
+        result = digest.hexdigest()
+        if expected_sha256 is not None and result != expected_sha256:
+            raise StorageIntegrityError("artifact hash mismatch")
+        return result
 
     def download_text_content(self, s3_key, *, max_bytes=DEFAULT_MAX_BYTES):
         try:

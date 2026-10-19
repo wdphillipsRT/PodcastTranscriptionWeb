@@ -237,6 +237,7 @@ class _ProcessingPipeline:
         if job.state == "completed":
             job.state, job.completed_at = "pending", None
         if job.state == "failed":
+            self.session.rollback()
             return None
         item.processing_stage = stage
         job.celery_task_id = job.celery_task_id or f"process-item-{item.id}-{stage}"
@@ -252,6 +253,8 @@ class _ProcessingPipeline:
         if sha256(segments).hexdigest() != item.segments_sha256:
             return False
         payload = json.loads(segments)
+        if not isinstance(payload, dict):
+            return False
         schema, digest = payload.pop("schema"), payload.pop("transcript_sha256")
         payload["segments"] = tuple(TranscriptSegment(**segment) for segment in payload["segments"])
         canonical = CanonicalTranscript(**payload)
@@ -264,35 +267,133 @@ class _ProcessingPipeline:
             and self.storage.get_bytes(item.transcript_s3_key, max_bytes=self.settings.YOUTUBE_CAPTION_MAX_BYTES)
                 == canonical.to_text().encode())
 
+    def _canonical_reusable(self, item):
+        from s3_utils import StorageError, StorageIntegrityError
+        if not _completed_valid(item):
+            return False
+        try:
+            return self._verify_completed(item)
+        except StorageIntegrityError:
+            return False
+        except StorageError:
+            raise
+        except (ValueError, TypeError, KeyError):
+            return False
+
+    @staticmethod
+    def _caption_expected(item):
+        if item.platform != "youtube":
+            return False
+        caption_lineage = (item.transcript_origin in {"creator_caption", "automatic_caption"}
+            or item.transcription_provider == "yt-dlp" or item.processing_stage in {"youtube_captions", "normalize"}
+            or bool(item.provider_transcript_s3_key and item.provider_transcript_s3_key.endswith(".vtt")))
+        audio_fallback_proven = (item.transcript_origin == "amazon_transcribe"
+            or item.processing_stage in {"youtube_audio", "transcribe"}
+            or item.last_successful_stage in {"youtube_audio", "transcribe"})
+        return caption_lineage or not audio_fallback_proven
+
+    def _caption_reusable(self, item):
+        from hashlib import sha256
+        from s3_utils import StorageIntegrityError
+        if not _caption_valid(item):
+            return False
+        try:
+            content = self.storage.get_bytes(item.provider_transcript_s3_key, max_bytes=self.settings.YOUTUBE_CAPTION_MAX_BYTES)
+            return sha256(content).hexdigest() == item.provider_transcript_sha256
+        except StorageIntegrityError:
+            return False
+
+    def _audio_reusable(self, item):
+        from hashlib import sha256
+        from s3_utils import StorageIntegrityError
+        if not _audio_valid(item) or item.media_sha256 == sha256(b"").hexdigest():
+            return False
+        try:
+            self.storage.verify_sha256(item.media_s3_key, expected_sha256=item.media_sha256,
+                max_bytes=self.settings.MAX_AUDIO_BYTES)
+            return True
+        except StorageIntegrityError:
+            return False
+
+    def _amazon_provider_reusable(self, item):
+        from hashlib import sha256
+        import json
+        from s3_utils import StorageError, StorageIntegrityError
+        from transcribe import deterministic_job_name
+        from transcripts import canonical_json
+        name = deterministic_job_name(item.id, item.media_sha256)
+        if not (_digest(item.provider_transcript_sha256) and item.transcription_job_name == name
+                and _artifact(item, item.provider_transcript_s3_key, "provider")
+                and item.provider_transcript_s3_key.rsplit("/", 1)[-1] == name + ".json"):
+            return False
+        try:
+            raw = json.loads(self.storage.get_bytes(item.provider_transcript_s3_key,
+                max_bytes=self.settings.YOUTUBE_CAPTION_MAX_BYTES))
+            return (isinstance(raw, dict) and raw.get("jobName") == name
+                and sha256(canonical_json(raw).encode()).hexdigest() == item.provider_transcript_sha256)
+        except StorageIntegrityError:
+            return False
+        except StorageError:
+            raise
+        except (ValueError, TypeError):
+            return False
+
+    def _plan(self, item):
+        """Validate upstream objects before deciding which durable stage repairs them."""
+        if self._caption_expected(item):
+            if self._caption_reusable(item):
+                if self._canonical_reusable(item):
+                    return None
+                self._clear_canonical(item)
+                return "normalize"
+            # A valid audio object does not authorize bypassing creator or
+            # automatic captions whose provider artifact needs repair.
+            self._clear_canonical(item)
+            item.provider_transcript_s3_key = item.provider_transcript_sha256 = None
+            return "youtube_captions"
+        if self._audio_reusable(item):
+            if self._amazon_provider_reusable(item) and self._canonical_reusable(item):
+                return None
+            self._clear_canonical(item)
+            return "transcribe"
+        if item.media_s3_key or item.media_sha256:
+            item.media_s3_key = item.media_sha256 = None
+            self._clear_canonical(item)
+        if item.platform == "youtube":
+            return "youtube_audio" if (item.processing_stage in {"youtube_audio", "transcribe"}
+                or item.transcript_origin == "amazon_transcribe") else "youtube_captions"
+        return "podcast_audio"
+
+    def _verification_stage(self, item):
+        if self._caption_expected(item):
+            return "normalize" if _caption_valid(item) else "youtube_captions"
+        if _audio_valid(item):
+            return "transcribe"
+        if item.platform == "youtube":
+            return "youtube_audio" if item.processing_stage == "youtube_audio" else "youtube_captions"
+        return "podcast_audio"
+
     def run(self, item_id, requested_stage=None):
         from models import ContentItem, ProcessingJob, utc_now
-        from s3_utils import StoragePermanentError, StorageTransientError
         item = self.session.get(ContentItem, item_id)
         if item is None:
             return None
         verification_error = None
-        if _completed_valid(item):
-            try:
-                if self._verify_completed(item):
-                    item.status, item.error_category = "completed", None
-                    self.session.commit()
-                    return None
-            except StorageTransientError as error:
-                verification_error = error
-            except (StoragePermanentError, ValueError, TypeError, KeyError):
-                # An incoherent completed tuple is repaired from the existing
-                # provider/audio artifact, without deleting unknown S3 data.
-                pass
-        if item.status in {"failed", "unavailable", "deferred"}:
+        try:
+            stage = self._plan(item)
+        except Exception as error:
+            # Verification itself is a stage operation: transient reads retry
+            # without clearing references or silently lowering caption priority.
+            verification_error = error
+            stage = self._verification_stage(item)
+        if stage is None:
+            item.status, item.error_category = "completed", None
+            self.session.commit()
             return None
-        if _caption_valid(item):
-            stage = "normalize"
-        elif _audio_valid(item):
-            stage = "transcribe"
-        elif item.platform == "youtube":
-            stage = "youtube_audio" if item.processing_stage == "youtube_audio" else "youtube_captions"
-        else:
-            stage = "podcast_audio"
+        if item.status in {"failed", "unavailable", "deferred"}:
+            self.session.rollback()
+            return None
+        item.status = "transcribing" if stage in {"transcribe", "normalize"} else "acquiring"
         initial_stage = "podcast_audio" if item.platform == "podcast" else "youtube_captions"
         execution_stage = requested_stage or initial_stage
         if execution_stage != stage and not (execution_stage == "youtube_captions" and stage == "youtube_audio"):
@@ -302,6 +403,7 @@ class _ProcessingPipeline:
             return self._queue(item, stage)
         job = self._job(item_id, stage)
         if job.state == "failed":
+            self.session.rollback()
             return None
         job.celery_task_id = job.celery_task_id or f"process-item-{item_id}-{stage}"
         # The exclusive lifetime lock proves no previous claim is still live,
@@ -331,6 +433,15 @@ class _ProcessingPipeline:
             self.session.rollback()
             category, retryable, unavailable = _processing_failure(error)
             item, job = self.session.get(ContentItem, item_id), self.session.get(ProcessingJob, job.id)
+            from s3_utils import StorageIntegrityError
+            if stage == "normalize" and isinstance(error, StorageIntegrityError):
+                # The verified VTT can disappear/change before its second read.
+                # Persist a repair handoff, retaining caption priority.
+                self._clear_canonical(item)
+                item.provider_transcript_s3_key = item.provider_transcript_sha256 = None
+                item.status, item.error_category = "acquiring", "artifact_repair"
+                job.state, job.error_category = "retrying", "artifact_repair"
+                return self._queue(item, "youtube_captions")
             item.error_category = category
             if retryable and job.attempts <= 5:
                 job.state, job.error_category = "retrying", "dispatch_pending"
@@ -428,7 +539,12 @@ class _ProcessingPipeline:
                     raise
             except TranscriptValidationError:
                 pass
-        return "youtube_audio"
+        # The current inventory proved captions unusable. Only this durable
+        # decision permits a reusable audio object to advance to Amazon.
+        self._clear_canonical(item)
+        item.provider_transcript_s3_key = item.provider_transcript_sha256 = None
+        item.transcript_origin = item.transcription_provider = item.transcription_job_name = item.language = None
+        return "transcribe" if self._audio_reusable(item) else "youtube_audio"
 
     def _youtube_audio(self, item, source):
         from tempfile import TemporaryDirectory
@@ -439,10 +555,11 @@ class _ProcessingPipeline:
 
     def _normalize(self, item, source):
         from hashlib import sha256
+        from s3_utils import StorageIntegrityError
         from transcripts import normalize_vtt
         content = self.storage.get_bytes(item.provider_transcript_s3_key, max_bytes=self.settings.YOUTUBE_CAPTION_MAX_BYTES)
         if sha256(content).hexdigest() != item.provider_transcript_sha256:
-            raise ValueError("invalid provider hash")
+            raise StorageIntegrityError("artifact hash mismatch")
         transcript = normalize_vtt(content, platform=item.platform, external_id=item.external_id,
             item_id=item.id, source_id=source.id, language=item.language, origin=item.transcript_origin,
             provider_version=self.settings.YTDLP_EXPECTED_VERSION)
@@ -479,6 +596,8 @@ class _ProcessingPipeline:
         # private tuple and canonical identity before treating it as completed.
         segments = self.storage.get_bytes(result["segments_key"], max_bytes=self.settings.YOUTUBE_CAPTION_MAX_BYTES)
         payload = json.loads(segments)
+        if not isinstance(payload, dict):
+            raise ValueError("invalid transcription canonical object")
         schema, digest = payload.pop("schema"), payload.pop("transcript_sha256")
         payload["segments"] = tuple(TranscriptSegment(**segment) for segment in payload["segments"])
         transcript = CanonicalTranscript(**payload)
@@ -557,7 +676,7 @@ def _publish_processing(message):
         # Unknown broker outcome: the committed outbox can be replayed by
         # discovery's process_item dispatcher. No worker updates are undone.
         return
-    db.session.query(ProcessingJob).filter_by(id=job_id, state="pending", error_category="dispatch_pending").update(
+    db.session.query(ProcessingJob).filter_by(id=job_id, state="pending", celery_task_id=task_id, error_category="dispatch_pending").update(
         {"error_category": None}, synchronize_session="fetch")
     db.session.commit()
 

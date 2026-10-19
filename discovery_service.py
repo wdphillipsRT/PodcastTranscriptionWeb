@@ -305,10 +305,12 @@ class DiscoveryService:
             if job is None or job.error_category != "dispatch_pending":
                 self.session.commit()
                 continue
-            item_id, task_id = job.item_id, job.celery_task_id
+            item_id, task_id, attempts = job.item_id, job.celery_task_id, job.attempts
+            observed_state = job.state
             self.session.commit()
-            if self._send("process_item", item_id, task_id=task_id):
-                self.session.query(ProcessingJob).filter_by(id=identity, error_category="dispatch_pending").update(
+            if self._send("process_item", item_id, task_id=task_id) and observed_state == "pending":
+                self.session.query(ProcessingJob).filter_by(id=identity, state="pending", attempts=attempts,
+                    celery_task_id=task_id, error_category="dispatch_pending").update(
                     {"error_category": None}, synchronize_session="fetch")
                 self.session.commit()
 

@@ -1,6 +1,7 @@
 """The artifact boundary never exposes URLs or follows bucket redirects."""
 
 from io import BytesIO
+from hashlib import sha256
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -189,3 +190,92 @@ def test_retry_hook_close_errors_do_not_escape_redaction():
     assert "SECRET" not in str(caught.value)
     body.close.assert_called_once()
     raw.close.assert_called_once()
+
+
+def test_streaming_object_hash_uses_bounded_chunks_without_buffering_audio():
+    storage, client = manager()
+    function = getattr(storage, "verify_sha256", None)
+    assert callable(function), "bounded object SHA-256 verifier missing"
+    size = 180_000
+    class Stream:
+        remaining = size
+        closed = False
+        def read(self, count):
+            assert type(count) is int and 0 < count <= 65536
+            produced = min(count, self.remaining)
+            self.remaining -= produced
+            return b"a" * produced
+        def close(self):
+            self.closed = True
+    body = Stream()
+    client.get_object.return_value = {"Body": body, "ContentLength": size}
+    digest = sha256(b"a" * size).hexdigest()
+    assert function(KEY, expected_sha256=digest, max_bytes=size) == digest
+    assert body.closed and body.remaining == 0
+    client.get_object.assert_called_once_with(Bucket=BUCKET, Key=KEY)
+
+
+@pytest.mark.parametrize("declared,actual,maximum", [(6, b"abcdef", 5), (4, b"abcde", 5),
+    (5, b"abc", 5), (None, b"abc", 5), (-1, b"", 5), (True, b"x", 5)])
+def test_object_hash_rejects_length_corruption_and_closes(declared, actual, maximum):
+    storage, client = manager()
+    function = getattr(storage, "verify_sha256", None)
+    assert callable(function), "bounded object SHA-256 verifier missing"
+    body = BytesIO(actual)
+    client.get_object.return_value = {"Body": body, "ContentLength": declared}
+    with pytest.raises(s3_utils.StoragePermanentError):
+        function(KEY, max_bytes=maximum)
+    assert body.closed
+
+
+def test_object_hash_mismatch_is_repairable_and_redacted():
+    storage, client = manager()
+    function = getattr(storage, "verify_sha256", None)
+    assert callable(function), "bounded object SHA-256 verifier missing"
+    body = BytesIO(b"wrong audio")
+    client.get_object.return_value = {"Body": body, "ContentLength": 11}
+    with pytest.raises(s3_utils.StorageIntegrityError) as caught:
+        function(KEY, expected_sha256="f" * 64, max_bytes=100)
+    assert body.closed and KEY not in str(caught.value) and "wrong audio" not in str(caught.value)
+
+
+def test_object_hash_reuses_region_checks_and_closes_rejected_body():
+    storage, client = manager()
+    function = getattr(storage, "verify_sha256", None)
+    assert callable(function), "bounded object SHA-256 verifier missing"
+    body = BytesIO(b"audio")
+    client.get_object.return_value = {"Body": body, "ContentLength": 5,
+        "ResponseMetadata": {"HTTPStatusCode": 200, "HTTPHeaders": {"x-amz-bucket-region": "us-west-2"}}}
+    with pytest.raises(s3_utils.StoragePermanentError, match="redirect"):
+        function(KEY, max_bytes=10)
+    assert body.closed
+
+
+@pytest.mark.parametrize("operation", ["get_bytes", "verify_sha256"])
+def test_missing_objects_are_distinct_from_denied_objects(operation):
+    storage, client = manager()
+    function = getattr(storage, operation, None)
+    assert callable(function), "bounded object SHA-256 verifier missing"
+    for code in ("NoSuchKey", "404", "NotFound"):
+        client.get_object.side_effect = ClientError({"Error": {"Code": code, "Message": "SECRET"}}, "GetObject")
+        with pytest.raises(s3_utils.StorageIntegrityError) as caught:
+            function(KEY, max_bytes=10)
+        assert "SECRET" not in str(caught.value)
+    client.get_object.side_effect = ClientError({"Error": {"Code": "AccessDenied", "Message": "SECRET"}}, "GetObject")
+    with pytest.raises(s3_utils.StoragePermanentError) as caught:
+        function(KEY, max_bytes=10)
+    assert not isinstance(caught.value, s3_utils.StorageIntegrityError)
+
+
+def test_object_hash_stream_failure_closes_and_preserves_transient_category():
+    from botocore.exceptions import ResponseStreamingError
+    storage, client = manager()
+    function = getattr(storage, "verify_sha256", None)
+    assert callable(function), "bounded object SHA-256 verifier missing"
+    body = Mock()
+    body.read.side_effect = ResponseStreamingError(error="SECRET")
+    client.get_object.return_value = {"Body": body, "ContentLength": 10}
+    with pytest.raises(s3_utils.StorageTransientError) as caught:
+        function(KEY, max_bytes=10)
+    assert "SECRET" not in str(caught.value)
+    body.close.assert_called_once()

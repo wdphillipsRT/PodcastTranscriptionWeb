@@ -13,7 +13,7 @@ import pytest
 from extensions import db
 from ingestion_types import DownloadedMedia, IngestionError, TransientMediaLocator
 from models import Admin, ContentItem, ContentSource, ProcessingJob, SourceItem, utc_now
-from s3_utils import S3Manager, StorageTransientError
+from s3_utils import S3Manager, StorageTransientError, StorageIntegrityError
 from transcripts import normalize_amazon_transcribe
 from youtube_media import CaptionCandidate, CaptionInventory, YouTubeMediaError
 import tasks
@@ -44,8 +44,16 @@ class MemoryStorage:
         return self.upload_binary_content(content.encode(), key, content_type)
 
     def get_bytes(self, key, *, max_bytes):
+        if key not in self.objects:
+            raise StorageIntegrityError("artifact unavailable")
         result = self.objects[key]
         assert len(result) <= max_bytes
+        return result
+
+    def verify_sha256(self, key, *, expected_sha256=None, max_bytes):
+        result = sha256(self.get_bytes(key, max_bytes=max_bytes)).hexdigest()
+        if expected_sha256 is not None and result != expected_sha256:
+            raise StorageIntegrityError("artifact hash mismatch")
         return result
 
 
@@ -624,3 +632,228 @@ def test_replayed_acquisition_dispatches_existing_audio_to_transcription_queue(p
         for name, _, options in pipeline.sent)
     drain(pipeline)
     assert row.status == "completed"
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "incomplete"])
+@pytest.mark.parametrize("canonical_complete", [True, False])
+def test_creator_provider_repair_keeps_caption_priority_over_reusable_audio(pipeline, damage, canonical_complete):
+    row = pipeline.item(youtube=True)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    old_key = row.provider_transcript_s3_key
+    row.media_sha256 = sha256(AUDIO).hexdigest()
+    row.media_s3_key = f"items/youtube/{VIDEO}/audio/{row.media_sha256}.mp3"
+    pipeline.storage.objects[row.media_s3_key] = AUDIO
+    if damage == "missing":
+        del pipeline.storage.objects[old_key]
+    elif damage == "corrupt":
+        pipeline.storage.objects[old_key] = b"corrupt VTT bytes"
+    else:
+        row.provider_transcript_sha256 = None
+    if not canonical_complete:
+        row.transcript_s3_key = None
+    db.session.commit()
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert row.status == "completed" and row.transcript_origin == "creator_caption"
+    assert pipeline.media.inventory.call_count == pipeline.media.download_caption.call_count == 2
+    assert pipeline.storage.objects[row.provider_transcript_s3_key] == VTT
+    pipeline.media.extract_audio.assert_not_called()
+    pipeline.amazon.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [None, 4, "scalar", []])
+def test_scalar_canonical_payload_repairs_from_provider_without_acquisition(pipeline, value):
+    row = pipeline.item(youtube=True)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    payload = json.dumps(value).encode()
+    pipeline.storage.objects[row.segments_s3_key] = payload
+    row.segments_sha256 = sha256(payload).hexdigest()
+    db.session.commit()
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert row.status == "completed"
+    assert isinstance(json.loads(pipeline.storage.objects[row.segments_s3_key]), dict)
+    pipeline.media.inventory.assert_called_once()
+    pipeline.media.download_caption.assert_called_once()
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+@pytest.mark.parametrize("completed", [True, False])
+def test_audio_reuse_checks_s3_bytes_and_repairs_missing_or_mismatched_object(pipeline, damage, completed):
+    row = pipeline.item()
+    tasks.process_item.run(row.id)
+    if completed:
+        drain(pipeline)
+    old_key = row.media_s3_key
+    if damage == "missing":
+        del pipeline.storage.objects[old_key]
+    else:
+        pipeline.storage.objects[old_key] = b"corrupt audio content"
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert row.status == "completed"
+    assert pipeline.download.call_count == 2
+    assert pipeline.storage.objects[row.media_s3_key] == AUDIO
+    assert pipeline.amazon.call_count == (2 if completed else 1)
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_completed_amazon_provider_output_must_exist_and_match_source_hash(pipeline, damage):
+    row = pipeline.item()
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    provider_key = row.provider_transcript_s3_key
+    if damage == "missing":
+        del pipeline.storage.objects[provider_key]
+    else:
+        pipeline.storage.objects[provider_key] = b'{"jobName":"wrong","results":{}}'
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert row.status == "completed" and pipeline.amazon.call_count == 2
+    pipeline.download.assert_called_once()
+    assert json.loads(pipeline.storage.objects[row.provider_transcript_s3_key])["jobName"] == row.transcription_job_name
+
+
+def test_irreparable_deterministic_amazon_output_is_safe_terminal_failure(pipeline):
+    from transcribe import TranscriptionPermanentError
+    row = pipeline.item()
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    del pipeline.storage.objects[row.provider_transcript_s3_key]
+    pipeline.amazon.side_effect = TranscriptionPermanentError("invalid transcription artifact")
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert row.status == "failed" and row.error_category == "invalid_input"
+    assert pipeline.amazon.call_count == 2
+    pipeline.download.assert_called_once()
+
+
+def test_valid_creator_provider_with_invalid_canonical_and_audio_reuses_provider(pipeline):
+    row = pipeline.item(youtube=True)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    row.media_sha256 = sha256(AUDIO).hexdigest()
+    row.media_s3_key = f"items/youtube/{VIDEO}/audio/{row.media_sha256}.mp3"
+    pipeline.storage.objects[row.media_s3_key] = AUDIO
+    row.segments_sha256 = "f" * 64
+    db.session.commit()
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert row.status == "completed" and row.transcript_origin == "creator_caption"
+    pipeline.media.inventory.assert_called_once()
+    pipeline.media.download_caption.assert_called_once()
+    pipeline.amazon.assert_not_called()
+
+
+def test_caption_provider_lost_between_verification_and_normalization_returns_to_acquisition(pipeline):
+    row = pipeline.item(youtube=True)
+    tasks.process_item.run(row.id)
+    original = pipeline.storage.get_bytes
+    count = 0
+    def lost(key, **kwargs):
+        nonlocal count
+        if key == row.provider_transcript_s3_key:
+            count += 1
+            if count == 2:
+                raise StorageIntegrityError("artifact unavailable")
+        return original(key, **kwargs)
+    pipeline.storage.get_bytes = lost
+    drain(pipeline)
+    assert row.status == "completed" and row.transcript_origin == "creator_caption"
+    assert pipeline.media.inventory.call_count == 2
+    pipeline.amazon.assert_not_called()
+
+
+def test_repair_decision_clears_completed_status_before_publishing_acquisition(pipeline):
+    row = pipeline.item(youtube=True)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    del pipeline.storage.objects[row.provider_transcript_s3_key]
+    tasks.normalize_item_transcript.run(row.id)
+    assert row.status == "acquiring"
+    assert row.provider_transcript_s3_key is None and row.transcript_s3_key is None
+    assert pipeline.sent[0][0] == "acquire_youtube_transcript"
+    drain(pipeline)
+    assert row.status == "completed"
+
+
+def test_invalid_caption_provider_with_no_current_captions_reuses_audio_after_inventory(pipeline):
+    row = pipeline.item(youtube=True)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    del pipeline.storage.objects[row.provider_transcript_s3_key]
+    row.media_sha256 = sha256(AUDIO).hexdigest()
+    row.media_s3_key = f"items/youtube/{VIDEO}/audio/{row.media_sha256}.mp3"
+    pipeline.storage.objects[row.media_s3_key] = AUDIO
+    db.session.commit()
+    pipeline.media.inventory.return_value = CaptionInventory(VIDEO, ())
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert row.status == "completed" and row.transcript_origin == "amazon_transcribe"
+    assert pipeline.media.inventory.call_count == 2
+    pipeline.media.extract_audio.assert_not_called()
+    pipeline.amazon.assert_called_once()
+
+
+def test_caption_provider_verification_transient_retries_without_reacquisition(pipeline, monkeypatch):
+    row = pipeline.item(youtube=True)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    key = row.provider_transcript_s3_key
+    original = pipeline.storage.get_bytes
+    def temporary(artifact, **kwargs):
+        if artifact == key:
+            raise StorageTransientError("SECRET")
+        return original(artifact, **kwargs)
+    pipeline.storage.get_bytes = temporary
+    monkeypatch.setattr(tasks.normalize_item_transcript, "retry", Mock(side_effect=Retry("safe")))
+    with pytest.raises(Retry):
+        tasks.normalize_item_transcript.run(row.id)
+    assert row.error_category == "storage_transient" and row.provider_transcript_s3_key == key
+    pipeline.media.inventory.assert_called_once()
+    pipeline.amazon.assert_not_called()
+
+
+def test_preexisting_audio_without_caption_inventory_does_not_bypass_creator(pipeline):
+    row = pipeline.item(youtube=True)
+    row.media_sha256 = sha256(AUDIO).hexdigest()
+    row.media_s3_key = f"items/youtube/{VIDEO}/audio/{row.media_sha256}.mp3"
+    pipeline.storage.objects[row.media_s3_key] = AUDIO
+    db.session.commit()
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert row.status == "completed" and row.transcript_origin == "creator_caption"
+    pipeline.media.inventory.assert_called_once()
+    pipeline.media.extract_audio.assert_not_called()
+    pipeline.amazon.assert_not_called()
+
+
+def test_amazon_provider_hash_uses_canonical_json_semantics_on_reuse(pipeline):
+    row = pipeline.item()
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    key = row.provider_transcript_s3_key
+    raw = json.loads(pipeline.storage.objects[key])
+    pipeline.storage.objects[key] = json.dumps(raw, indent=4, sort_keys=True).encode()
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    assert row.status == "completed"
+    pipeline.download.assert_called_once()
+    pipeline.amazon.assert_called_once()
+
+
+def test_terminal_item_does_not_clear_references_without_durable_repair_decision(pipeline):
+    row = pipeline.item(youtube=True)
+    tasks.process_item.run(row.id)
+    drain(pipeline)
+    provider, canonical = row.provider_transcript_s3_key, row.transcript_s3_key
+    del pipeline.storage.objects[provider]
+    row.status = "deferred"
+    db.session.commit()
+    tasks.process_item.run(row.id)
+    assert row.status == "deferred"
+    assert row.provider_transcript_s3_key == provider and row.transcript_s3_key == canonical
+    assert not db.session.dirty
+    pipeline.media.inventory.assert_called_once()
