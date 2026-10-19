@@ -46,6 +46,7 @@ def classification_view(latest=None, active=None):
     """Closed aggregate DTO: no artifact identities or free-form diagnostics."""
     return dict(state=CLASSIFICATION_STATES.get(latest.state, "Not classified") if latest else "Not classified",
         policy_version=POLICY_VERSION if latest and latest.policy_version == POLICY_VERSION else "Not available",
+        available=bool(active),
         review_required=bool(active and active.review_required),
         failure=CLASSIFICATION_FAILURES.get(latest.error_category, "Classification unavailable") if latest and latest.error_category else None,
         **{name: getattr(active, name) if active else 0 for name in CLASSIFICATION_TOTALS})

@@ -11,7 +11,7 @@
 </dl>
 <section aria-labelledby="classification-heading"><h2 id="classification-heading">Classification</h2>
 {{ classification_summary(item.classification) }}
-<p><a href="{{ url_for('workspace.classification_item', item_id=item.id) }}">Review classification</a></p></section>
+{% if item.classification.available %}<p><a href="{{ url_for('workspace.classification_item', item_id=item.id) }}">{{ 'Review' if item.classification.review_required else 'View' }} classification</a></p>{% endif %}</section>
 {% if transcript is defined %}<section aria-labelledby="transcript-heading"><h2 id="transcript-heading">Transcript</h2><pre>{{ transcript }}</pre></section>
 {% elif item.transcript_available %}<p><a href="{{ url_for('workspace.transcript', item_id=item.id) }}">Read transcript</a></p>{% endif %}
 {% if citations %}<section aria-labelledby="citations-heading"><h2 id="citations-heading">Source timestamps</h2>

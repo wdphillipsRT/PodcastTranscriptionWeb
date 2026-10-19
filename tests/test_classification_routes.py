@@ -67,6 +67,49 @@ def test_review_is_authenticated_escaped_and_private(review, app):
     assert "First editorial insight" not in api and review.item.transcript_sha256 not in api
 
 
+def test_items_without_active_policy_do_not_offer_empty_review_page(review):
+    failed = m.ContentItem(admin_id=review.owner.id, platform="podcast", item_type="podcast_episode",
+        external_id="failed-media", canonical_url="https://example.com/failed", title="Failed", status="failed")
+    db.session.add(failed)
+    db.session.flush()
+    db.session.add(m.SourceItem(item_id=failed.id, source_id=review.source.id))
+    pending, _ = add_item(review, external_id="pending-classification")
+    review.service.ensure_revision(pending.id, "backfill")
+    db.session.commit()
+
+    source_page = BeautifulSoup(review.client.get(f"/sources/{review.source.id}/items").text, "html.parser")
+    for item in (failed, pending):
+        item_link = source_page.find("a", href=f"/items/{item.id}")
+        assert item_link is not None
+        row = item_link.find_parent("tr")
+        assert row.find("a", href=f"/items/{item.id}/classification") is None
+        detail = BeautifulSoup(review.client.get(f"/items/{item.id}").text, "html.parser")
+        assert detail.find("a", href=f"/items/{item.id}/classification") is None
+
+
+def test_active_policy_link_distinguishes_review_from_view(review):
+    page = BeautifulSoup(review.client.get(f"/items/{review.item.id}").text, "html.parser")
+    link = page.find("a", href=f"/items/{review.item.id}/classification")
+    assert link.string == "Review classification"
+    source_page = BeautifulSoup(review.client.get(f"/sources/{review.source.id}/items").text, "html.parser")
+    link = source_page.find("a", href=f"/items/{review.item.id}/classification")
+    assert link.string == "Review classification"
+
+    values = correction(review)
+    values["label"] = "editorial"
+    outcome = review.service.record_override(item_id=review.item.id, admin_id=review.owner.id, **values)
+    prepared = review.service.prepare_revision(outcome.revision_id)
+    for ordinal in prepared.block_ordinals:
+        review.service.run_block(outcome.revision_id, ordinal)
+    review.service.finalize_revision(outcome.revision_id)
+    page = BeautifulSoup(review.client.get(f"/items/{review.item.id}").text, "html.parser")
+    link = page.find("a", href=f"/items/{review.item.id}/classification")
+    assert link.string == "View classification"
+    source_page = BeautifulSoup(review.client.get(f"/sources/{review.source.id}/items").text, "html.parser")
+    link = source_page.find("a", href=f"/items/{review.item.id}/classification")
+    assert link.string == "View classification"
+
+
 def test_review_scopes_gets_and_mutations(review, monkeypatch):
     from web import routes
     monkeypatch.setattr(routes, "current_user", SimpleNamespace(id=999))
