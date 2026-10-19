@@ -282,9 +282,12 @@ The smoke proof uses the real administrator CLI, CSRF-protected login and API,
 RSS and YouTube adapters, durable discovery/backfill tasks, caption normalization,
 private storage wrapper, Amazon job logic, and authenticated transcript views.
 Only HTTP, downloader execution, AWS SDK transport, and queue delivery are stubbed.
-It proves 60 canonical items, 91 source memberships, three backfill selectors,
-121 processing stages attempted once, origin/hash/citation lineage, and artifact
-reuse after scheduled discovery and task replay. It blocks socket access.
+It proves 55 canonical items, 84 source memberships, three backfill selectors,
+111 processing stages attempted once, origin/hash/citation lineage, and artifact
+reuse after scheduled discovery and task replay. Scheduled discovery preserves
+the initial observed-history baseline: older items omitted by newest-25 require
+an explicit backfill. Count backfills accept new source memberships, excluding
+already imported and unavailable items. The proof blocks socket access.
 
 Live tests require both explicit selection of `tests/live/test_youtube_live.py`
 and `RUN_LIVE_YOUTUBE=1`. An ordinary full-suite run skips them even if the opt-in

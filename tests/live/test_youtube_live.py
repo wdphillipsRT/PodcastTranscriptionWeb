@@ -5,7 +5,7 @@ require RUN_LIVE_AWS_TRANSCRIBE=1 and a deliberately selected fallback URL.
 No credentials, private objects, transcript bodies or URLs are printed.
 """
 
-from collections import deque
+from collections import Counter, deque
 import logging
 import os
 from pathlib import Path
@@ -100,7 +100,7 @@ def test_live_newest25_and_historical_backfill(live_settings, setting, kind, mon
     url = required(setting)
     from discovery_service import DiscoveryService
     from extensions import db
-    from models import Admin, BackfillRequest, ContentItem, ContentSource, DiscoveryRun, SourceItem
+    from models import Admin, BackfillRequest, ContentItem, ContentSource, DiscoveryRun, ProcessingJob, SourceItem
     from youtube_discovery import YouTubeDiscoveryClient
     # Discovery writes only to a disposable SQLite database; no media is queued
     # to a real broker and no provider artifacts are written by this check.
@@ -135,9 +135,13 @@ def test_live_newest25_and_historical_backfill(live_settings, setting, kind, mon
                     provider_metadata=dict(descriptor.provider_metadata), initial_item_limit=25)
                 db.session.add(source)
                 db.session.commit()
-                pending = deque()
-                service = DiscoveryService(db.session, live_settings, lambda _: adapter,
-                    lambda name, identity, **kwargs: pending.append((name, identity)))
+                pending, dispatched = deque(), []
+
+                def dispatch(name, identity, **kwargs):
+                    pending.append((name, identity))
+                    dispatched.append((name, identity))
+
+                service = DiscoveryService(db.session, live_settings, lambda _: adapter, dispatch)
                 run_id = service.discover_source(source.id)
 
                 def drain():
@@ -153,12 +157,14 @@ def test_live_newest25_and_historical_backfill(live_settings, setting, kind, mon
                 drain()
                 run = db.session.get(DiscoveryRun, run_id)
                 assert bool(run.state == "completed"), "Live initial discovery failed"
-                assert bool(ContentItem.query.count() == min(25, run.items_scanned)), "Newest-25 count failed"
-                # A second bounded provider scan independently checks ordering.
+                # items_scanned includes unavailable observations. A second
+                # bounded scan supplies the usable/public catalog independently.
                 adapter.pages = 0
                 page, cursor, discovered = 0, None, {}
                 while True:
                     result = adapter.discover_page(descriptor, cursor)
+                    for unavailable in result.unavailable_ids:
+                        discovered.pop(unavailable, None)
                     discovered.update({item.external_id: item for item in result.items})
                     page += 1
                     if result.exhausted:
@@ -166,19 +172,59 @@ def test_live_newest25_and_historical_backfill(live_settings, setting, kind, mon
                     if page >= 10:
                         pytest.fail("Choose a source with at most 10 discovery pages", pytrace=False)
                     cursor = result.next_cursor
-                expected = {item.external_id for item in sorted(discovered.values(),
-                    key=lambda item: (item.published_at, item.external_id), reverse=True)[:25]}
-                assert bool({item.external_id for item in ContentItem.query.all()} == expected), "Newest-25 identities failed"
+                available = sorted(discovered.values(),
+                    key=lambda item: (item.published_at, item.external_id), reverse=True)
+                expected = {item.external_id for item in available[:25]}
+
+                def memberships():
+                    return {item.external_id for item in ContentItem.query.join(SourceItem).filter(
+                        SourceItem.source_id == source.id)}
+
+                def canonical_items():
+                    return {item.external_id for item in ContentItem.query.all()}
+
+                def jobs():
+                    return [(job.id, job.item_id, job.stage, job.state, job.attempts, job.error_category)
+                            for job in ProcessingJob.query.order_by(ProcessingJob.id)]
+
+                assert bool(ContentItem.query.count() == min(25, len(available))), "Newest-25 usable count failed"
+                assert bool(memberships() == canonical_items() == expected), "Newest-25 identities failed"
+                before_memberships, before_items = memberships(), canonical_items()
+                before_jobs = {job.id for job in ProcessingJob.query.all()}
+                dispatch_offset = len(dispatched)
+                # Count requests accept this many NEW memberships, not this many
+                # total catalog entries, and never count unavailable identities.
+                historical = [item for item in available if item.external_id not in before_memberships]
+                expected_new = {item.external_id for item in historical[:26]}
                 adapter.pages = 0
                 identity = service.create_backfill(source.id, selector_type="count", requested_count=26)
                 drain()
                 backfill = db.session.get(BackfillRequest, identity)
                 assert bool(backfill.state == "completed"), "Live backfill failed"
-                assert bool(backfill.items_accepted == min(26, len(discovered))), "Historical progress failed"
-                before = ContentItem.query.count(), SourceItem.query.count()
+                assert bool(memberships() == before_memberships | expected_new), "Historical identities failed"
+                assert bool(backfill.items_accepted == len(expected_new)), "Historical progress failed"
+                expected_new_items = expected_new - before_items
+                assert bool(canonical_items() - before_items == expected_new_items), "Historical canonical identities failed"
+                assert bool(backfill.items_queued == len(expected_new_items)), "Historical queue progress failed"
+                new_jobs = ProcessingJob.query.filter(ProcessingJob.id.notin_(before_jobs)).all()
+                assert bool(len(new_jobs) == len(expected_new_items)), "Historical processing job count failed"
+                assert bool({db.session.get(ContentItem, job.item_id).external_id for job in new_jobs}
+                            == expected_new_items), "Historical processing identities failed"
+                assert all(job.stage == "youtube_captions" and job.state == "pending" and job.attempts == 0
+                           for job in new_jobs), "Historical processing stages failed"
+                queued = Counter(db.session.get(ContentItem, item_id).external_id
+                    for name, item_id in dispatched[dispatch_offset:] if name == "process_item")
+                assert bool(queued == Counter({key: 1 for key in expected_new_items})), "Historical dispatch identities failed"
+
+                def replay_state():
+                    return (memberships(), canonical_items(), jobs(), backfill.items_scanned,
+                            backfill.items_accepted, backfill.items_queued, backfill.state,
+                            backfill.cursor, len(dispatched), adapter.pages)
+
+                before = replay_state()
                 service.run_backfill(identity)
                 drain()
-                assert bool((ContentItem.query.count(), SourceItem.query.count()) == before), "Live replay duplicated rows"
+                assert bool(replay_state() == before), "Live replay changed identities, progress or dispatch"
             finally:
                 db.session.remove()
                 db.drop_all()

@@ -196,4 +196,3 @@ def test_reserved_shared_and_scoped_addresses_fail_before_socket(monkeypatch, ad
         with pytest.raises(IngestionError, match="unsafe_destination"):
             with http_response(session, "GET", f"http://{host}/rss", SETTINGS):
                 pass
-

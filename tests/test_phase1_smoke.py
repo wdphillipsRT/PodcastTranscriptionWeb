@@ -508,3 +508,88 @@ def test_live_failure_formatter_suppresses_provider_exception_chain(case, messag
     assert locator not in rendered
     assert failure.value.__suppress_context__
     assert failure.value.__cause__ is None
+
+
+@pytest.mark.parametrize("kind", ["youtube_channel", "youtube_playlist"])
+@pytest.mark.parametrize("usable_count,unavailable_count", [(35, 0), (1, 1)],
+                         ids=["35-usable-videos", "one-usable-one-unavailable"])
+def test_live_discovery_handler_uses_available_catalog_and_new_memberships(
+        app_environment, monkeypatch, kind, usable_count, unavailable_count):
+    """Exercise the actual opt-in handler offline, beyond its default skips."""
+    from config import load_settings
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Offline live-handler regression attempted network access")
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+    usable_ids = {video_id(n) for n in range(usable_count)}
+    unavailable_ids = {video_id(usable_count + n) for n in range(unavailable_count)}
+    http_calls, observed = [], []
+
+    def response(payload, url):
+        result = requests.Response()
+        result.status_code, result.url = 200, url
+        content = json.dumps(payload).encode()
+        result.headers.update({"Content-Type": "application/json", "Content-Length": str(len(content))})
+        result.raw = BytesIO(content)
+        return result
+
+    def provider_response(self, method, url, **kwargs):
+        assert method == "GET" and url.startswith("https://www.googleapis.com/youtube/v3/")
+        assert kwargs["params"]["key"] == app_environment["YOUTUBE_API_KEY"]
+        assert kwargs["stream"] and kwargs["allow_redirects"] is False
+        resource = url.rsplit("/", 1)[-1]
+        http_calls.append(resource)
+        if resource == "channels":
+            data = fixture("channel")
+        elif resource == "playlists":
+            data = fixture("playlist")
+        elif resource == "playlistItems":
+            assert kwargs["params"]["playlistId"] in {PLAYLIST, UPLOADS}
+            data = {"items": []}
+            for identity in sorted(usable_ids | unavailable_ids):
+                entry = deepcopy(fixture("playlist_page")["items"][0])
+                entry["contentDetails"]["videoId"] = identity
+                entry["snippet"]["resourceId"]["videoId"] = identity
+                entry["snippet"]["playlistId"] = kwargs["params"]["playlistId"]
+                if identity in unavailable_ids:
+                    entry["status"]["privacyStatus"] = "private"
+                data["items"].append(entry)
+        else:
+            assert resource == "videos"
+            data = {"items": []}
+            for identity in kwargs["params"]["id"].split(","):
+                assert identity in usable_ids
+                entry = deepcopy(fixture("public_video")["items"][0])
+                entry["id"] = identity
+                entry["snippet"]["publishedAt"] = (
+                    datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(days=int(identity[5:]))).isoformat()
+                data["items"].append(entry)
+        return response(data, url)
+
+    monkeypatch.setattr(requests.sessions.Session, "request", provider_response)
+    original_drop = db.drop_all
+
+    def capture_disposable_state():
+        requests_ = BackfillRequest.query.all()
+        observed.append({
+            "identities": {row.external_id for row in ContentItem.query.all()},
+            "memberships": SourceItem.query.count(),
+            "jobs": ProcessingJob.query.count(),
+            "backfills": [(row.items_accepted, row.items_queued, row.state) for row in requests_],
+        })
+        original_drop()
+
+    monkeypatch.setattr(db, "drop_all", capture_disposable_state)
+    handler = runpy.run_path(str(Path(__file__).with_name("live") / "test_youtube_live.py"))[
+        "test_live_newest25_and_historical_backfill"]
+    url = (f"https://www.youtube.com/channel/{CHANNEL}" if kind == "youtube_channel" else
+           f"https://www.youtube.com/playlist?list={PLAYLIST}")
+    monkeypatch.setitem(handler.__globals__, "required", lambda name: url)
+    handler(load_settings(app_environment), "SYNTHETIC_SOURCE_URL", kind, monkeypatch)
+    expected_new = max(0, usable_count - 25)
+    assert observed == [{"identities": usable_ids, "memberships": usable_count, "jobs": usable_count,
+                         "backfills": [(expected_new, expected_new, "completed")]}]
+    assert len(http_calls) == 7  # source resolution + three two-request catalog scans; replay does no I/O
