@@ -5,6 +5,7 @@ import importlib
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql, sqlite
 
 from extensions import db
 
@@ -21,6 +22,15 @@ def test_initial_migration_upgrade_schema_and_downgrade(app_factory, tmp_path):
     with app.app_context():
         inspector = sa.inspect(db.engine)
         assert set(inspector.get_table_names()) == expected | {"alembic_version"}
+        media_column = next(column for column in inspector.get_columns("content_items")
+                            if column["name"] == "remote_media_url")
+        assert isinstance(media_column["type"], sa.String)
+        assert media_column["type"].length == 4096
+        assert media_column["nullable"] is True
+        # Bind-time validation must retain the migration's bounded SQL type.
+        for dialect in (sqlite.dialect(), postgresql.dialect()):
+            assert db.metadata.tables["content_items"].c.remote_media_url.type.compile(
+                dialect=dialect) == "VARCHAR(4096)"
         with db.engine.connect() as connection:
             assert connection.scalar(sa.text("select version_num from alembic_version")) == "0001_media_foundation"
             context = MigrationContext.configure(connection, opts={"compare_type": True})

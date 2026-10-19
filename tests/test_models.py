@@ -283,6 +283,51 @@ def test_item_allows_safe_podcast_media_url(schema):
     assert episode.remote_media_url == "https://cdn.example.com/episode.mp3"
 
 
+@pytest.mark.parametrize("operation", ["insert", "update"])
+@pytest.mark.parametrize("unsafe_url", [
+    "https://user:secret@example.com/audio.mp3",
+    "https://example.com/audio.mp3?token=secret",
+    "https://user:secret@example.com/audio.mp3?token=secret",
+])
+def test_core_writes_reject_unsafe_remote_media_urls(schema, operation, unsafe_url):
+    owner = admin(schema)
+    if operation == "insert":
+        statement = sa.insert(schema.ContentItem).values(
+            admin_id=owner.id, platform="podcast", item_type="podcast_episode",
+            external_id="core-episode", canonical_url="https://example.com/episode",
+            title="Core episode", remote_media_url=unsafe_url,
+        )
+    else:
+        episode = item(schema, owner, platform="podcast", item_type="podcast_episode",
+                       remote_media_url="https://cdn.example.com/episode.mp3")
+        statement = sa.update(schema.ContentItem).where(schema.ContentItem.id == episode.id).values(
+            remote_media_url=unsafe_url)
+    with pytest.raises(StatementError, match="credentials"):
+        db.session.execute(statement)
+
+
+@pytest.mark.parametrize("operation", ["insert", "update"])
+@pytest.mark.parametrize("safe_url", [None, "https://cdn.example.com/episode.mp3"])
+def test_core_writes_preserve_safe_remote_media_urls_and_null(schema, operation, safe_url):
+    owner = admin(schema)
+    if operation == "insert":
+        db.session.execute(sa.insert(schema.ContentItem).values(
+            admin_id=owner.id, platform="podcast", item_type="podcast_episode",
+            external_id="core-episode", canonical_url="https://example.com/episode",
+            title="Core episode", remote_media_url=safe_url,
+        ))
+        episode = db.session.scalar(sa.select(schema.ContentItem).where(
+            schema.ContentItem.external_id == "core-episode"))
+    else:
+        episode = item(schema, owner, platform="podcast", item_type="podcast_episode",
+                       remote_media_url="https://cdn.example.com/original.mp3")
+        db.session.execute(sa.update(schema.ContentItem).where(schema.ContentItem.id == episode.id).values(
+            remote_media_url=safe_url))
+    db.session.commit()
+    db.session.expire_all()
+    assert episode.remote_media_url == safe_url
+
+
 @pytest.mark.parametrize("direct", [False, True])
 def test_admin_delete_cascades_all_eight_tables(schema, direct):
     owner, origin, content, run = graph(schema)

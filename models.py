@@ -82,6 +82,16 @@ def safe_url(value):
     return value
 
 
+class SafeRemoteMediaURL(TypeDecorator):
+    """Apply URL safety to ORM, Core, and bulk writes before binding values."""
+
+    impl = sa.String
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return None if value is None else safe_url(value)
+
+
 DESCRIPTOR_STRINGS = {
     "platform", "item_type", "external_id", "canonical_url", "remote_media_url", "title",
     "description", "creator_name", "creator_id", "channel_id", "channel_name", "channel_url",
@@ -192,7 +202,7 @@ class ContentItem(Timestamps, db.Model):
     platform = db.Column(db.String(32), nullable=False)
     external_id = db.Column(db.String(1024), nullable=False)
     canonical_url = db.Column(db.String(4096), nullable=False)
-    remote_media_url = db.Column(db.String(4096))
+    remote_media_url = db.Column(SafeRemoteMediaURL(4096))
     title = db.Column(db.String(1000), nullable=False)
     description = db.Column(db.Text)
     published_at = db.Column(UTCDateTime(), index=True)
