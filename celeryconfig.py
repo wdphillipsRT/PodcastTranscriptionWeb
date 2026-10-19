@@ -23,9 +23,13 @@ task_time_limit = 1860
 result_expires = 3600
 task_default_queue = "default"
 task_create_missing_queues = False
-task_queues = tuple(Queue(name) for name in ("default", "discovery", "downloads", "transcription"))
+task_queues = tuple(Queue(name) for name in ("default", "discovery", "downloads", "transcription", "classification"))
 task_routes = {"tasks." + name: {"queue": "discovery"} for name in (
     "discover_source", "continue_discovery", "finalize_discovery", "run_backfill", "cancel_backfill", "check_all_sources")}
 task_routes.update({"tasks.process_item": {"queue": "downloads"},
                     "tasks.transcribe_item": {"queue": "transcription"}})
 beat_schedule = {"hourly-source-discovery": {"task": "tasks.check_all_sources", "schedule": 3600.0}}
+task_routes.update({"tasks." + name: {"queue": "classification"}
+    for name in ("classify_item", "reconcile_classifications", "scan_source_rule")})
+beat_schedule["classification-reconciliation"] = {"task": "tasks.reconcile_classifications",
+    "schedule": float(os.environ.get("CLASSIFICATION_RECONCILE_INTERVAL_SECONDS", "300"))}

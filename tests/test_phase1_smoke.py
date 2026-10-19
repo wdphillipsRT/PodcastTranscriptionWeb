@@ -59,7 +59,7 @@ def smoke(app_factory, monkeypatch):
     monkeypatch.setattr(socket, "create_connection", forbidden)
     monkeypatch.setattr(socket, "getaddrinfo", lambda host, port, **kwargs:
         [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))])
-    app = app_factory(WTF_CSRF_ENABLED=True, SQLALCHEMY_DATABASE_URI="sqlite:///:memory:")
+    app = app_factory(WTF_CSRF_ENABLED=True, SQLALCHEMY_DATABASE_URI="sqlite:///:memory:", CLASSIFICATION_ENABLED=True)
     queue, dispatched, downloads, paths = deque(), [], [], []
     objects, puts, provider_jobs, starts, http_calls = {}, [], {}, [], []
     settings = SimpleNamespace(**app.config)
@@ -205,6 +205,13 @@ def smoke(app_factory, monkeypatch):
 
     monkeypatch.setattr(tasks, "dispatch_task", dispatch)
 
+    def classification_dispatch(name, *, args, **options):
+        assert name == "tasks.classify_item" and args[1:] == ["prepare", None]
+        assert options["queue"] == "classification"
+        dispatched.append(("classify_item", args[0]))
+
+    monkeypatch.setattr(tasks.celery_app, "send_task", classification_dispatch)
+
     def drain():
         invocations = 0
         while queue:
@@ -337,6 +344,9 @@ def test_phase1_ingests_backfills_and_replays_privately(smoke, monkeypatch, capl
     smoke.drain()
     assert (counts(), smoke.downloads, smoke.puts, smoke.starts) == before_scheduled
     assert counts() == (1, 4, 55, 84, 3, 111)
+    from models import ClassificationRevision
+    assert ClassificationRevision.query.count() == 55
+    assert sum(name == "classify_item" for name, _ in smoke.dispatched) == 55
     assert {row.external_id for row in ContentItem.query.filter_by(platform="podcast")} == expected_rss
     assert {row.status for row in ContentItem.query.all()} == {"completed"}, [
         (row.external_id, row.status, row.processing_stage, row.error_category)
