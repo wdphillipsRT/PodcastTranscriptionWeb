@@ -1,4 +1,4 @@
-# Gunicorn configuration for Heroku deployment
+# Gunicorn defaults; the supported Compose command supplies bind and timeout.
 import os
 
 # Server socket
