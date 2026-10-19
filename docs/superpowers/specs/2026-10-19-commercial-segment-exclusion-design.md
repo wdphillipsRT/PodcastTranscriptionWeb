@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-19
 
-**Status:** Approved design addendum awaiting written-spec review
+**Status:** Approved
 
 **Parent specification:** `2026-10-19-docker-podcast-learning-platform-design.md`
 
