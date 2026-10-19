@@ -267,11 +267,15 @@ def backfill(backfill_id):
 @login_required
 def cancel_backfill(backfill_id):
     row = backfill_owned(backfill_id)
-    if row.state in {"pending", "running"}:
-        from tasks import get_discovery_service
-        get_discovery_service().cancel_backfill(row.id)
-    return result(backfill_view(row), location=url_for("workspace.source", source_id=row.source_id),
-                  message="Cancellation requested. Imported items and artifacts are preserved.")
+    from tasks import get_discovery_service
+    outcome = get_discovery_service().cancel_backfill(row.id)
+    if outcome is None:
+        abort(404)
+    view = backfill_view(backfill_owned(backfill_id))
+    view.update(state=outcome["state"], cancel_requested=outcome["cancel_requested"])
+    message = ("Cancellation requested. Imported items and artifacts are preserved." if outcome["changed"]
+               else "Backfill is already finished. No cancellation was applied.")
+    return result(view, location=url_for("workspace.source", source_id=row.source_id), message=message)
 
 
 @workspace.post("/api/items/<int:item_id>/retry")

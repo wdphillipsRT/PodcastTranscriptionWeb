@@ -301,3 +301,71 @@ def test_nonexistent_ids_have_uniform_404s(workspace):
         ("get", "/items/999/transcript"), ("get", "/api/items/999"), ("get", "/api/backfills/999"),
         ("post", "/items/999/retry"), ("post", "/backfills/999/cancel"), ("post", "/sources/999/backfills")]:
         assert getattr(workspace.client, method)(path).status_code == 404
+
+
+@pytest.mark.parametrize("api", [False, True])
+def test_cancel_rechecks_worker_failure_after_route_observes_running(workspace, monkeypatch, api):
+    import sqlalchemy as sa
+    import tasks
+    with workspace.app.app_context():
+        db.session.add(BackfillRequest(source_id=1, selector_type="count", requested_count=2,
+            state="running", items_scanned=7, items_accepted=1, items_queued=1))
+        db.session.flush()
+        db.session.add(DiscoveryRun(source_id=1, backfill_id=1, run_type="backfill", state="scanning"))
+        db.session.commit()
+    original = tasks.get_discovery_service
+    observed = []
+    def worker_fails_before_locked_cancel():
+        observed.append(db.session.get(BackfillRequest, 1).state)
+        with db.engine.begin() as connection:
+            connection.execute(sa.update(BackfillRequest).where(BackfillRequest.id == 1).values(
+                state="failed", error_category="discovery_failed"))
+            connection.execute(sa.update(DiscoveryRun).where(DiscoveryRun.backfill_id == 1).values(
+                state="failed", error_category="discovery_failed"))
+        return original()
+    monkeypatch.setattr(tasks, "get_discovery_service", worker_fails_before_locked_cancel)
+    path = "/api/backfills/1/cancel" if api else "/backfills/1/cancel"
+    response = workspace.client.post(path, follow_redirects=not api)
+    assert observed == ["running"]
+    assert response.status_code == 200
+    if api:
+        assert response.json["state"] == "failed" and response.json["cancel_requested"] is False
+    else:
+        assert "No cancellation was applied" in response.text
+        assert "Cancellation requested." not in response.text
+    with workspace.app.app_context():
+        row, run = db.session.get(BackfillRequest, 1), db.session.get(DiscoveryRun, 1)
+        assert row.state == run.state == "failed"
+        assert row.cancel_requested is False and row.items_accepted == 1
+        assert row.error_category == run.error_category == "discovery_failed"
+
+
+@pytest.mark.parametrize("api", [False, True])
+@pytest.mark.parametrize("state", ["pending", "running", "completed", "cancelled", "failed"])
+def test_cancel_browser_and_api_derive_response_from_locked_result(workspace, monkeypatch, api, state):
+    import tasks
+    with workspace.app.app_context():
+        db.session.add(BackfillRequest(source_id=1, selector_type="count", requested_count=2,
+            state=state, items_scanned=7, items_accepted=1, items_queued=1))
+        db.session.commit()
+    original = tasks.get_discovery_service
+    calls = []
+    def locked_service():
+        calls.append(True)
+        return original()
+    monkeypatch.setattr(tasks, "get_discovery_service", locked_service)
+    path = "/api/backfills/1/cancel" if api else "/backfills/1/cancel"
+    response = workspace.client.post(path, follow_redirects=not api)
+    assert response.status_code == 200 and calls == [True]
+    active = state in {"pending", "running"}
+    expected = "cancelled" if active else state
+    if api:
+        assert response.json["state"] == expected and response.json["cancel_requested"] is active
+    elif active:
+        assert "Cancellation requested." in response.text
+    else:
+        assert "No cancellation was applied" in response.text
+    with workspace.app.app_context():
+        row = db.session.get(BackfillRequest, 1)
+        assert row.state == expected and row.cancel_requested is active
+        assert row.items_accepted == row.items_queued == 1

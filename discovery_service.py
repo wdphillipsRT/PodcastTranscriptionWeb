@@ -143,18 +143,53 @@ class DiscoveryService:
     def _cancelled(self, request):
         if request is None:
             return False
-        self.session.refresh(request)
-        self.session.refresh(request.source)
-        disabled = not request.source.enabled
-        if request.cancel_requested or request.state == "cancelled" or disabled:
-            request.state, request.completed_at = "cancelled", utc_now()
+        terminal = ("completed", "cancelled", "failed")
+        with self.session.no_autoflush:
+            request = self._locked(BackfillRequest, request.id)
+            if request is None:
+                self.session.commit()
+                return True
+            enabled = self.session.query(ContentSource.enabled).filter_by(id=request.source_id).scalar()
+            if request.state in terminal:
+                # Failed requests without cancellation remain explicitly
+                # replayable while enabled; source disable/cancellation cannot
+                # rewrite their failure into a different terminal state.
+                stop = request.state in {"completed", "cancelled"} or request.cancel_requested or not enabled
+                if stop:
+                    self.session.commit()
+                return stop
+            if not request.cancel_requested and enabled:
+                return False
+            # Match failure/finalization lock order: request -> run -> source.
+            run_ids = self.session.query(DiscoveryRun.id).filter_by(backfill_id=request.id).order_by(DiscoveryRun.id).all()
+            for (run_id,) in run_ids:
+                self._locked(DiscoveryRun, run_id)
+            source = self._locked(ContentSource, request.source_id)
+            if source is None:
+                self.session.commit()
+                return True
+            disabled = not source.enabled
+            if not request.cancel_requested and not disabled:
+                return False
+            values = {"state": "cancelled", "completed_at": utc_now()}
             if disabled:
-                request.error_category = "source_disabled"
-            self.session.query(DiscoveryRun).filter_by(backfill_id=request.id).update(
-                {"state": "cancelled", "completed_at": utc_now()}, synchronize_session="fetch")
+                values["error_category"] = "source_disabled"
+            # Guard every write as well as locking: SQLite ignores FOR UPDATE,
+            # and a terminal commit after our reads must remain authoritative.
+            changed = self.session.query(BackfillRequest).filter(
+                BackfillRequest.id == request.id,
+                BackfillRequest.state.in_(("pending", "running")),
+                sa.or_(BackfillRequest.cancel_requested.is_(True), sa.exists().where(
+                    ContentSource.id == request.source_id, ContentSource.enabled.is_(False)))
+            ).update(values, synchronize_session=False)
+            if not changed:
+                self.session.rollback()
+                return True
+            self.session.query(DiscoveryRun).filter(
+                DiscoveryRun.backfill_id == request.id, DiscoveryRun.state.notin_(terminal)
+            ).update({"state": "cancelled", "completed_at": values["completed_at"]}, synchronize_session=False)
             self.session.commit()
             return True
-        return False
 
     def _scan(self, run, request=None):
         source = run.source
@@ -358,14 +393,29 @@ class DiscoveryService:
         return request.id
 
     def cancel_backfill(self, request_id):
-        request = self._locked(BackfillRequest, request_id)
-        if request is None or request.state == "completed":
+        with self.session.no_autoflush:
+            request = self._locked(BackfillRequest, request_id)
+            if request is None:
+                self.session.commit()
+                return None
+            changed = False
+            if request.state in {"pending", "running"}:
+                changed = bool(self.session.query(BackfillRequest).filter(
+                    BackfillRequest.id == request.id, BackfillRequest.state.in_(("pending", "running"))
+                ).update({"cancel_requested": True}, synchronize_session=False))
+            # The durable flag lets a worker stop even if cancellation
+            # finalization is interrupted. Finalization reacquires all locks.
             self.session.commit()
-            return None
-        request.cancel_requested = True
+            if changed:
+                self._cancelled(request)
+            request = self._locked(BackfillRequest, request_id)
+            if request is None:
+                self.session.commit()
+                return None
+            outcome = dict(id=request.id, state=request.state, cancel_requested=request.cancel_requested,
+                           changed=changed and request.state == "cancelled")
         self.session.commit()
-        self._cancelled(request)
-        return request.id
+        return outcome
 
     def _backfill_run(self, request):
         run = self.session.query(DiscoveryRun).filter_by(backfill_id=request.id).first()

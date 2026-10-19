@@ -561,3 +561,120 @@ def test_concurrent_failure_and_finalizer_finish_and_preserve_recoverable_work(a
         assert SourceItem.query.count() == ProcessingJob.query.count() == 2
         db.session.remove()
         db.drop_all()
+
+
+@pytest.mark.parametrize("terminal", ["completed", "cancelled", "failed"])
+@pytest.mark.parametrize("cancel_requested", [False, True])
+def test_cancel_service_preserves_every_terminal_request_and_returns_locked_outcome(store, terminal, cancel_requested):
+    from models import utc_now
+    source = store()
+    row = request(source, selector_type="count", requested_count=2)
+    row.state, row.completed_at, row.error_category = terminal, utc_now(), "preserved"
+    row.cancel_requested = cancel_requested
+    db.session.commit()
+    before = (row.state, row.cancel_requested, row.completed_at, row.error_category)
+    outcome = service(Adapter([])).cancel_backfill(row.id)
+    assert outcome == {"id": row.id, "state": terminal, "cancel_requested": cancel_requested, "changed": False}
+    assert (row.state, row.cancel_requested, row.completed_at, row.error_category) == before
+
+
+@pytest.mark.parametrize("terminal", ["completed", "cancelled", "failed"])
+def test_cancel_finalization_guards_terminal_commit_when_sqlite_ignores_row_locks(store, monkeypatch, terminal):
+    from models import ContentSource, utc_now
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    row.cancel_requested = True
+    db.session.commit()
+    request_id, run_id = row.id, run.id
+    original = svc._locked
+    interleaved = False
+    completed_at = utc_now()
+    def worker_finishes_after_cancel_reads_active_rows(model, identity):
+        nonlocal interleaved
+        value = original(model, identity)
+        if model is ContentSource and not interleaved:
+            interleaved = True
+            with db.engine.begin() as connection:
+                connection.execute(sa.update(BackfillRequest).where(BackfillRequest.id == request_id).values(
+                    state=terminal, completed_at=completed_at, error_category="preserved"))
+                connection.execute(sa.update(DiscoveryRun).where(DiscoveryRun.id == run_id).values(
+                    state=terminal, completed_at=completed_at, error_category="preserved"))
+        return value
+    monkeypatch.setattr(svc, "_locked", worker_finishes_after_cancel_reads_active_rows)
+    svc._cancelled(row)
+    db.session.expire_all()
+    assert interleaved and row.state == run.state == terminal
+    assert row.error_category == run.error_category == "preserved"
+    assert row.completed_at == run.completed_at == completed_at
+
+
+def test_cancel_finalization_uses_request_run_source_lock_order_before_writes(store):
+    from models import ContentSource
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    row.cancel_requested = True
+    db.session.commit()
+    original, locks = svc._locked, []
+    def record(model, identity):
+        locks.append(model)
+        return original(model, identity)
+    svc._locked = record
+    svc._cancelled(row)
+    assert locks == [BackfillRequest, DiscoveryRun, ContentSource]
+    assert row.state == run.state == "cancelled"
+
+
+@pytest.mark.parametrize("terminal", ["completed", "cancelled", "failed"])
+def test_cancel_flag_guard_preserves_terminal_commit_after_locked_read(store, monkeypatch, terminal):
+    source = store()
+    svc = service(Adapter([]))
+    row = request(source, selector_type="count", requested_count=2)
+    request_id = row.id
+    original = svc._locked
+    interleaved = False
+    def worker_finishes_after_cancel_observes_pending(model, identity):
+        nonlocal interleaved
+        value = original(model, identity)
+        if model is BackfillRequest and not interleaved:
+            interleaved = True
+            with db.engine.begin() as connection:
+                connection.execute(sa.update(BackfillRequest).where(BackfillRequest.id == request_id).values(state=terminal))
+        return value
+    monkeypatch.setattr(svc, "_locked", worker_finishes_after_cancel_observes_pending)
+    outcome = svc.cancel_backfill(request_id)
+    assert interleaved and outcome == {"id": row.id, "state": terminal, "cancel_requested": False, "changed": False}
+    assert row.state == terminal and row.cancel_requested is False
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+def test_cancellation_finalization_rechecks_terminal_after_flag_commit(store, monkeypatch, terminal):
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    original = svc._cancelled
+    def worker_finishes_before_finalization(active):
+        assert active.cancel_requested and not db.session.dirty
+        active.state, run.state = terminal, terminal
+        active.error_category, run.error_category = "preserved", "preserved"
+        db.session.commit()
+        return original(active)
+    monkeypatch.setattr(svc, "_cancelled", worker_finishes_before_finalization)
+    outcome = svc.cancel_backfill(row.id)
+    assert outcome == {"id": row.id, "state": terminal, "cancel_requested": True, "changed": False}
+    assert row.state == run.state == terminal
+    assert row.error_category == run.error_category == "preserved"
+
+
+def test_source_disable_cannot_turn_failed_backfill_into_cancelled_during_replay(store):
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    row.state = run.state = "failed"
+    row.error_category = run.error_category = "preserved"
+    source.enabled = False
+    db.session.commit()
+    svc.run_backfill(row.id)
+    assert row.state == run.state == "failed"
+    assert row.cancel_requested is False and row.error_category == "preserved"
