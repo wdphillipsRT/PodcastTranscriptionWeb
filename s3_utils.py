@@ -1,279 +1,257 @@
-"""
-S3 utilities for podcast transcription service.
-Handles file uploads, downloads, and management for audio files, transcripts, and summaries.
-"""
+"""Private, region-pinned artifact storage. Public URLs are not capabilities."""
 
-import os
-import boto3
-import logging
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Optional, Dict, Any
-from botocore.exceptions import ClientError, NoCredentialsError
+import re
 
-logger = logging.getLogger(__name__)
+import boto3
+from botocore.config import Config
+from botocore.exceptions import (ClientError, ConnectionError, HTTPClientError,
+                                 IncompleteReadError, ResponseStreamingError)
+
+from config import load_settings
+
+
+BUCKET_NAME = "podcast-transcriptions-web-2025"
+DEFAULT_MAX_BYTES = 52_428_800
+
+
+class StorageError(ValueError):
+    """Safe storage failure; provider payloads never cross this boundary."""
+
+
+class StorageTransientError(StorageError):
+    """The caller may retry this operation."""
+
+
+class StoragePermanentError(StorageError):
+    """Invalid configuration, input, or denied operation."""
+
+
+def setting(settings, name):
+    return settings[name] if isinstance(settings, Mapping) else getattr(settings, name)
+
+
+def validate_segment(value):
+    # ASCII rejects encoded traversal, controls and URL syntax as well.
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,254}", value) or ".." in value:
+        raise StoragePermanentError("invalid artifact segment")
+    return value
+
+
+def validate_artifact_key(key):
+    if not isinstance(key, str):
+        raise StoragePermanentError("invalid artifact key")
+    parts = key.split("/")
+    if len(parts) != 5 or parts[0] != "items" or parts[1] not in {"podcast", "youtube"}:
+        raise StoragePermanentError("invalid artifact key")
+    for part in parts[1:]:
+        validate_segment(part)
+    if len(key.encode()) > 1024:
+        raise StoragePermanentError("invalid artifact key")
+    return key
+
+
+def _failure(error):
+    code = error.response.get("Error", {}).get("Code", "") if isinstance(error, ClientError) else ""
+    if code in {"SlowDown", "Throttling", "ThrottlingException", "RequestTimeout", "InternalError", "ServiceUnavailable", "500", "503"} or isinstance(error, (ConnectionError, HTTPClientError, IncompleteReadError, ResponseStreamingError)):
+        raise StorageTransientError("storage temporarily unavailable") from None
+    raise StoragePermanentError("storage operation failed") from None
+
 
 class S3Manager:
-    """Manages S3 operations for podcast transcription files."""
-    
-    def __init__(self):
-        """Initialize S3 client with configuration from environment."""
-        self.bucket_name = os.environ.get('AWS_S3_BUCKET_NAME')
-        self.region = os.environ.get('AWS_REGION', 'us-east-1')
-        
-        if not self.bucket_name:
-            raise ValueError("AWS_S3_BUCKET_NAME environment variable is required")
-        
-        try:
-            self.s3_client = boto3.client(
-                's3',
-                aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-                aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-                region_name=self.region
-            )
-            logger.info(f"Initialized S3 client for bucket: {self.bucket_name}")
-        except Exception as e:
-            logger.error(f"Failed to initialize S3 client: {e}")
-            raise
-    
-    def generate_s3_key(self, podcast_id: int, episode_id: int, file_type: str, filename: str) -> str:
-        """Generate S3 key for organized file storage.
-        
-        Args:
-            podcast_id: Database ID of the podcast
-            episode_id: Database ID of the episode
-            file_type: Type of file ('audio', 'transcripts', 'summaries')
-            filename: Original filename
-        
-        Returns:
-            S3 key in format: {file_type}/podcast_{id}/episode_{id}/{filename}
-        """
-        return f"{file_type}/podcast_{podcast_id}/episode_{episode_id}/{filename}"
-    
-    def upload_file(self, local_file_path: str, s3_key: str, 
-                   content_type: Optional[str] = None) -> Optional[str]:
-        """Upload a local file to S3.
-        
-        Args:
-            local_file_path: Path to local file
-            s3_key: S3 key (path) for the file
-            content_type: MIME type of the file (auto-detected if None)
-        
-        Returns:
-            S3 URL of uploaded file, or None if upload failed
-        """
-        try:
-            extra_args = {}
-            if content_type:
-                extra_args['ContentType'] = content_type
-            
-            self.s3_client.upload_file(
-                local_file_path, 
-                self.bucket_name, 
-                s3_key,
-                ExtraArgs=extra_args
-            )
-            
-            s3_url = f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/{s3_key}"
-            logger.info(f"Uploaded {local_file_path} to {s3_url}")
-            return s3_url
-            
-        except FileNotFoundError:
-            logger.error(f"Local file not found: {local_file_path}")
-            return None
-        except NoCredentialsError:
-            logger.error("AWS credentials not found")
-            return None
-        except ClientError as e:
-            logger.error(f"Failed to upload to S3: {e}")
-            return None
-    
-    def download_file(self, s3_key: str, local_file_path: str) -> bool:
-        """Download a file from S3 to local storage.
-        
-        Args:
-            s3_key: S3 key of the file to download
-            local_file_path: Local path where file should be saved
-        
-        Returns:
-            True if download successful, False otherwise
-        """
-        try:
-            # Create directory if it doesn't exist
-            Path(local_file_path).parent.mkdir(parents=True, exist_ok=True)
-            
-            self.s3_client.download_file(
-                self.bucket_name, 
-                s3_key, 
-                local_file_path
-            )
-            
-            logger.info(f"Downloaded {s3_key} to {local_file_path}")
-            return True
-            
-        except ClientError as e:
-            if e.response['Error']['Code'] == '404':
-                logger.error(f"File not found in S3: {s3_key}")
-            else:
-                logger.error(f"Failed to download from S3: {e}")
-            return False
-    
-    def upload_text_content(self, content: str, s3_key: str, 
-                           content_type: str = 'text/plain') -> Optional[str]:
-        """Upload text content directly to S3.
-        
-        Args:
-            content: Text content to upload
-            s3_key: S3 key for the file
-            content_type: MIME type of the content
-        
-        Returns:
-            S3 URL of uploaded content, or None if upload failed
-        """
-        try:
-            self.s3_client.put_object(
-                Bucket=self.bucket_name,
-                Key=s3_key,
-                Body=content.encode('utf-8'),
-                ContentType=content_type
-            )
-            
-            s3_url = f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/{s3_key}"
-            logger.info(f"Uploaded text content to {s3_url}")
-            return s3_url
-            
-        except ClientError as e:
-            logger.error(f"Failed to upload text to S3: {e}")
-            return None
-    
-    def download_text_content(self, s3_key: str) -> Optional[str]:
-        """Download text content from S3.
-        
-        Args:
-            s3_key: S3 key of the text file
-        
-        Returns:
-            Text content as string, or None if download failed
-        """
-        try:
-            response = self.s3_client.get_object(
-                Bucket=self.bucket_name,
-                Key=s3_key
-            )
-            
-            content = response['Body'].read().decode('utf-8')
-            logger.info(f"Downloaded text content from {s3_key}")
-            return content
-            
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchKey':
-                logger.error(f"File not found in S3: {s3_key}")
-            else:
-                logger.error(f"Failed to download text from S3: {e}")
-            return None
-    
-    def delete_file(self, s3_key: str) -> bool:
-        """Delete a file from S3.
-        
-        Args:
-            s3_key: S3 key of the file to delete
-        
-        Returns:
-            True if deletion successful, False otherwise
-        """
-        try:
-            self.s3_client.delete_object(
-                Bucket=self.bucket_name,
-                Key=s3_key
-            )
-            
-            logger.info(f"Deleted {s3_key} from S3")
-            return True
-            
-        except ClientError as e:
-            logger.error(f"Failed to delete from S3: {e}")
-            return False
-    
-    def file_exists(self, s3_key: str) -> bool:
-        """Check if a file exists in S3.
-        
-        Args:
-            s3_key: S3 key to check
-        
-        Returns:
-            True if file exists, False otherwise
-        """
-        try:
-            self.s3_client.head_object(
-                Bucket=self.bucket_name,
-                Key=s3_key
-            )
-            return True
-        except ClientError as e:
-            if e.response['Error']['Code'] == '404':
-                return False
-            else:
-                logger.error(f"Error checking file existence: {e}")
-                return False
-    
-    def get_file_info(self, s3_key: str) -> Optional[Dict[str, Any]]:
-        """Get metadata about a file in S3.
-        
-        Args:
-            s3_key: S3 key of the file
-        
-        Returns:
-            Dictionary with file metadata, or None if file doesn't exist
-        """
-        try:
-            response = self.s3_client.head_object(
-                Bucket=self.bucket_name,
-                Key=s3_key
-            )
-            
-            return {
-                'size': response.get('ContentLength', 0),
-                'last_modified': response.get('LastModified'),
-                'content_type': response.get('ContentType'),
-                'etag': response.get('ETag', '').strip('"')
-            }
-            
-        except ClientError as e:
-            if e.response['Error']['Code'] == '404':
-                logger.debug(f"File not found in S3: {s3_key}")
-            else:
-                logger.error(f"Error getting file info: {e}")
-            return None
+    """One configured bucket and region, probed before the first operation.
 
-
-# Global S3 manager instance
-s3_manager = None
-
-def get_s3_manager() -> S3Manager:
-    """Get global S3 manager instance (singleton pattern)."""
-    global s3_manager
-    if s3_manager is None:
-        s3_manager = S3Manager()
-    return s3_manager
-
-
-def extract_s3_key_from_url(s3_url: str) -> Optional[str]:
-    """Extract S3 key from S3 URL.
-    
-    Args:
-        s3_url: S3 URL like https://bucket.s3.region.amazonaws.com/path/to/file
-    
-    Returns:
-        S3 key (path/to/file) or None if invalid URL
+    Credentials use boto3's normal chain. Inject a client for tests. Operations
+    accept no bucket override, URL, endpoint or presigning option.
     """
-    try:
-        if not s3_url or not s3_url.startswith('https://'):
-            return None
-        
-        # Split URL and extract key part
-        parts = s3_url.split('.amazonaws.com/')
-        if len(parts) != 2:
-            return None
-        
-        return parts[1]
-    except Exception:
-        return None
+
+    def __init__(self, settings=None, *, client=None):
+        settings = settings if settings is not None else load_settings()
+        self._bucket_name = setting(settings, "AWS_S3_BUCKET_NAME")
+        self._region = setting(settings, "AWS_REGION")
+        if self._bucket_name != BUCKET_NAME:
+            raise StoragePermanentError("invalid configured bucket")
+        if not isinstance(self._region, str) or not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]+", self._region):
+            raise StoragePermanentError("invalid configured region")
+        try:
+            self.s3_client = client if client is not None else boto3.client("s3", region_name=self.region, config=Config(retries={"total_max_attempts": 1}, s3={"us_east_1_regional_endpoint": "regional"}))
+            client_region = self.s3_client.meta.region_name
+            if isinstance(client_region, str) and client_region != self.region:
+                raise StoragePermanentError("storage client region mismatch")
+            # S3's region redirector is independent of ordinary retries.
+            self.s3_client.meta.events.register_first("needs-retry.s3", self._reject_redirect)
+            self.probe()
+        except StorageError:
+            raise
+        except Exception as error:
+            _failure(error)
+
+    @property
+    def bucket_name(self):
+        return self._bucket_name
+
+    @property
+    def region(self):
+        return self._region
+
+    def _reject_redirect(self, response=None, **kwargs):
+        if response is None:
+            return
+        http_response, _ = response
+        headers = {str(k).lower(): v for k, v in http_response.headers.items()}
+        region = headers.get("x-amz-bucket-region")
+        if http_response.status_code in {301, 302, 303, 307, 308} or "location" in headers or region and region != self.region:
+            raise StoragePermanentError("storage redirect or region mismatch")
+
+    def _check_response(self, response):
+        metadata = response.get("ResponseMetadata", {})
+        headers = {str(k).lower(): v for k, v in metadata.get("HTTPHeaders", {}).items()}
+        status = metadata.get("HTTPStatusCode", 200)
+        region = headers.get("x-amz-bucket-region")
+        if 300 <= status < 400 or "location" in headers or region and region != self.region:
+            raise StoragePermanentError("storage redirect or region mismatch")
+        if not 200 <= status < 300:
+            raise StoragePermanentError("storage operation failed")
+
+    def probe(self):
+        try:
+            response = self.s3_client.get_bucket_location(Bucket=self.bucket_name)
+            self._check_response(response)
+            if "LocationConstraint" not in response:
+                raise StoragePermanentError("bucket region unavailable")
+            actual = response["LocationConstraint"]
+            actual = "us-east-1" if actual is None else actual
+            if actual != self.region:
+                raise StoragePermanentError("bucket region mismatch")
+        except StorageError:
+            raise
+        except Exception as error:
+            _failure(error)
+
+    @staticmethod
+    def generate_s3_key(platform, external_id, kind, filename):
+        for part in (platform, external_id, kind, filename):
+            validate_segment(part)
+        return validate_artifact_key(f"items/{platform}/{external_id}/{kind}/{filename}")
+
+    @staticmethod
+    def _content_type(content_type):
+        if not isinstance(content_type, str) or not re.fullmatch(r"[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+(?:; charset=utf-8)?", content_type):
+            raise StoragePermanentError("explicit content type required")
+        return content_type
+
+    def upload_binary_content(self, content, s3_key, content_type):
+        validate_artifact_key(s3_key)
+        self._content_type(content_type)
+        if not isinstance(content, bytes):
+            raise StoragePermanentError("artifact body must be bytes")
+        try:
+            response = self.s3_client.put_object(Bucket=self.bucket_name, Key=s3_key, Body=content, ContentType=content_type, ServerSideEncryption="AES256")
+            self._check_response(response)
+            return s3_key
+        except StorageError:
+            raise
+        except Exception as error:
+            _failure(error)
+
+    def upload_text_content(self, content, s3_key, content_type="text/plain"):
+        if not isinstance(content, str):
+            raise StoragePermanentError("artifact body must be text")
+        return self.upload_binary_content(content.encode("utf-8"), s3_key, content_type)
+
+    def upload_file(self, local_file_path, s3_key, content_type):
+        validate_artifact_key(s3_key)
+        self._content_type(content_type)
+        try:
+            self.s3_client.upload_file(str(local_file_path), self.bucket_name, s3_key, ExtraArgs={"ContentType": content_type, "ServerSideEncryption": "AES256"})
+            return s3_key
+        except StorageError:
+            raise
+        except Exception as error:
+            _failure(error)
+
+    def get_bytes(self, s3_key, *, max_bytes=DEFAULT_MAX_BYTES):
+        validate_artifact_key(s3_key)
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise StoragePermanentError("invalid artifact byte limit")
+        body = None
+        try:
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
+            body = response.get("Body")
+            self._check_response(response)
+            length = response.get("ContentLength")
+            if type(length) is not int or not 0 <= length <= max_bytes:
+                raise StoragePermanentError("invalid artifact content length")
+            chunks, total = [], 0
+            while True:
+                chunk = body.read(min(65536, max_bytes - total + 1))
+                if not isinstance(chunk, bytes):
+                    raise StoragePermanentError("invalid artifact body")
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes or total > length:
+                    raise StoragePermanentError("artifact exceeds declared byte limit")
+                chunks.append(chunk)
+            if total != length:
+                raise StoragePermanentError("artifact content length mismatch")
+            return b"".join(chunks)
+        except StorageError:
+            raise
+        except Exception as error:
+            _failure(error)
+        finally:
+            if body is not None:
+                try:
+                    body.close()
+                except Exception:
+                    pass
+
+    def download_text_content(self, s3_key, *, max_bytes=DEFAULT_MAX_BYTES):
+        try:
+            return self.get_bytes(s3_key, max_bytes=max_bytes).decode("utf-8")
+        except UnicodeError:
+            raise StoragePermanentError("invalid artifact text encoding") from None
+
+    def download_file(self, s3_key, local_file_path, *, max_bytes=DEFAULT_MAX_BYTES):
+        content = self.get_bytes(s3_key, max_bytes=max_bytes)
+        try:
+            Path(local_file_path).write_bytes(content)
+        except OSError:
+            raise StoragePermanentError("artifact local write failed") from None
+        return True
+
+    def get_file_info(self, s3_key):
+        validate_artifact_key(s3_key)
+        try:
+            response = self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            self._check_response(response)
+            return {"size": response["ContentLength"], "content_type": response.get("ContentType")}
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+                return None
+            _failure(error)
+        except StorageError:
+            raise
+        except Exception as error:
+            _failure(error)
+
+    def file_exists(self, s3_key):
+        return self.get_file_info(s3_key) is not None
+
+    def delete_file(self, s3_key):
+        validate_artifact_key(s3_key)
+        try:
+            response = self.s3_client.delete_object(Bucket=self.bucket_name, Key=s3_key)
+            self._check_response(response)
+            return True
+        except StorageError:
+            raise
+        except Exception as error:
+            _failure(error)
+
+
+def get_s3_manager(settings=None):
+    """Build a probed manager for the current worker configuration."""
+    return S3Manager(settings)
