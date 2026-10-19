@@ -109,6 +109,75 @@ def test_vtt_supports_cue_ids_settings_entities_and_rolling_caption_overlap():
     assert [segment.text for segment in result.segments] == ["One & two.", "Three."]
 
 
+@pytest.mark.parametrize("spacer", [" \t", ""])
+def test_vtt_accepts_whitespace_split_cue_payload(spacer):
+    raw = f"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{spacer}\nSynthetic caption.\n"
+    result = module().normalize_vtt(raw, origin="automatic_caption", **METADATA)
+    assert [segment.text for segment in result.segments] == ["Synthetic caption."]
+
+
+def test_vtt_accepts_youtube_whitespace_split_payloads_and_skips_empty_cues():
+    raw = (b"WEBVTT\r\nKind: captions\r\n\r\n"
+           b"00:00:00.000 --> 00:00:01.000\r\n \t\r\n\r\n"
+           b"first\r\n00:00:01.000 --> 00:00:03.000 align:start\r\n \t\r\n"
+           b"<00:00:01.500><c>One &amp; two.</c>\r\n\r\n"
+           b"00:00:02.000 --> 00:00:04.000\r\n \t\r\n\r\n"
+           b"00:00:03.000 --> 00:00:05.000\r\nThree.\r\n\r\n"
+           b"00:00:05.000 --> 00:00:06.000\r\n \t\r\n")
+    first = module().normalize_vtt(raw, origin="automatic_caption", **METADATA)
+    second = module().normalize_vtt(raw, origin="automatic_caption", **METADATA)
+    assert [(segment.start, segment.end, segment.text) for segment in first.segments] == [
+        (1.0, 3.0, "One & two."), (3.0, 5.0, "Three.")]
+    assert first.source_sha256 == sha256(raw).hexdigest()
+    assert first.to_json() == second.to_json()
+    assert first.segments[0].citation == "https://www.youtube.com/watch?v=abc123xyz_1&t=1s"
+
+
+@pytest.mark.parametrize("following", [
+    "next-cue\n00:00:02.000 --> 00:00:03.000\nSecond.",
+    "NOTE hidden note\nhidden\n\n00:00:02.000 --> 00:00:03.000\nSecond.",
+    "STYLE\n::cue { color: lime; }\n\n00:00:02.000 --> 00:00:03.000\nSecond.",
+    "REGION\nid:region\n\n00:00:02.000 --> 00:00:03.000\nSecond.",
+])
+def test_vtt_empty_cues_do_not_consume_next_cue_ids_or_metadata(following):
+    raw = ("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFirst.\n\n"
+           "00:00:01.000 --> 00:00:02.000\n \t\n\n" + following)
+    result = module().normalize_vtt(raw, origin="automatic_caption", **METADATA)
+    assert [segment.text for segment in result.segments] == ["First.", "Second."]
+
+
+@pytest.mark.parametrize("payload", ["", " \t\n", "<c></c>"])
+def test_vtt_without_usable_caption_text_is_rejected(payload):
+    raw = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n" + payload
+    with pytest.raises(module().TranscriptValidationError, match="^invalid transcript input$"):
+        module().normalize_vtt(raw, origin="automatic_caption", **METADATA)
+
+
+@pytest.mark.parametrize("cue", [
+    "00:00:03.000 --> 00:00:02.000\n \t",
+    "00:00:00.000 --> 00:00:04.000\n \t",
+    "00:00:02.000 --> 00:00:02.500\n \t",
+    "00:00:61.000 --> 00:01:03.000\n \t",
+    "00:00:02.000 --> malformed\n \t",
+    "00:00:02.000 --> 00:00:04.000\n\nSECRET\x00",
+    "00:00:02.000 --> 00:00:04.000\n\n\x0b",
+    "00:00:02.000 --> 00:00:04.000\n\ns3://private/SECRET",
+    "00:00:02.000 --> 00:00:04.000\n\nhttps://bucket.s3.amazonaws.com/SECRET",
+    "00:00:02.000 --> 00:00:04.000\n\nhttps://example.com/?token=SECRET",
+    "00:00:02.000 --> 00:00:04.000\n\nNOTE ignored\n\nSECRET orphan",
+])
+def test_vtt_empty_and_split_cues_retain_safe_timing_and_text_validation(cue):
+    raw = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nFirst.\n\n" + cue
+    with pytest.raises(module().TranscriptValidationError, match="^invalid transcript input$"):
+        module().normalize_vtt(raw, origin="automatic_caption", **METADATA)
+
+
+def test_vtt_still_rejects_orphan_text_after_a_complete_cue():
+    raw = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nFirst.\n\nSECRET orphan"
+    with pytest.raises(module().TranscriptValidationError, match="^invalid transcript input$"):
+        module().normalize_vtt(raw, origin="automatic_caption", **METADATA)
+
+
 def test_canonical_constructor_freezes_children_and_validates_replacement():
     api = module()
     result = api.normalize_vtt(VTT, origin="creator_caption", **METADATA)

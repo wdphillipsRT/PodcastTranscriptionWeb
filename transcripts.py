@@ -294,21 +294,38 @@ def normalize_vtt(content, *, platform, external_id, item_id, source_id, languag
         if not isinstance(raw, bytes) or type(max_bytes) is not int or not 0 < len(raw) <= max_bytes <= DEFAULT_MAX_BYTES:
             _invalid()
         text = raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
-        blocks = re.split(r"\n[ \t]*\n", text.strip())
+        blocks = re.split(r"\n(?:[ \t]*\n)+", text.strip(" \t\n"))
         if not re.fullmatch(r"WEBVTT(?:[ \t].*)?", blocks[0].split("\n")[0]) or origin not in {"creator_caption", "automatic_caption"}:
             _invalid()
-        rows = []
-        for block in blocks[1:]:
-            lines = block.split("\n")
-            if re.match(r"^(?:NOTE(?:\s|$)|STYLE$|REGION$)", lines[0]):
+        rows, previous_start, previous_end = [], 0.0, 0.0
+        metadata = re.compile(r"^(?:NOTE(?:\s|$)|STYLE$|REGION$)")
+        block_index = 1
+        while block_index < len(blocks):
+            lines = blocks[block_index].split("\n")
+            block_index += 1
+            if metadata.match(lines[0]):
                 continue
             index = 0 if " --> " in lines[0] else 1
             if index >= len(lines) or " --> " not in lines[index]:
                 _invalid()
             start, end = lines[index].split(" --> ", 1)
-            end = end.split()[0]
-            cue = html.unescape(re.sub(r"<[^>]*>", "", " ".join(lines[index + 1:])))
-            rows.append((_vtt_time(start), _vtt_time(end), cue))
+            start, end = _vtt_time(start), _vtt_time(end.split()[0])
+            if end < start or start < previous_start or end < previous_end:
+                _invalid()
+            previous_start, previous_end = start, end
+            payload = " ".join(lines[index + 1:])
+            if not payload.strip(" \t") and block_index < len(blocks):
+                following = blocks[block_index]
+                # Only an empty cue may own a detached provider payload.
+                # Cue IDs/timing and metadata remain separate blocks.
+                if not metadata.match(following.split("\n")[0]) and "-->" not in following:
+                    payload = " ".join(following.split("\n"))
+                    block_index += 1
+            cue = html.unescape(re.sub(r"<[^>]*>", "", payload))
+            if len(cue) > max_text_chars:
+                _invalid()
+            if cue.strip(" \t\n"):
+                rows.append((start, end, cue))
         return _build(rows, source_sha256=sha256(raw).hexdigest(), platform=platform, external_id=external_id,
                       item_id=item_id, source_id=source_id, origin=origin, provider="yt-dlp",
                       provider_version=provider_version, tool_version=tool_version, language=language,
