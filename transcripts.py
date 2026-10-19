@@ -298,7 +298,7 @@ def normalize_vtt(content, *, platform, external_id, item_id, source_id, languag
         if not re.fullmatch(r"WEBVTT(?:[ \t].*)?", blocks[0].split("\n")[0]) or origin not in {"creator_caption", "automatic_caption"}:
             _invalid()
         rows, previous_start, previous_end = [], 0.0, 0.0
-        metadata = re.compile(r"^(?:NOTE(?:\s|$)|STYLE$|REGION$)")
+        metadata = re.compile(r"^(?:NOTE(?:\s|$)|(?:STYLE|REGION)[ \t]*$)")
         block_index = 1
         while block_index < len(blocks):
             lines = blocks[block_index].split("\n")
@@ -322,9 +322,9 @@ def normalize_vtt(content, *, platform, external_id, item_id, source_id, languag
                     payload = " ".join(following.split("\n"))
                     block_index += 1
             cue = html.unescape(re.sub(r"<[^>]*>", "", payload))
-            if len(cue) > max_text_chars:
+            if len(cue) > max_text_chars or any(ord(c) < 32 and c not in "\n\r\t" or ord(c) == 127 for c in cue):
                 _invalid()
-            if cue.strip(" \t\n"):
+            if cue.split():
                 rows.append((start, end, cue))
         return _build(rows, source_sha256=sha256(raw).hexdigest(), platform=platform, external_id=external_id,
                       item_id=item_id, source_id=source_id, origin=origin, provider="yt-dlp",
