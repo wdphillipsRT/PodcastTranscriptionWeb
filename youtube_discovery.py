@@ -276,6 +276,31 @@ class YouTubeDiscoveryClient:
             _fail("invalid_url")
         return self._videos(self._request("videos", id=identity), [identity], kind, identity)[0]
 
+    def source_contains_video(self, source: SourceDescriptor, video_id: str) -> bool:
+        """Check one exact playlist membership with one bounded official call.
+
+        A filtered lookup needs no broad playlist scan or pagination. Video
+        availability/ownership metadata is validated separately by resolve_video.
+        """
+        if not isinstance(source, SourceDescriptor) or source.source_type != "youtube_playlist":
+            _fail("invalid_source")
+        playlist_id = _identity(source.external_id, PLAYLIST_ID)
+        video_id = _identity(video_id, VIDEO_ID)
+        data = self._request("playlistItems", playlistId=playlist_id, videoId=video_id, maxResults=1)
+        if not data["items"]:
+            return False
+        if len(data["items"]) != 1:
+            _fail("invalid_response")
+        entry = data["items"][0]
+        self._public_status(entry)
+        details = _mapping(entry.get("contentDetails"))
+        snippet = _mapping(entry.get("snippet"))
+        resource = _mapping(snippet.get("resourceId"))
+        if (details.get("videoId") != video_id or resource.get("kind") != "youtube#video"
+                or resource.get("videoId") != video_id or snippet.get("playlistId", playlist_id) != playlist_id):
+            _fail("invalid_response")
+        return True
+
     @staticmethod
     def _public_status(entry):
         status = _mapping(entry.get("status"))

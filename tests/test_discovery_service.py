@@ -52,8 +52,13 @@ class Adapter:
         self.calls.append(cursor)
         return self.pages[int(cursor or 0)]
     def resolve_video(self, url):
+        from source_classifier import youtube_locator
         self.resolved_url = url
-        return descriptor(9, True, canonical_url=url)
+        return descriptor(9, True, canonical_url=url, external_id=youtube_locator(url)[2],
+                          channel_id=getattr(self, "channel_id", "feed"))
+    def source_contains_video(self, source, video_id):
+        self.membership_lookup = (source.external_id, video_id)
+        return getattr(self, "contains_video", True)
 
 
 def service(adapter, dispatch=None, **config):
@@ -261,3 +266,69 @@ def test_staging_page_failure_rolls_back_all_candidates(store):
     run_id = service(adapter).discover_source(source.id)
     assert db.session.get(DiscoveryRun, run_id).state == "failed"
     assert DiscoveryCandidate.query.count() == 0
+
+
+@pytest.mark.parametrize("mode", ["global", "source", "completed_run"])
+def test_disabled_only_pending_jobs_are_not_replayed(store, mode):
+    source = store()
+    svc = service(Adapter([DiscoveryPage((descriptor(1),))]), lambda *a, **k: (_ for _ in ()).throw(TimeoutError()))
+    run_id = svc.discover_source(source.id)
+    source.enabled = False
+    db.session.commit()
+    sent = []
+    svc.dispatch = lambda name, ident, **kw: sent.append((name, ident))
+    if mode == "completed_run":
+        svc.continue_discovery(run_id)
+    else:
+        svc.replay_pending_dispatches(source.id if mode == "source" else None)
+    assert sent == []
+    assert ProcessingJob.query.one().error_category == "dispatch_pending"
+    source.enabled = True
+    db.session.commit()
+    svc.replay_pending_dispatches()
+    assert sent == [("process_item", ContentItem.query.one().id)]
+    assert ProcessingJob.query.one().error_category is None
+
+
+def test_pending_job_rechecks_enabled_membership_at_send_boundary(store, monkeypatch):
+    source = store()
+    svc = service(Adapter([DiscoveryPage((descriptor(1),))]))
+    original = svc._send
+    def disable_then_send(name, ident, **kw):
+        if name == "process_item":
+            source.enabled = False
+            db.session.commit()
+        return original(name, ident, **kw)
+    sent = []
+    svc.dispatch = lambda name, ident, **kw: sent.append((name, ident))
+    monkeypatch.setattr(svc, "_send", disable_then_send)
+    svc.discover_source(source.id)
+    assert sent == [] and ProcessingJob.query.one().error_category == "dispatch_pending"
+
+
+def test_disabling_source_after_first_send_leaves_remaining_jobs_pending(store):
+    source = store()
+    sent = []
+    def dispatch(name, ident, **kw):
+        if name == "process_item":
+            sent.append(ident)
+            source.enabled = False
+            db.session.commit()
+    svc = service(Adapter([DiscoveryPage(tuple(descriptor(n) for n in range(3)))]), dispatch)
+    svc.discover_source(source.id)
+    assert len(sent) == 1
+    assert ProcessingJob.query.filter_by(error_category="dispatch_pending").count() == 2
+
+
+def test_shared_pending_item_can_dispatch_via_another_enabled_membership(store):
+    disabled, enabled = store(identity="disabled"), store(identity="enabled")
+    svc = service(Adapter([DiscoveryPage((descriptor(1),))]), lambda *a, **k: (_ for _ in ()).throw(TimeoutError()))
+    svc.discover_source(disabled.id)
+    disabled.enabled = False
+    db.session.add(SourceItem(source_id=enabled.id, item_id=ContentItem.query.one().id))
+    db.session.commit()
+    sent = []
+    svc.dispatch = lambda name, ident, **kw: sent.append((name, ident))
+    svc.replay_pending_dispatches(disabled.id)
+    assert sent == [("process_item", ContentItem.query.one().id)]
+    assert ProcessingJob.query.one().error_category is None

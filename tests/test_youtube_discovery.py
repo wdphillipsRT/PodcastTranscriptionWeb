@@ -468,3 +468,44 @@ def test_public_completed_livestream_remains_discoverable():
         "actualStartTime": "2026-10-18T11:00:00Z", "actualEndTime": "2026-10-18T12:00:00Z"}
     client, _ = client_with(response(payload))
     assert client.resolve_video(f"https://youtu.be/{VIDEO}").external_id == VIDEO
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_exact_playlist_membership_lookup_is_one_bounded_official_request(present):
+    payload = fixture("playlist_page")
+    if not present:
+        payload["items"] = []
+    client, session = client_with(response(payload))
+    source = SourceDescriptor("youtube_playlist", PLAYLIST, f"https://youtube.com/playlist?list={PLAYLIST}", "List")
+    assert client.source_contains_video(source, VIDEO) is present
+    assert session.get.call_count == 1
+    assert session.get.call_args.args == (BASE + "/playlistItems",)
+    params = session.get.call_args.kwargs["params"]
+    assert params["playlistId"] == PLAYLIST and params["videoId"] == VIDEO and params["maxResults"] == 1
+    assert "pageToken" not in params
+
+
+@pytest.mark.parametrize("mutation", ["wrong_video", "wrong_playlist", "too_many", "private"])
+def test_playlist_membership_lookup_fails_closed_for_wrong_or_unsafe_response(mutation):
+    payload = fixture("playlist_page")
+    if mutation == "wrong_video":
+        payload["items"][0]["contentDetails"]["videoId"] = "abcdefghijk"
+    elif mutation == "wrong_playlist":
+        payload["items"][0]["snippet"]["playlistId"] = "PLzyxwvutsrqponmlkjihgfe"
+    elif mutation == "too_many":
+        payload["items"].append(deepcopy(payload["items"][0]))
+    else:
+        payload["items"][0]["status"]["privacyStatus"] = "private"
+    client, session = client_with(response(payload))
+    source = SourceDescriptor("youtube_playlist", PLAYLIST, f"https://youtube.com/playlist?list={PLAYLIST}", "List")
+    with pytest.raises(YouTubeDiscoveryError):
+        client.source_contains_video(source, VIDEO)
+    assert session.get.call_count == 1
+
+
+def test_playlist_membership_lookup_rejects_invalid_selectors_before_http():
+    client, session = client_with()
+    source = SourceDescriptor("youtube_playlist", "invalid", "https://youtube.com/", "List")
+    with pytest.raises(YouTubeDiscoveryError):
+        client.source_contains_video(source, VIDEO)
+    session.get.assert_not_called()

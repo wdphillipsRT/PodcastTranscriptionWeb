@@ -87,12 +87,18 @@ class DiscoveryService:
 
     def _send(self, name, identity, **options):
         positive_id(identity)
+        if name == "process_item" and not self._enabled_memberships(identity).first():
+            return False
         try:
             self.dispatch(name, identity, **options)
             return True
         except Exception:
             # Never retain exception strings, URLs or provider credentials.
             return False
+
+    def _enabled_memberships(self, item_id=None):
+        query = self.session.query(SourceItem.item_id).join(ContentSource).filter(ContentSource.enabled.is_(True))
+        return query.filter(SourceItem.item_id == item_id) if item_id is not None else query
 
     def _pending_run(self, source, run_type):
         run = self.session.query(DiscoveryRun).filter(
@@ -154,6 +160,8 @@ class DiscoveryService:
         adapter = self.adapter_factory(source)
         descriptor = source_descriptor(source)
         for _ in range(min(self.settings.YOUTUBE_MAX_PAGES_PER_TASK, 5)):
+            if request is not None:
+                request = self._locked(BackfillRequest, request.id)
             if self._cancelled(request):
                 return False
             run = self._locked(DiscoveryRun, run.id)
@@ -247,7 +255,9 @@ class DiscoveryService:
         return item.id, membership, job_created
 
     def replay_pending_dispatches(self, source_id=None):
-        query = self.session.query(ProcessingJob).filter_by(error_category="dispatch_pending")
+        query = self.session.query(ProcessingJob).filter(
+            ProcessingJob.error_category == "dispatch_pending",
+            ProcessingJob.item_id.in_(self._enabled_memberships()))
         if source_id is not None:
             query = query.join(ContentItem).join(SourceItem).filter(SourceItem.source_id == source_id)
         identities = [row.id for row in query.all()]
@@ -325,6 +335,21 @@ class DiscoveryService:
             self.session.flush()
         return run
 
+    def _resolve_owned_video(self, source, url):
+        identity = youtube_locator(url)[2]
+        if source.source_type == "youtube_video" and source.external_id != identity:
+            raise ValueError("explicit video does not belong to the selected source")
+        adapter = self.adapter_factory(source)
+        item = adapter.resolve_video(url)
+        owned = item.external_id == identity
+        if source.source_type == "youtube_channel":
+            owned = owned and item.channel_id == source.external_id
+        elif source.source_type == "youtube_playlist":
+            owned = owned and adapter.source_contains_video(source_descriptor(source), identity) is True
+        if not owned:
+            raise ValueError("explicit video does not belong to the selected source")
+        return item
+
     def run_backfill(self, request_id):
         request = self._locked(BackfillRequest, request_id)
         if request is None:
@@ -332,8 +357,8 @@ class DiscoveryService:
             return None
         self._validate_request(request)
         # Validation may canonicalize a persisted URL. Preserve that update
-        # before cancellation refreshes the row from a concurrent transaction.
-        self.session.commit()
+        # before refreshing, retaining the request lock through run creation.
+        self.session.flush()
         if request.state == "completed":
             self.session.commit()
             self.replay_pending_dispatches(request.source_id)
@@ -353,7 +378,7 @@ class DiscoveryService:
         self.session.commit()
         try:
             if request.selector_type == "explicit_url" and request.source.source_type.startswith("youtube_") and run.state != "finalizing":
-                item = self.adapter_factory(request.source).resolve_video(request.explicit_url)
+                item = self._resolve_owned_video(request.source, request.explicit_url)
                 self._stage(run, (item,))
                 run.state, request.items_scanned = "finalizing", run.items_scanned
                 self.session.commit()
@@ -365,30 +390,61 @@ class DiscoveryService:
         return request.id
 
     def _finalize_backfill(self, run, request):
-        accepted_now = 0
         examined_now = 0
-        maximum = min(self.settings.BACKFILL_REQUEST_MAX_ITEMS, 5000)
-        limit = request.requested_count if request.selector_type == "count" else maximum
-        if request.selector_type == "explicit_url":
-            limit = 1
         batch_limit = min(self.settings.YOUTUBE_MAX_ITEMS_PER_BACKFILL_TASK, 100)
-        candidates = self._ordered_candidates(run, batch_limit + 1)
-        matching_urls = self.session.query(DiscoveryCandidate.id).filter(
-            DiscoveryCandidate.run_id == run.id,
-            DiscoveryCandidate.descriptor["canonical_url"].as_string() == request.explicit_url
-        ).limit(2)
-        if request.selector_type == "explicit_url" and matching_urls.count() > 1:
-            raise ValueError("explicit item URL is ambiguous in available provider history")
-        for entry in candidates:
+        request_id, run_id = request.id, run.id
+        while True:
+            # A new transaction reacquires this lock after each committed item.
+            # No candidate snapshot or progress read survives the lock boundary.
+            request = self._locked(BackfillRequest, request_id)
+            if request.state == "completed":
+                self.session.commit()
+                self.replay_pending_dispatches(request.source_id)
+                return
             if self._cancelled(request):
                 return
-            if request.items_accepted >= limit:
-                break
-            if max(accepted_now, examined_now) >= batch_limit:
+            run = self._locked(DiscoveryRun, run_id)
+            if run.state != "finalizing":
                 self.session.commit()
                 self._send("run_backfill", request.id)
                 return
-            candidate = self._locked(DiscoveryCandidate, entry.id)
+            maximum = min(self.settings.BACKFILL_REQUEST_MAX_ITEMS, 5000)
+            limit = request.requested_count if request.selector_type == "count" else maximum
+            if request.selector_type == "explicit_url":
+                limit = 1
+                matching_urls = self.session.query(DiscoveryCandidate.id).filter(
+                    DiscoveryCandidate.run_id == run.id,
+                    DiscoveryCandidate.descriptor["canonical_url"].as_string() == request.explicit_url
+                ).limit(2)
+                if matching_urls.count() > 1:
+                    raise ValueError("explicit item URL is ambiguous in available provider history")
+            # Both terminal decisions and remaining-work reads happen under the
+            # request lock, before any commit can release it to another worker.
+            remaining_query = self.session.query(DiscoveryCandidate).filter(
+                DiscoveryCandidate.run_id == run.id, DiscoveryCandidate.descriptor.is_not(None))
+            if request.items_accepted >= limit or remaining_query.with_entities(DiscoveryCandidate.id).first() is None:
+                if request.items_accepted >= limit:
+                    remaining_query.update({"descriptor": None}, synchronize_session=False)
+                request.state, request.completed_at = "completed", utc_now()
+                run.state, run.completed_at = "completed", utc_now()
+                run.items_accepted, run.items_queued = request.items_accepted, request.items_queued
+                if request.source.source_type == "podcast_rss":
+                    request.error_category = "rss_history_limited"
+                self.session.commit()
+                self.replay_pending_dispatches(request.source_id)
+                return
+            if examined_now >= batch_limit:
+                self.session.commit()
+                self._send("run_backfill", request.id)
+                return
+            candidates = self._ordered_candidates(run, 1)
+            if not candidates:
+                # Defensive against an externally changed/inconsistent snapshot:
+                # known remaining work is never cleared on an empty batch.
+                self.session.commit()
+                self._send("run_backfill", request.id)
+                return
+            candidate = self._locked(DiscoveryCandidate, candidates[0].id)
             if candidate.descriptor is None:
                 self.session.commit()
                 continue
@@ -405,21 +461,13 @@ class DiscoveryService:
                 request.items_accepted += 1
                 request.items_queued += int(queued)
                 run.items_accepted, run.items_queued = request.items_accepted, request.items_queued
-                accepted_now += 1
             else:
                 candidate.descriptor = None
-            request.cursor = json.dumps({"after": candidate.id}, separators=(",", ":"))
+            self.session.flush()
+            request.cursor = json.dumps({"after": candidate.id, "remaining": remaining_query.with_entities(DiscoveryCandidate.id).first() is not None},
+                                        separators=(",", ":"))
             self.session.commit()
             self.replay_pending_dispatches(request.source_id)
-        if self._cancelled(request):
-            return
-        self.session.query(DiscoveryCandidate).filter_by(run_id=run.id).update({"descriptor": None}, synchronize_session="fetch")
-        request.state, request.completed_at = "completed", utc_now()
-        run.state, run.completed_at = "completed", utc_now()
-        if request.source.source_type == "podcast_rss":
-            request.error_category = "rss_history_limited"
-        self.session.commit()
-        self.replay_pending_dispatches(request.source_id)
 
     def check_all_sources(self):
         self.replay_pending_dispatches()

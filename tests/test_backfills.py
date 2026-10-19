@@ -233,3 +233,149 @@ def test_failed_backfill_scan_replays_with_clean_run_status(store):
     svc.run_backfill(row.id)
     assert row.state == run.state == "completed"
     assert run.started_at and run.completed_at and run.error_category is None
+
+
+def staged_request(source, svc, count=205):
+    row = request(source, selector_type="count", requested_count=count)
+    row.state = "running"
+    run = DiscoveryRun(source_id=source.id, backfill_id=row.id, run_type="backfill", state="finalizing")
+    db.session.add(run)
+    db.session.flush()
+    svc._stage(run, tuple(descriptor(n) for n in range(count)))
+    row.items_scanned = count
+    db.session.commit()
+    return row, run
+
+
+def test_205_item_interleaving_does_not_complete_at_101_and_clear_remaining(store, monkeypatch):
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc)
+    original = svc._ordered_candidates
+    interleaved = False
+    def paused_snapshot(active_run, limit=None):
+        nonlocal interleaved
+        snapshot = original(active_run, limit)
+        if not interleaved:
+            interleaved = True
+            # Reproduce B accepting the first 100 while A holds a stale batch.
+            for candidate in original(active_run, 100):
+                svc._accept(source, candidate)
+                row.items_accepted += 1
+                row.items_queued += 1
+                db.session.commit()
+        return snapshot
+    monkeypatch.setattr(svc, "_ordered_candidates", paused_snapshot)
+    svc._finalize_backfill(run, row)
+    remaining = DiscoveryCandidate.query.filter(DiscoveryCandidate.descriptor.is_not(None)).count()
+    assert row.state == "running" and remaining > 0
+    assert row.items_accepted == 200 and remaining == 5
+    assert row.items_accepted + remaining == 205
+    svc.run_backfill(row.id)
+    assert row.state == "completed" and row.items_accepted == ContentItem.query.count() == 205
+
+
+def test_request_for_update_lock_covers_candidate_reads_and_completion(store):
+    from sqlalchemy.dialects import postgresql
+    source = store()
+    svc = service(Adapter([]))
+    row, run = staged_request(source, svc, 2)
+    locked = False
+    locks = []
+    session = db.session()
+    def committed(session):
+        nonlocal locked
+        if not session.in_nested_transaction():
+            locked = False
+    def before_read(context):
+        nonlocal locked
+        if not context.is_select:
+            return
+        statement = context.statement
+        entities = {value.get("entity") for value in statement.column_descriptions}
+        if BackfillRequest in entities and statement._for_update_arg is not None:
+            locked = True
+            locks.append(str(statement.compile(dialect=postgresql.dialect())))
+        if DiscoveryCandidate in entities:
+            assert locked, "candidate selection/remaining-work reads require the request FOR UPDATE lock"
+    def before_flush(session, context, instances):
+        if any(isinstance(value, (BackfillRequest, ContentItem, SourceItem)) for value in session.dirty | session.new):
+            assert locked, "acceptance/progress/completion must commit while holding the request lock"
+    sa.event.listen(session, "do_orm_execute", before_read)
+    sa.event.listen(session, "after_commit", committed)
+    sa.event.listen(session, "before_flush", before_flush)
+    try:
+        svc._finalize_backfill(run, row)
+    finally:
+        sa.event.remove(session, "do_orm_execute", before_read)
+        sa.event.remove(session, "after_commit", committed)
+        sa.event.remove(session, "before_flush", before_flush)
+    assert locks and all("FOR UPDATE" in sql for sql in locks)
+    assert row.state == "completed" and row.items_accepted == 2
+
+
+def test_empty_local_candidate_batch_cannot_clear_known_remaining_work(store, monkeypatch):
+    source = store()
+    sent = []
+    svc = service(Adapter([]), lambda name, ident, **kw: sent.append((name, ident)))
+    row, run = staged_request(source, svc, 205)
+    monkeypatch.setattr(svc, "_ordered_candidates", lambda active_run, limit=None: [])
+    svc._finalize_backfill(run, row)
+    assert row.state == "running" and row.items_accepted == 0
+    assert DiscoveryCandidate.query.filter(DiscoveryCandidate.descriptor.is_not(None)).count() == 205
+    assert sent == [("run_backfill", row.id)]
+
+
+def test_backfill_cannot_finalize_before_provider_pagination_exhausts(store):
+    source = store()
+    sent = []
+    svc = service(Adapter([]), lambda name, ident, **kw: sent.append((name, ident)))
+    row, run = staged_request(source, svc, 2)
+    run.state, run.cursor = "scanning", "next-page"
+    db.session.commit()
+    svc._finalize_backfill(run, row)
+    assert row.state == "running" and row.items_accepted == 0
+    assert DiscoveryCandidate.query.filter(DiscoveryCandidate.descriptor.is_not(None)).count() == 2
+    assert sent == [("run_backfill", row.id)]
+
+
+@pytest.mark.parametrize("kind,identity,channel,member,accepted", [
+    ("youtube_video", "abcdefghijk", "channel", True, True),
+    ("youtube_video", "zyxwvutsrqp", "channel", True, False),
+    ("youtube_channel", "channel", "channel", True, True),
+    ("youtube_channel", "channel", "other", True, False),
+    ("youtube_playlist", "selected-playlist", "channel", True, True),
+    ("youtube_playlist", "selected-playlist", "channel", False, False),
+])
+def test_explicit_youtube_video_must_belong_to_selected_source(store, kind, identity, channel, member, accepted):
+    source = store(kind, identity)
+    row = request(source, selector_type="explicit_url", explicit_url="https://youtu.be/abcdefghijk")
+    adapter = Adapter([])
+    adapter.channel_id, adapter.contains_video = channel, member
+    service(adapter).run_backfill(row.id)
+    assert row.state == ("completed" if accepted else "failed")
+    assert ContentItem.query.count() == SourceItem.query.count() == int(accepted)
+    assert DiscoveryCandidate.query.count() == int(accepted)
+    if kind == "youtube_playlist":
+        assert adapter.membership_lookup == (identity, "abcdefghijk")
+
+
+def test_podcast_explicit_url_outside_selected_feed_cannot_be_attached(store):
+    source = store()
+    row = request(source, selector_type="explicit_url", explicit_url="https://another-feed.example/episode")
+    service(Adapter([DiscoveryPage((descriptor(1),))])).run_backfill(row.id)
+    assert row.state == "completed" and row.items_accepted == SourceItem.query.count() == 0
+
+
+def test_disabled_completed_backfill_does_not_publish_pending_jobs(store):
+    source = store()
+    row = request(source, selector_type="count", requested_count=1)
+    svc = service(Adapter([DiscoveryPage((descriptor(1),))]), lambda *a, **k: (_ for _ in ()).throw(TimeoutError()))
+    svc.run_backfill(row.id)
+    source.enabled = False
+    db.session.commit()
+    sent = []
+    svc.dispatch = lambda name, ident, **kw: sent.append((name, ident))
+    svc.run_backfill(row.id)
+    assert row.state == "completed" and sent == []
+    assert ProcessingJob.query.one().error_category == "dispatch_pending"
