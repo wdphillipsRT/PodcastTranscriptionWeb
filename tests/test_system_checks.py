@@ -126,6 +126,9 @@ def test_database_requires_connectivity_and_exact_migration_head(checks, tmp_pat
     assert checks._check_database(config) is False
     with engine.begin() as connection:
         connection.execute(text("UPDATE alembic_version SET version_num = '0001_media_foundation'"))
+    assert checks._check_database(config) is False
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE alembic_version SET version_num = '0002_commercial_classification'"))
     assert checks._check_database(config) is True
     engine.dispose()
 
@@ -136,7 +139,7 @@ def test_postgres_probe_bounds_connection_and_statement_timeouts(checks, monkeyp
     create = MagicMock(return_value=engine)
     monkeypatch.setattr(checks, "create_engine", create)
     context = MagicMock()
-    context.configure.return_value.get_current_heads.return_value = ("0001_media_foundation",)
+    context.configure.return_value.get_current_heads.return_value = ("0002_commercial_classification",)
     monkeypatch.setattr(checks, "MigrationContext", context)
     checks._check_database({"SQLALCHEMY_DATABASE_URI": "postgresql://name:secret@db/app"})
     options = create.call_args.kwargs["connect_args"]

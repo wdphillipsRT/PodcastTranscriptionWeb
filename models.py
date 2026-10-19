@@ -25,6 +25,11 @@ SELECTOR_TYPES = ("date_range", "count", "explicit_url")
 BACKFILL_STATES = ("pending", "running", "completed", "cancelled", "failed")
 JOB_STAGES = ("podcast_audio", "youtube_captions", "youtube_audio", "transcribe", "normalize")
 JOB_STATES = ("pending", "running", "retrying", "completed", "failed")
+CLASSIFICATION_STATES = ("pending", "running", "retrying", "completed", "failed", "superseded")
+CLASSIFICATION_REASONS = ("transcript_completed", "backfill", "override", "policy_upgrade", "source_rule", "manual_retry", "live_smoke")
+RULE_SCAN_STATES = ("pending", "running", "completed", "failed")
+CLASSIFICATION_BLOCK_STATES = ("pending", "running", "completed", "failed", "superseded")
+CLASSIFICATION_LABELS = ("editorial", "paid_commercial", "self_promotion", "cross_promotion", "housekeeping", "uncertain")
 
 
 def utc_now():
@@ -231,6 +236,13 @@ class ContentItem(Timestamps, db.Model):
     transcription_provider = db.Column(db.String(64))
     transcription_job_name = db.Column(db.String(200))
     language = db.Column(db.String(16))
+    active_classification_revision_id = db.Column(db.Integer, db.ForeignKey(
+        "classification_revisions.id", name="fk_content_items_active_classification_revision",
+        ondelete="SET NULL", use_alter=True), index=True)
+    active_classification_revision = db.relationship("ClassificationRevision",
+        foreign_keys=[active_classification_revision_id], post_update=True)
+    classification_revisions = db.relationship("ClassificationRevision", back_populates="item",
+        foreign_keys="ClassificationRevision.item_id", cascade="all, delete-orphan", passive_deletes=True)
     admin = db.relationship("Admin", back_populates="items")
     sources = db.relationship("SourceItem", back_populates="item", cascade="all, delete-orphan", passive_deletes=True)
     processing_jobs = db.relationship("ProcessingJob", back_populates="item", cascade="all, delete-orphan", passive_deletes=True)
@@ -379,4 +391,168 @@ class ProcessingJob(Timestamps, db.Model):
         enum_check("stage", JOB_STAGES, "ck_processing_jobs_stage"),
         enum_check("state", JOB_STATES, "ck_processing_jobs_state"),
         sa.CheckConstraint("attempts >= 0", name="ck_processing_jobs_attempts"),
+    )
+
+
+class ClassificationRevision(Timestamps, db.Model):
+    """Audited classifier inputs and immutable completed artifact references."""
+
+    __tablename__ = "classification_revisions"
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey("content_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_id = db.Column(db.Integer, db.ForeignKey("content_sources.id", ondelete="CASCADE"), nullable=False, index=True)
+    previous_revision_id = db.Column(db.Integer, db.ForeignKey("classification_revisions.id", ondelete="SET NULL"), index=True)
+    revision = db.Column(db.Integer, nullable=False)
+    request_reason = db.Column(db.String(32), nullable=False)
+    state = db.Column(db.String(32), nullable=False, default="pending", server_default="pending", index=True)
+    attempts = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    celery_task_id = db.Column(db.String(255))
+    transcript_sha256 = db.Column(db.String(64), nullable=False)
+    segments_sha256 = db.Column(db.String(64), nullable=False)
+    input_identity_sha256 = db.Column(db.String(64), nullable=False)
+    idempotency_key = db.Column(db.String(255), nullable=False)
+    policy_version = db.Column(db.String(128), nullable=False)
+    prompt_version = db.Column(db.String(128), nullable=False)
+    prompt_sha256 = db.Column(db.String(64), nullable=False)
+    requested_model = db.Column(db.String(128), nullable=False)
+    resolved_model = db.Column(db.String(128))
+    classifier_cli_version = db.Column(db.String(128), nullable=False)
+    source_rule_set_sha256 = db.Column(db.String(64), nullable=False)
+    override_set_sha256 = db.Column(db.String(64), nullable=False)
+    policy_s3_key = db.Column(db.String(2048))
+    policy_sha256 = db.Column(db.String(64))
+    projection_s3_key = db.Column(db.String(2048))
+    projection_sha256 = db.Column(db.String(64))
+    included_segments = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    excluded_segments = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    uncertain_segments = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    included_milliseconds = db.Column(db.BigInteger, nullable=False, default=0, server_default="0")
+    excluded_milliseconds = db.Column(db.BigInteger, nullable=False, default=0, server_default="0")
+    uncertain_milliseconds = db.Column(db.BigInteger, nullable=False, default=0, server_default="0")
+    total_cost_microusd = db.Column(db.BigInteger, nullable=False, default=0, server_default="0")
+    review_required = db.Column(db.Boolean, nullable=False, default=False, server_default=sa.false())
+    heartbeat_at = db.Column(UTCDateTime())
+    started_at = db.Column(UTCDateTime())
+    completed_at = db.Column(UTCDateTime())
+    error_category = db.Column(db.String(64))
+    item = db.relationship("ContentItem", back_populates="classification_revisions", foreign_keys=[item_id])
+    source = db.relationship("ContentSource")
+    previous_revision = db.relationship("ClassificationRevision", remote_side=[id], foreign_keys=[previous_revision_id])
+    blocks = db.relationship("ClassificationBlock", back_populates="revision", cascade="all, delete-orphan", passive_deletes=True)
+    __table_args__ = (
+        sa.UniqueConstraint("item_id", "transcript_sha256", "revision", name="uq_classification_revisions_item_transcript_revision"),
+        sa.UniqueConstraint("item_id", "idempotency_key", name="uq_classification_revisions_item_idempotency"),
+        enum_check("state", CLASSIFICATION_STATES, "ck_classification_revisions_state"),
+        enum_check("request_reason", CLASSIFICATION_REASONS, "ck_classification_revisions_reason"),
+        sa.CheckConstraint("revision > 0", name="ck_classification_revisions_revision"),
+        sa.CheckConstraint("attempts >= 0", name="ck_classification_revisions_attempts"),
+        sa.CheckConstraint("included_segments >= 0 AND excluded_segments >= 0 AND uncertain_segments >= 0 "
+            "AND included_milliseconds >= 0 AND excluded_milliseconds >= 0 AND uncertain_milliseconds >= 0 "
+            "AND total_cost_microusd >= 0", name="ck_classification_revisions_totals"),
+        sa.CheckConstraint("state != 'completed' OR (policy_s3_key IS NOT NULL AND policy_sha256 IS NOT NULL "
+            "AND projection_s3_key IS NOT NULL AND projection_sha256 IS NOT NULL "
+            "AND resolved_model IS NOT NULL AND completed_at IS NOT NULL AND error_category IS NULL)", name="ck_classification_revisions_completed"),
+    )
+
+
+@sa.event.listens_for(ClassificationRevision, "before_update")
+def _immutable_completed_classification(_mapper, connection, target):
+    state = sa.inspect(target)
+    if not any(state.attrs[column.key].history.has_changes() for column in state.mapper.column_attrs):
+        return
+    persisted_state = connection.scalar(sa.select(ClassificationRevision.__table__.c.state).where(
+        ClassificationRevision.__table__.c.id == state.identity[0]))
+    if persisted_state == "completed":
+        raise ValueError("completed classification revisions are immutable")
+
+
+class ClassificationBlock(Timestamps, db.Model):
+    __tablename__ = "classification_blocks"
+    id = db.Column(db.Integer, primary_key=True)
+    revision_id = db.Column(db.Integer, db.ForeignKey("classification_revisions.id", ondelete="CASCADE"), nullable=False, index=True)
+    ordinal = db.Column(db.Integer, nullable=False)
+    state = db.Column(db.String(32), nullable=False, default="pending", server_default="pending", index=True)
+    attempts = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    target_first_segment_id = db.Column(db.String(27), nullable=False)
+    target_last_segment_id = db.Column(db.String(27), nullable=False)
+    input_sha256 = db.Column(db.String(64), nullable=False)
+    decision_s3_key = db.Column(db.String(2048))
+    decision_sha256 = db.Column(db.String(64))
+    cost_microusd = db.Column(db.BigInteger, nullable=False, default=0, server_default="0")
+    heartbeat_at = db.Column(UTCDateTime())
+    started_at = db.Column(UTCDateTime())
+    completed_at = db.Column(UTCDateTime())
+    error_category = db.Column(db.String(64))
+    revision = db.relationship("ClassificationRevision", back_populates="blocks")
+    __table_args__ = (
+        sa.UniqueConstraint("revision_id", "ordinal", name="uq_classification_blocks_revision_ordinal"),
+        enum_check("state", CLASSIFICATION_BLOCK_STATES, "ck_classification_blocks_state"),
+        sa.CheckConstraint("ordinal > 0", name="ck_classification_blocks_ordinal"),
+        sa.CheckConstraint("attempts >= 0 AND cost_microusd >= 0", name="ck_classification_blocks_counters"),
+        sa.CheckConstraint("state != 'completed' OR (decision_s3_key IS NOT NULL AND decision_sha256 IS NOT NULL "
+            "AND completed_at IS NOT NULL)", name="ck_classification_blocks_completed"),
+    )
+
+
+class SegmentOverride(db.Model):
+    __tablename__ = "segment_overrides"
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey("content_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_id = db.Column(db.Integer, db.ForeignKey("content_sources.id", ondelete="CASCADE"), nullable=False, index=True)
+    transcript_sha256 = db.Column(db.String(64), nullable=False)
+    policy_revision_id = db.Column(db.Integer, db.ForeignKey("classification_revisions.id", ondelete="SET NULL"), index=True)
+    first_segment_id = db.Column(db.String(27), nullable=False)
+    last_segment_id = db.Column(db.String(27), nullable=False)
+    label = db.Column(db.String(32), nullable=False)
+    range_fingerprint_sha256 = db.Column(db.String(64), nullable=False)
+    supersedes_id = db.Column(db.Integer, db.ForeignKey("segment_overrides.id", ondelete="SET NULL"), index=True)
+    admin_id = db.Column(db.Integer, db.ForeignKey("admins.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = db.Column(UTCDateTime(), nullable=False, default=utc_now, server_default=sa.func.now())
+    item = db.relationship("ContentItem")
+    source = db.relationship("ContentSource")
+    policy_revision = db.relationship("ClassificationRevision")
+    supersedes = db.relationship("SegmentOverride", remote_side=[id], foreign_keys=[supersedes_id])
+    admin = db.relationship("Admin")
+    __table_args__ = (enum_check("label", CLASSIFICATION_LABELS, "ck_segment_overrides_label"),)
+
+
+class SourceClassificationRule(db.Model):
+    __tablename__ = "source_classification_rules"
+    id = db.Column(db.Integer, primary_key=True)
+    source_id = db.Column(db.Integer, db.ForeignKey("content_sources.id", ondelete="CASCADE"), nullable=False, index=True)
+    originating_override_id = db.Column(db.Integer, db.ForeignKey("segment_overrides.id", ondelete="SET NULL"), index=True)
+    fingerprint_sha256 = db.Column(db.String(64), nullable=False)
+    label = db.Column(db.String(32), nullable=False)
+    fingerprint_version = db.Column(db.String(128), nullable=False)
+    supersedes_id = db.Column(db.Integer, db.ForeignKey("source_classification_rules.id", ondelete="SET NULL"), index=True)
+    created_at = db.Column(UTCDateTime(), nullable=False, default=utc_now, server_default=sa.func.now())
+    source = db.relationship("ContentSource")
+    originating_override = db.relationship("SegmentOverride")
+    supersedes = db.relationship("SourceClassificationRule", remote_side=[id], foreign_keys=[supersedes_id])
+    __table_args__ = (
+        sa.UniqueConstraint("source_id", "fingerprint_version", "fingerprint_sha256", "label",
+            name="uq_source_classification_rules_fingerprint_label"),
+        enum_check("label", CLASSIFICATION_LABELS, "ck_source_classification_rules_label"),
+    )
+
+
+class ClassificationSweep(Timestamps, db.Model):
+    __tablename__ = "classification_sweeps"
+    id = db.Column(db.Integer, primary_key=True)
+    source_id = db.Column(db.Integer, db.ForeignKey("content_sources.id", ondelete="CASCADE"), nullable=False, index=True)
+    rule_id = db.Column(db.Integer, db.ForeignKey("source_classification_rules.id", ondelete="CASCADE"), nullable=False, index=True)
+    state = db.Column(db.String(32), nullable=False, default="pending", server_default="pending", index=True)
+    cursor_item_id = db.Column(db.Integer)
+    items_scanned = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    items_queued = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    celery_task_id = db.Column(db.String(255))
+    error_category = db.Column(db.String(64))
+    started_at = db.Column(UTCDateTime())
+    completed_at = db.Column(UTCDateTime())
+    source = db.relationship("ContentSource")
+    rule = db.relationship("SourceClassificationRule")
+    __table_args__ = (
+        enum_check("state", RULE_SCAN_STATES, "ck_classification_sweeps_state"),
+        sa.CheckConstraint("items_scanned >= 0 AND items_queued >= 0", name="ck_classification_sweeps_counters"),
+        sa.CheckConstraint("cursor_item_id IS NULL OR cursor_item_id > 0", name="ck_classification_sweeps_cursor"),
     )
