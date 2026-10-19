@@ -641,3 +641,41 @@ def test_verified_download_cleanup_preserves_replaced_destination(tmp_path, monk
     with pytest.raises(s3_utils.StoragePermanentError):
         storage.download_file_verified(KEY, destination, expected_sha256=sha256(b"audio").hexdigest(), max_bytes=5)
     assert destination.read_bytes() == b"keep" and body.closed
+
+
+@pytest.mark.parametrize("acquisition", ["fstat", "fdopen"])
+@pytest.mark.parametrize("close_failure", [False, True])
+@pytest.mark.parametrize("replacement", [False, True])
+def test_verified_download_acquisition_cleanup_is_safe(
+        tmp_path, monkeypatch, acquisition, close_failure, replacement):
+    storage, client = manager()
+    destination = tmp_path / "SECRET-audio.mp3"
+    moved = tmp_path / "original.mp3"
+    descriptors, closed = [], []
+    real_close, real_fstat = os.close, os.fstat
+    def fail_acquisition(fd, *args):
+        descriptors.append(fd)
+        if replacement:
+            destination.rename(moved)
+            destination.write_bytes(b"keep")
+        raise OSError(f"SECRET acquisition {KEY} {destination}")
+    def close_descriptor(fd):
+        closed.append(fd)
+        real_close(fd)
+        if close_failure:
+            raise OSError(f"SECRET close {KEY} {destination}")
+    monkeypatch.setattr(os, acquisition, fail_acquisition)
+    monkeypatch.setattr(os, "close", close_descriptor)
+    with pytest.raises(s3_utils.StoragePermanentError) as caught:
+        storage.download_file_verified(KEY, destination, expected_sha256="a" * 64, max_bytes=5)
+    assert "SECRET" not in str(caught.value)
+    assert KEY not in str(caught.value) and str(destination) not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert closed == descriptors and len(closed) == 1
+    with pytest.raises(OSError):
+        real_fstat(descriptors[0])
+    if replacement:
+        assert destination.read_bytes() == b"keep"
+    else:
+        assert not destination.exists()
+    client.get_object.assert_not_called()

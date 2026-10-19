@@ -438,7 +438,21 @@ class S3Manager:
             _failure(error)
         finally:
             if descriptor is not None:
-                os.close(descriptor)
+                if identity is None:
+                    try:
+                        # fstat may have failed during acquisition. Recover
+                        # identity from the still-owned descriptor, never from
+                        # the path, which could already name a replacement.
+                        created = os.stat(descriptor)
+                        identity = (created.st_dev, created.st_ino)
+                    except OSError:
+                        pass
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    # A failed close must not skip unlink or expose diagnostics.
+                    # Do not retry: the descriptor may already be released.
+                    pass
             if not complete and identity is not None:
                 try:
                     current = destination.lstat()
