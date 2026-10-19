@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import importlib
 import json
+import logging
 import subprocess
 import threading
 from types import SimpleNamespace
@@ -183,6 +184,70 @@ def test_transcribe_uses_authenticated_minimal_list(checks, monkeypatch):
     client.list_transcription_jobs.assert_called_once_with(MaxResults=1)
     assert factory.call_args.args == ("transcribe",)
     assert factory.call_args.kwargs["config"].signature_version != "unsigned"
+
+
+@pytest.mark.parametrize("service", ["s3", "transcribe"])
+@pytest.mark.parametrize("override", ["global_environment", "service_environment", "global_shared_config", "service_shared_config", "explicit_application_config"])
+def test_aws_readiness_ignores_endpoint_overrides_without_network_or_secret_output(
+        checks, monkeypatch, tmp_path, capsys, caplog, service, override):
+    from botocore.httpsession import URLLib3Session
+
+    marker = "endpoint-override-secret"
+    caplog.set_level(logging.DEBUG, logger="botocore")
+    hostile = "https://" + marker + ".invalid"
+    for name in ("AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL_TRANSCRIBE",
+                 "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_USE_FIPS_ENDPOINT", "AWS_USE_DUALSTACK_ENDPOINT"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in {
+        "AWS_ACCESS_KEY_ID": "readiness-test-key", "AWS_SECRET_ACCESS_KEY": "readiness-test-secret",
+        "AWS_SESSION_TOKEN": "readiness-test-session-token", "AWS_EC2_METADATA_DISABLED": "true",
+        "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS": "false",
+        "AWS_CONFIG_FILE": str(tmp_path / "aws-config"),
+        "AWS_SHARED_CREDENTIALS_FILE": str(tmp_path / "absent-credentials"),
+    }.items():
+        monkeypatch.setenv(name, value)
+    shared = "[default]\nregion = us-east-1\nignore_configured_endpoint_urls = false\n"
+    config = {"AWS_REGION": "us-west-2"}
+    if override == "global_environment":
+        monkeypatch.setenv("AWS_ENDPOINT_URL", hostile)
+    elif override == "service_environment":
+        monkeypatch.setenv("AWS_ENDPOINT_URL_" + service.upper(), hostile)
+    elif override == "global_shared_config":
+        shared += "endpoint_url = " + hostile + "\n"
+    elif override == "service_shared_config":
+        shared += "services = hostile-services\n\n[services hostile-services]\n" + service + " =\n  endpoint_url = " + hostile + "\n"
+    else:
+        config.update(endpoint_url=hostile, AWS_ENDPOINT_URL=hostile,
+                      **{"AWS_ENDPOINT_URL_" + service.upper(): hostile})
+    (tmp_path / "aws-config").write_text(shared)
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("endpoint resolution must not use the network")
+    monkeypatch.setattr(URLLib3Session, "send", no_network)
+    # A fresh real SDK session exercises environment/shared-config precedence;
+    # client construction and endpoint resolution perform no service requests.
+    session = checks.boto3.Session()
+    supplied = []
+    def create_client(service_name, **kwargs):
+        supplied.append(kwargs["config"])
+        return session.client(service_name, **kwargs)
+    monkeypatch.setattr(checks.boto3, "client", create_client)
+    client = checks._aws_client(service, config)
+    try:
+        assert client.meta.endpoint_url == "https://" + service + ".us-west-2.amazonaws.com"
+        # Botocore consumes this option during construction and does not retain
+        # it on the reconstructed client.meta.config object.
+        assert supplied[0].ignore_configured_endpoint_urls is True
+        credentials = client._request_signer._credentials.get_frozen_credentials()
+        assert (credentials.access_key, credentials.secret_key, credentials.token) == (
+            "readiness-test-key", "readiness-test-secret", "readiness-test-session-token")
+    finally:
+        client.close()
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err
+    assert marker not in caplog.text
+    assert "readiness-test-secret" not in caplog.text
+    assert "readiness-test-session-token" not in caplog.text
 
 
 @pytest.mark.parametrize("status,body,expected", [

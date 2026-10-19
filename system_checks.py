@@ -61,9 +61,10 @@ def _check_redis(config):
 
 
 def _aws_client(service, config):
-    # Explicit region/signing; use the normal SDK credential chain. Do not
-    # accept an endpoint override from application settings.
+    # Explicit region/signing; use the normal SDK credential chain. Ignore
+    # endpoint overrides from environment/shared config as well as app settings.
     return boto3.client(service, region_name=config["AWS_REGION"], config=SDKConfig(
+        ignore_configured_endpoint_urls=True,
         signature_version="s3v4" if service == "s3" else "v4",
         connect_timeout=2, read_timeout=2, retries={"total_max_attempts": 1}))
 

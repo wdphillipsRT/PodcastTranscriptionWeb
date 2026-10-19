@@ -69,8 +69,8 @@ def test_commands_named_queues_beat_and_only_bounded_worker_tmpfs(compose):
             assert not service.get("tmpfs")
     beat = services["beat"]
     assert beat["command"][:4] == ["celery", "-A", "tasks.celery_app", "beat"]
-    assert beat["environment"]["SYSTEM_CHECK_SERVICES"] == "database,redis,beat"
-    assert beat["entrypoint"] == ["/app/scripts/start-worker.sh"]
+    assert beat["entrypoint"] == ["/app/scripts/start-beat.sh"]
+    assert all("SYSTEM_CHECK_SERVICES" not in service.get("environment", {}) for service in services.values())
     assert services["web"]["entrypoint"] == ["/app/scripts/start-web.sh"]
     assert services["web"]["command"][-1] == "app:create_app()"
 
@@ -116,8 +116,12 @@ def test_direct_python_runtime_and_dev_requirements_are_pinned():
     assert "PyYAML==6.0.3" in (ROOT / "requirements-dev.txt").read_text().splitlines()
 
 
-@pytest.mark.parametrize("script", ["start-web.sh", "start-worker.sh"])
-def test_startup_scripts_fail_closed_and_preserve_exec_arguments(script, tmp_path):
+@pytest.mark.parametrize("script,selection", [
+    ("start-web.sh", "database,redis,s3,transcribe,youtube,yt_dlp,deno"),
+    ("start-worker.sh", "database,redis,s3,transcribe,youtube,yt_dlp,deno"),
+    ("start-beat.sh", "database,redis,beat"),
+])
+def test_startup_scripts_fail_closed_and_preserve_exec_arguments(script, selection, tmp_path):
     path = ROOT / "scripts" / script
     assert path.exists(), "startup checks must exist"
     content = path.read_text()
@@ -135,13 +139,16 @@ def test_startup_scripts_fail_closed_and_preserve_exec_arguments(script, tmp_pat
     arguments = [str(path), "/bin/printf", "%s", "literal $(echo secret)"]
     result = subprocess.run(arguments, env=environment, capture_output=True, text=True, timeout=3)
     assert result.returncode == 0
-    assert "database,redis,s3,transcribe,youtube,yt_dlp,deno" in result.stdout
+    assert result.stdout.splitlines()[0] == "--app app:create_app system check --services " + selection
     assert result.stdout.endswith("literal $(echo secret)")
     result = subprocess.run(arguments, env={**environment, "GUARD_EXIT": "1"}, capture_output=True, text=True, timeout=3)
     assert result.returncode == 1 and "literal" not in result.stdout
-    if script == "start-worker.sh":
-        result = subprocess.run(arguments, env={**environment, "SYSTEM_CHECK_SERVICES": "database,redis,beat"}, capture_output=True, text=True, timeout=3)
-        assert "database,redis,beat" in result.stdout
+    for hostile in ("beat", "database,redis,beat", "", "redis; echo injected-secret", "s3", "unknown"):
+        result = subprocess.run(arguments, env={**environment, "SYSTEM_CHECK_SERVICES": hostile}, capture_output=True, text=True, timeout=3)
+        assert result.returncode == 0
+        assert result.stdout.splitlines()[0] == "--app app:create_app system check --services " + selection
+        assert result.stdout.endswith("literal $(echo secret)")
+    assert "SYSTEM_CHECK_SERVICES" not in content
 
 
 def test_dockerignore_excludes_sensitive_and_local_material_but_ships_app_assets():
@@ -152,5 +159,5 @@ def test_dockerignore_excludes_sensitive_and_local_material_but_ships_app_assets
         return any(fnmatch.fnmatch(name, pattern) or name.startswith(pattern.rstrip("/") + "/") for pattern in patterns)
     for name in (".env", ".env.prod", ".aws/credentials", "credentials.json", "secret.pem", ".git/config", ".worktrees/other/app.py", ".venv/lib/pkg.py", "tests/test_auth.py", ".pytest_cache/v/cache", "__pycache__/app.pyc", "data/database.sqlite", ".superpowers/sdd/task.md"):
         assert excluded(name), name
-    for name in ("migrations/env.py", "migrations/versions/0001_media_foundation.py", "templates/index.html", "static/app.css", "scripts/start-web.sh"):
+    for name in ("migrations/env.py", "migrations/versions/0001_media_foundation.py", "templates/index.html", "static/app.css", "scripts/start-web.sh", "scripts/start-worker.sh", "scripts/start-beat.sh"):
         assert not excluded(name), name

@@ -75,9 +75,7 @@ services:
 
   beat:
     <<: *app
-    entrypoint: [/app/scripts/start-worker.sh]
-    environment:
-      SYSTEM_CHECK_SERVICES: database,redis,beat
+    entrypoint: [/app/scripts/start-beat.sh]
     command: [celery, -A, tasks.celery_app, beat, --loglevel=info, --schedule, /tmp/celerybeat-schedule, --pidfile, /tmp/celerybeat.pid]
 
 volumes:
