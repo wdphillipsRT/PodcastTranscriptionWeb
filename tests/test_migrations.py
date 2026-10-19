@@ -6,6 +6,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
+import pytest
 
 from extensions import db
 
@@ -60,3 +61,28 @@ def test_initial_migration_upgrade_schema_and_downgrade(app_factory, tmp_path):
     # A fresh upgrade after downgrade catches stale indexes and broken reversibility.
     result = runner.invoke(args=["db", "upgrade"])
     assert result.exit_code == 0, result.output + repr(result.exception)
+
+
+def test_migrated_storage_accepts_public_selectors_and_rejects_signed_bindings(app_factory, tmp_path):
+    m = importlib.import_module("models")
+    app = app_factory(SQLALCHEMY_DATABASE_URI=f"sqlite:///{tmp_path / 'locator-migration.sqlite'}")
+    result = app.test_cli_runner().invoke(args=["db", "upgrade"])
+    assert result.exit_code == 0, result.output
+    with app.app_context():
+        owner = m.Admin(email="owner@example.org", password_hash="test")
+        db.session.add(owner)
+        db.session.flush()
+        origin = m.ContentSource(admin_id=owner.id, source_type="podcast_rss", external_id="feed",
+            canonical_url="https://example.org/feed?show=2", name="Selectors")
+        db.session.add(origin)
+        episode = m.ContentItem(admin_id=owner.id, platform="podcast", item_type="podcast_episode",
+            external_id="episode", canonical_url="https://example.org/episode?id=2", title="Episode",
+            remote_media_url="https://cdn.example.org/audio?episode=2")
+        db.session.add(episode)
+        db.session.commit()
+        db.session.expire_all()
+        assert origin.canonical_url.endswith("?show=2")
+        assert episode.remote_media_url.endswith("?episode=2")
+        with pytest.raises(sa.exc.StatementError):
+            db.session.execute(sa.update(m.ContentItem).where(m.ContentItem.id == episode.id).values(
+                remote_media_url="https://cdn.example.org/audio?X-Amz-Signature=secret"))

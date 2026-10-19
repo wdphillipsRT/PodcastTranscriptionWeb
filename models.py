@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 import sqlite3
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import urlsplit
 
 from flask_login import UserMixin
 import sqlalchemy as sa
@@ -11,6 +11,7 @@ from sqlalchemy.orm import validates
 from sqlalchemy.types import TypeDecorator
 
 from extensions import db
+from ingestion_types import normalize_public_url
 
 
 SOURCE_TYPES = ("podcast_rss", "youtube_channel", "youtube_playlist", "youtube_video")
@@ -74,12 +75,10 @@ def safe_url(value):
             raise ValueError
         if parsed.username or parsed.password or parsed.fragment:
             raise ValueError
-        # Only stable public identifiers are allowed in persisted descriptor URLs.
-        if any(key not in {"v", "list"} for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
-            raise ValueError
+        normalized = normalize_public_url(value)
     except (TypeError, ValueError):
         raise ValueError("descriptor URL must be public and contain no credentials or transient query data") from None
-    return value
+    return normalized
 
 
 class SafeRemoteMediaURL(TypeDecorator):
@@ -108,19 +107,22 @@ def normalized_descriptor(value):
     """
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) - DESCRIPTOR_STRINGS - {"duration_seconds"}:
+    if not isinstance(value, dict) or set(value) - DESCRIPTOR_STRINGS - {"duration_seconds", "requires_reacquisition"}:
         raise ValueError("descriptor must contain normalized fields only")
     result = dict(value)
     for key, entry in result.items():
         if entry is None:
             continue
-        if key == "duration_seconds":
+        if key == "requires_reacquisition":
+            if type(entry) is not bool:
+                raise ValueError("descriptor requires_reacquisition must be a boolean")
+        elif key == "duration_seconds":
             if type(entry) is not int or entry < 0:
                 raise ValueError("descriptor duration_seconds must be a nonnegative integer")
         elif not isinstance(entry, str):
             raise ValueError("descriptor text fields must be strings")
         elif key.endswith("_url"):
-            safe_url(entry)
+            result[key] = safe_url(entry)
         elif key == "published_at":
             try:
                 parsed = datetime.fromisoformat(entry)

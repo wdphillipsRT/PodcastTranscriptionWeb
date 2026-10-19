@@ -14,7 +14,8 @@ import requests
 from config import Settings
 from feed_resolver import bounded_chunks, fetch_body, http_response, parse_feed
 from ingestion_types import (DiscoveryPage, DownloadedMedia, IngestionError,
-    ItemDescriptor, SourceDescriptor, normalize_public_url, utc_datetime)
+    ItemDescriptor, SourceDescriptor, TransientMediaLocator, has_sensitive_query,
+    normalize_public_url, utc_datetime, validated_http_url)
 
 
 def _publication(entry):
@@ -40,6 +41,45 @@ def _duration(value):
         return None
 
 
+def _podcast_entries(source, parsed, feed_url):
+    """Build safe descriptors; keep acquisition locators inside this boundary."""
+    seen = set()
+    for entry in parsed.entries:
+        enclosure = next((enc for enc in entry.get("enclosures", ())
+            if enc.get("href") and enc.get("type", "").lower().startswith("audio/")), None)
+        if not enclosure:
+            continue
+        try:
+            # Validation precedes normalization: userinfo must never disappear.
+            raw_media = validated_http_url(urljoin(feed_url, enclosure["href"]))
+            requires_reacquisition = has_sensitive_query(raw_media)
+            media_url = None if requires_reacquisition else normalize_public_url(raw_media)
+        except IngestionError:
+            continue
+        try:
+            canonical_url = normalize_public_url(urljoin(feed_url, entry.get("link") or media_url or source.canonical_url))
+        except IngestionError:
+            canonical_url = source.canonical_url
+        raw_guid = entry.get("id") or entry.get("guid")
+        if raw_guid:
+            identity = str(raw_guid)
+        elif requires_reacquisition:
+            identity = "sha256:" + sha256(raw_media.encode("utf-8")).hexdigest()
+        else:
+            identity = media_url
+        external_id = sha256((source.external_id + identity).encode("utf-8")).hexdigest()
+        if external_id in seen:
+            continue
+        seen.add(external_id)
+        descriptor = ItemDescriptor(source_type="podcast_rss", source_external_id=source.external_id,
+            external_id=external_id, title=entry.get("title") or "Untitled Episode",
+            published_at=_publication(entry), media_url=media_url, canonical_url=canonical_url,
+            description=entry.get("summary", ""), guid=identity,
+            creator_name=entry.get("author"), duration_seconds=_duration(entry.get("itunes_duration")),
+            requires_reacquisition=requires_reacquisition)
+        yield descriptor, raw_media
+
+
 def discover_podcast_items(source, settings, session, *, limit=None,
         published_after=None, published_before=None, cursor=None) -> DiscoveryPage:
     """Select a bounded feed snapshot inclusively by UTC date, then by count.
@@ -61,27 +101,7 @@ def discover_podcast_items(source, settings, session, *, limit=None,
         raise ValueError("invalid discovery cursor") from None
     body, feed_url = fetch_body(source.canonical_url, settings, session)
     parsed = parse_feed(body)
-    items, seen = [], set()
-    for entry in parsed.entries:
-        enclosure = next((enc for enc in entry.get("enclosures", ())
-            if enc.get("href") and enc.get("type", "").lower().startswith("audio/")), None)
-        if not enclosure:
-            continue
-        try:
-            media_url = normalize_public_url(urljoin(feed_url, enclosure["href"]))
-            canonical_url = normalize_public_url(urljoin(feed_url, entry.get("link") or media_url))
-        except IngestionError:
-            continue
-        guid = str(entry.get("id") or entry.get("guid") or media_url)
-        external_id = sha256((source.external_id + guid).encode("utf-8")).hexdigest()
-        if external_id in seen:
-            continue
-        seen.add(external_id)
-        items.append(ItemDescriptor(source_type="podcast_rss", source_external_id=source.external_id,
-            external_id=external_id, title=entry.get("title") or "Untitled Episode",
-            published_at=_publication(entry), media_url=media_url, canonical_url=canonical_url,
-            description=entry.get("summary", ""), guid=guid,
-            creator_name=entry.get("author"), duration_seconds=_duration(entry.get("itunes_duration"))))
+    items = [descriptor for descriptor, _ in _podcast_entries(source, parsed, feed_url)]
     epoch = datetime.min.replace(tzinfo=timezone.utc)
     items.sort(key=lambda item: (item.published_at or epoch, item.external_id), reverse=True)
     if after is not None:
@@ -94,12 +114,29 @@ def discover_podcast_items(source, settings, session, *, limit=None,
         next_cursor=None if exhausted else str(offset + len(selected)))
 
 
+def reacquire_podcast_media(source, item_external_id, settings, session) -> TransientMediaLocator:
+    """Refetch one bounded feed and resolve exactly the requested durable item ID.
+
+    Stable GUIDs survive signed URL rotation. A GUID-less signed enclosure uses
+    its full-locator digest, so rotation intentionally requires fresh discovery
+    rather than selecting a different resource using an ambiguous stripped URL.
+    """
+    body, feed_url = fetch_body(source.canonical_url, settings, session)
+    parsed = parse_feed(body)
+    for descriptor, raw_media in _podcast_entries(source, parsed, feed_url):
+        if descriptor.external_id == item_external_id:
+            return TransientMediaLocator(raw_media)
+    raise IngestionError("item_not_found")
+
+
 def download_podcast_audio(url, destination, settings, session) -> DownloadedMedia:
     """Stream into a unique sibling file; replace the destination on success."""
+    # Only the transient capability may carry signed access into this boundary.
+    locator = url._for_download() if isinstance(url, TransientMediaLocator) else normalize_public_url(url)
     destination = Path(destination)
     partial = None
     try:
-        with http_response(session, "GET", url, settings) as response:
+        with http_response(session, "GET", locator, settings, transient=True) as response:
             response.raise_for_status()
             destination.parent.mkdir(parents=True, exist_ok=True)
             digest, size = sha256(), 0

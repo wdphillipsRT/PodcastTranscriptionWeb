@@ -13,7 +13,8 @@ import feedparser
 import requests
 
 from config import Settings
-from ingestion_types import IngestionError, SourceDescriptor, normalize_public_url
+from ingestion_types import (IngestionError, SourceDescriptor, normalize_public_url,
+    validated_http_url)
 from source_classifier import classify_source_url
 
 
@@ -66,9 +67,9 @@ def _validate_destination(parts, resolver=None):
         raise IngestionError("unsafe_destination") from None
 
 
-def _request_url(url):
+def _request_url(url, *, transient=False):
     # Reject userinfo before requests can derive an Authorization header.
-    normalize_public_url(url)
+    url = validated_http_url(url) if transient else normalize_public_url(url)
     parts = urlsplit(url)
     if parts.username is not None or parts.password is not None:
         raise IngestionError("invalid_url")
@@ -77,12 +78,12 @@ def _request_url(url):
 
 
 @contextmanager
-def http_response(session, method, url, settings):
+def http_response(session, method, url, settings, *, transient=False):
     """Follow bounded, validated redirects and close every response."""
     response = None
     try:
         for redirect in range(MAX_REDIRECTS + 1):
-            response = session.request(method, _request_url(url), stream=True,
+            response = session.request(method, _request_url(url, transient=transient), stream=True,
                 allow_redirects=False,
                 auth=_PUBLIC_AUTH,
                 timeout=(settings.HTTP_CONNECT_TIMEOUT_SECONDS, settings.HTTP_READ_TIMEOUT_SECONDS),
@@ -94,7 +95,7 @@ def http_response(session, method, url, settings):
             response = None
             if not location or redirect == MAX_REDIRECTS:
                 raise IngestionError("redirect_failed")
-            url = _request_url(urljoin(url, location))
+            url = urljoin(url, location)
         yield response
     except requests.RequestException:
         raise IngestionError("http_failed") from None

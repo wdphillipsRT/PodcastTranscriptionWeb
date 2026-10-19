@@ -3,12 +3,15 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import io
 import json
+import pickle
 import socket
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import requests
+import episode_fetcher as podcast
+import ingestion_types
 
 from ingestion_types import (DiscoveryPage, DownloadedMedia, IngestionError,
     ItemDescriptor, SourceDescriptor, normalize_public_url, redact_url)
@@ -123,7 +126,8 @@ def test_contracts_freeze_nested_metadata_and_expose_neutral_fields(source):
 
 def test_url_normalization_redacts_query_credentials_and_fragment():
     raw = "HTTPS://user:password@Feeds.Example:443/feed.xml?token=secret#secret"
-    assert normalize_public_url(raw) == "https://feeds.example/feed.xml"
+    with pytest.raises(IngestionError):
+        normalize_public_url(raw)
     assert redact_url(raw) == "https://feeds.example/feed.xml"
     assert redact_url("malformed secret") == "[invalid URL]"
 
@@ -180,7 +184,7 @@ def test_discovery_normalizes_dates_ids_order_and_relative_urls(source, settings
     assert newest.published_at == datetime(2026, 10, 13, 8, tzinfo=timezone.utc)
     assert newest.external_id == sha256((source.external_id + "episode-new").encode()).hexdigest()
     assert older.media_url == "https://feeds.example/show/audio/old.mp3"
-    assert newest.media_url == "https://cdn.example/new.mp3"
+    assert newest.media_url is None and newest.requires_reacquisition
     assert newest.canonical_url == "https://feeds.example/show/episodes/new"
     assert fallback.guid == "https://feeds.example/show/audio/fallback.mp3"
     assert fallback.external_id == sha256((source.external_id + fallback.guid).encode()).hexdigest()
@@ -241,7 +245,8 @@ def test_malformed_feed_safe_failure(body, source, settings):
 def test_audio_streams_and_returns_hash(source, settings, tmp_path):
     audio = b"a" * 70_000
     body = Response(audio, headers={"Content-Type": "audio/mpeg", "Content-Length": str(len(audio))})
-    result = download_podcast_audio("https://cdn.example/a.mp3?signature=secret", tmp_path / "nested/a.mp3", settings, Session(body))
+    locator = ingestion_types.TransientMediaLocator("https://cdn.example/a.mp3?signature=secret")
+    result = download_podcast_audio(locator, tmp_path / "nested/a.mp3", settings, Session(body))
     assert result.path.read_bytes() == audio
     assert result.size_bytes == len(audio)
     assert result.sha256 == sha256(audio).hexdigest()
@@ -261,7 +266,8 @@ def test_failed_audio_cleans_partial_and_preserves_existing(kind, settings, tmp_
         headers=headers, status=500 if kind == "http" else 200,
         failure=requests.Timeout("?token=secret user:password") if kind == "interrupted" else None)
     with pytest.raises(IngestionError) as error:
-        download_podcast_audio("https://cdn.example/a.mp3?token=secret", destination, settings, Session(response))
+        locator = ingestion_types.TransientMediaLocator("https://cdn.example/a.mp3?token=secret")
+        download_podcast_audio(locator, destination, settings, Session(response))
     assert destination.read_bytes() == b"previous"
     assert list(tmp_path.iterdir()) == [destination]
     assert response.closed
@@ -438,3 +444,186 @@ def test_redirect_to_private_address_is_rejected_before_second_request(settings)
 def test_public_ip_literal_is_allowed(settings):
     session = Session(Response(url="https://93.184.216.34/feed"), Response(FEED, url="https://93.184.216.34/feed"))
     assert resolve_podcast_source("https://93.184.216.34/feed", settings, session).canonical_url == "https://93.184.216.34/feed"
+
+
+def single_enclosure(url, *, guid="episode", link=""):
+    from xml.sax.saxutils import escape
+    guid_xml = f'<guid isPermaLink="false">{escape(guid)}</guid>' if guid is not None else ""
+    link_xml = f"<link>{escape(link)}</link>" if link else ""
+    return f'<rss><channel><title>Selectors</title><item><title>Episode</title>{guid_xml}{link_xml}<enclosure url="{escape(url, {chr(34): "&quot;"})}" type="audio/mpeg"/></item></channel></rss>'.encode()
+
+
+def test_feed_query_selectors_are_requested_and_distinguish_source_identity(settings):
+    sources = []
+    for selector in ("1", "2"):
+        canonical = URL + f"?locale=en&show={selector}"
+        session = Session(Response(url=canonical), Response(FEED, url=canonical))
+        source = resolve_podcast_source(URL + f"?show={selector}&locale=en", settings, session)
+        assert [call[1] for call in session.calls] == [canonical, canonical]
+        assert source.canonical_url == canonical
+        assert source.external_id == sha256(canonical.encode()).hexdigest()
+        sources.append(source)
+    assert sources[0].external_id != sources[1].external_id
+
+
+@pytest.mark.parametrize("key", ["token", "ToKeN", "access_token", "api_key", "KEY", "signature", "sig",
+    "X-Amz-Signature", "x-amz-credential", "X-Goog-Signature", "X-Goog-Credential", "AWSAccessKeyId",
+    "Policy", "Key-Pair-Id", "%74oken"])
+def test_public_feed_rejects_sensitive_queries_instead_of_fetching_another_resource(key, settings):
+    session = Session()
+    with pytest.raises(IngestionError):
+        resolve_podcast_source(URL + f"?show=1&{key}=secret", settings, session)
+    assert session.calls == []
+
+
+def test_public_enclosure_selector_identity_does_not_collapse(source, settings):
+    items = []
+    for episode in ("1", "2"):
+        url = f"https://cdn.example/media?episode={episode}&format=mp3"
+        body = single_enclosure(url, guid=None)
+        item = discover_podcast_items(source, settings, Session(Response(body))).items[0]
+        assert item.media_url == url and not item.requires_reacquisition
+        items.append(item)
+    assert items[0].external_id != items[1].external_id
+
+
+def test_guidless_signed_variants_get_distinct_secret_free_ids(source, settings):
+    items = []
+    for signature in ("secret-one", "secret-two"):
+        raw = "https://cdn.example/audio.mp3?X-Amz-Signature=" + signature
+        item = discover_podcast_items(source, settings, Session(Response(single_enclosure(raw, guid=None)))).items[0]
+        assert item.media_url is None and item.requires_reacquisition
+        assert "secret" not in repr(item) and "X-Amz" not in repr(item)
+        assert item.guid == "sha256:" + sha256(raw.encode()).hexdigest()
+        assert item.external_id == sha256((source.external_id + item.guid).encode()).hexdigest()
+        items.append(item)
+    assert items[0].external_id != items[1].external_id
+
+
+def test_credentialed_provider_feed_is_rejected_before_normalization(settings):
+    for apple in (True, False):
+        raw = "https://user:secret@feeds.example/feed.xml"
+        if apple:
+            lookup = Response(json.dumps({"results": [{"feedUrl": raw}]}).encode())
+            session = Session(lookup)
+            url = "https://podcasts.apple.com/podcast/id123456789"
+        else:
+            session = Session(Response(), Response(f'<link rel="alternate" type="application/rss+xml" href="{raw}">'.encode()))
+            url = URL
+        with pytest.raises(IngestionError):
+            resolve_podcast_source(url, settings, session)
+        assert all("user:secret" not in call[1] for call in session.calls)
+
+
+def test_credentialed_enclosure_is_skipped_consistently(source, settings):
+    body = single_enclosure("https://user:secret@cdn.example/audio.mp3")
+    page = discover_podcast_items(source, settings, Session(Response(body)))
+    assert page.items == ()
+    with pytest.raises(IngestionError, match="item_not_found"):
+        podcast.reacquire_podcast_media(source, "irrelevant-id", settings, Session(Response(body)))
+
+
+def test_signed_discovery_persistence_reacquisition_download(source, settings, app, tmp_path):
+    from extensions import db
+    from models import Admin, ContentSource, DiscoveryCandidate, DiscoveryRun
+    raw = "https://cdn.example/audio.mp3?episode=1&X-Amz-Signature=secret"
+    body = single_enclosure(raw)
+    descriptor = discover_podcast_items(source, settings, Session(Response(body))).items[0]
+    assert descriptor.media_url is None and descriptor.requires_reacquisition
+    assert "secret" not in repr(descriptor)
+    with app.app_context():
+        db.create_all()
+        owner = Admin(email="owner@example.com", password_hash="test")
+        db.session.add(owner)
+        db.session.flush()
+        origin = ContentSource(admin_id=owner.id, source_type=source.source_type,
+            external_id=source.external_id, canonical_url=source.canonical_url, name=source.title)
+        db.session.add(origin)
+        db.session.flush()
+        run = DiscoveryRun(source_id=origin.id, run_type="initial")
+        db.session.add(run)
+        db.session.flush()
+        candidate = DiscoveryCandidate(run_id=run.id, platform="podcast", external_id=descriptor.external_id,
+            descriptor={"platform": "podcast", "item_type": "podcast_episode", "external_id": descriptor.external_id,
+            "canonical_url": descriptor.canonical_url, "remote_media_url": descriptor.media_url,
+            "title": descriptor.title, "requires_reacquisition": descriptor.requires_reacquisition})
+        db.session.add(candidate)
+        db.session.commit()
+        db.session.expire_all()
+        persisted = candidate.descriptor
+        assert "secret" not in json.dumps(persisted)
+        assert persisted["remote_media_url"] is None and persisted["requires_reacquisition"] is True
+        item_id = persisted["external_id"]
+        db.drop_all()
+    # A new signature is resolved at acquisition time under the same stable GUID.
+    refreshed = raw.replace("=secret", "=refreshed-secret")
+    session = Session(Response(single_enclosure(refreshed)), Response(b"audio"))
+    locator = podcast.reacquire_podcast_media(source, item_id, settings, session)
+    assert "secret" not in repr(locator) + str(locator)
+    assert not hasattr(locator, "__dict__")
+    with pytest.raises(TypeError):
+        json.dumps(locator)
+    with pytest.raises(TypeError):
+        pickle.dumps(locator)
+    with pytest.raises(TypeError):
+        locator.__getstate__()
+    with pytest.raises(TypeError):
+        replace(source, provider_metadata={"locator": locator})
+    result = download_podcast_audio(locator, tmp_path / "audio.mp3", settings, session)
+    assert session.calls[-1][1] == refreshed
+    assert result.path.read_bytes() == b"audio" and "secret" not in repr(result)
+
+
+def test_reacquisition_missing_item_and_oversized_feed_are_bounded(source, settings):
+    with pytest.raises(IngestionError, match="item_not_found"):
+        podcast.reacquire_podcast_media(source, "absent", settings, Session(Response(FEED)))
+    settings.RSS_MAX_BYTES = 5
+    with pytest.raises(IngestionError, match="response_too_large"):
+        podcast.reacquire_podcast_media(source, "absent", settings, Session(Response(FEED)))
+
+
+def test_metadata_cannot_hold_transient_or_raw_signed_access(source):
+    for metadata in ({"locator": "https://cdn.example/a?Signature=secret"}, {"Authorization": "secret"},
+                     {"locator": "  https://cdn.example/a?Signature=secret"}):
+        with pytest.raises((TypeError, IngestionError)):
+            replace(source, provider_metadata=metadata)
+
+
+def test_audio_public_redirect_can_reacquire_signed_access_without_persisting_it(settings, tmp_path):
+    signed = "https://cdn.example/audio.mp3?X-Amz-Signature=secret"
+    redirect = Response(status=302, headers={"Location": signed})
+    body = Response(b"audio", url=signed)
+    session = Session(redirect, body)
+    result = download_podcast_audio("https://public.example/audio?episode=1", tmp_path / "a.mp3", settings, session)
+    assert session.calls[-1][1] == signed
+    assert redirect.closed and body.closed
+    assert "secret" not in repr(result)
+
+
+def test_feed_redirect_cannot_introduce_signed_credentials(settings):
+    redirect = Response(status=302, headers={"Location": "https://feeds.example/feed?sig=secret"})
+    session = Session(redirect)
+    with pytest.raises(IngestionError):
+        resolve_podcast_source(URL, settings, session)
+    assert len(session.calls) == 1 and redirect.closed
+
+
+def test_signed_locator_download_errors_do_not_expose_access(settings, tmp_path, caplog):
+    raw = "https://cdn.example/a?signature=secret"
+    locator = ingestion_types.TransientMediaLocator(raw)
+    session = Session(requests.ConnectionError(raw))
+    with pytest.raises(IngestionError) as error:
+        download_podcast_audio(locator, tmp_path / "audio.mp3", settings, session)
+    assert "secret" not in repr(error.value) + caplog.text
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_guidless_reacquisition_matches_full_digest_and_fails_on_rotation(source, settings):
+    raw = "https://cdn.example/a?signature=secret"
+    body = single_enclosure(raw, guid=None)
+    item = discover_podcast_items(source, settings, Session(Response(body))).items[0]
+    locator = podcast.reacquire_podcast_media(source, item.external_id, settings, Session(Response(body)))
+    assert "secret" not in repr(locator)
+    with pytest.raises(IngestionError, match="item_not_found"):
+        podcast.reacquire_podcast_media(source, item.external_id, settings,
+            Session(Response(single_enclosure(raw.replace("secret", "rotated"), guid=None))))

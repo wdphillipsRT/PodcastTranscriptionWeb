@@ -307,7 +307,7 @@ def test_core_writes_reject_unsafe_remote_media_urls(schema, operation, unsafe_u
 
 
 @pytest.mark.parametrize("operation", ["insert", "update"])
-@pytest.mark.parametrize("safe_url", [None, "https://cdn.example.com/episode.mp3"])
+@pytest.mark.parametrize("safe_url", [None, "https://cdn.example.com/episode.mp3", "https://cdn.example.com/audio?episode=1"])
 def test_core_writes_preserve_safe_remote_media_urls_and_null(schema, operation, safe_url):
     owner = admin(schema)
     if operation == "insert":
@@ -401,3 +401,25 @@ def test_candidate_mutation_cannot_bypass_descriptor_validation(schema):
     candidate.descriptor["raw_response"] = {"token": "secret"}
     with pytest.raises((ValueError, StatementError)):
         db.session.flush()
+
+
+def test_public_query_locators_and_reacquisition_marker_survive_candidate_bind(schema):
+    _, _, _, run = graph(schema)
+    descriptor = {"platform": "podcast", "canonical_url": "https://example.org/episode?id=2",
+        "remote_media_url": "https://cdn.example.org/audio?episode=2&format=mp3",
+        "requires_reacquisition": False}
+    candidate = schema.DiscoveryCandidate(run_id=run.id, platform="podcast", external_id="episode-2", descriptor=descriptor)
+    db.session.add(candidate)
+    db.session.commit()
+    db.session.expire_all()
+    assert candidate.descriptor == descriptor
+
+
+@pytest.mark.parametrize("key", ["ToKeN", "api_key", "X-Amz-Signature", "X-Goog-Credential", "Sig", "%74oken"])
+def test_case_insensitive_signed_queries_rejected_at_bind_time(schema, key):
+    owner = admin(schema)
+    with pytest.raises(StatementError, match="credentials"):
+        db.session.execute(sa.insert(schema.ContentItem).values(admin_id=owner.id,
+            platform="podcast", item_type="podcast_episode", external_id="unsafe",
+            canonical_url="https://example.org/episode", title="Episode",
+            remote_media_url=f"https://cdn.example.org/audio?{key}=secret"))
