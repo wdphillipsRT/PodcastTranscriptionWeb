@@ -5,11 +5,10 @@ from contextlib import closing
 from pathlib import Path
 import re
 
-import boto3
-from botocore.config import Config
 from botocore.exceptions import (ClientError, ConnectionError, HTTPClientError,
                                  IncompleteReadError, ResponseStreamingError)
 
+from aws_clients import create_aws_client
 from config import load_settings
 
 
@@ -80,7 +79,7 @@ class S3Manager:
         if not isinstance(self._region, str) or not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]+", self._region):
             raise StoragePermanentError("invalid configured region")
         try:
-            self.s3_client = client if client is not None else boto3.client("s3", region_name=self.region, config=Config(retries={"total_max_attempts": 1}, s3={"us_east_1_regional_endpoint": "regional"}))
+            self.s3_client = client if client is not None else create_aws_client("s3", self.region)
             client_region = self.s3_client.meta.region_name
             if isinstance(client_region, str) and client_region != self.region:
                 raise StoragePermanentError("storage client region mismatch")

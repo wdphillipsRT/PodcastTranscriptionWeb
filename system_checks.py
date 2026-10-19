@@ -17,7 +17,6 @@ from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 import boto3
-from botocore.config import Config as SDKConfig
 from celery import Celery
 import click
 from flask import current_app
@@ -27,6 +26,7 @@ import requests
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
+from aws_clients import create_aws_client
 
 COMPONENTS = ("database", "redis", "s3", "transcribe", "youtube", "yt_dlp", "deno", "worker", "beat")
 PROBE_TIMEOUT_SECONDS = 8
@@ -61,12 +61,7 @@ def _check_redis(config):
 
 
 def _aws_client(service, config):
-    # Explicit region/signing; use the normal SDK credential chain. Ignore
-    # endpoint overrides from environment/shared config as well as app settings.
-    return boto3.client(service, region_name=config["AWS_REGION"], config=SDKConfig(
-        ignore_configured_endpoint_urls=True,
-        signature_version="s3v4" if service == "s3" else "v4",
-        connect_timeout=2, read_timeout=2, retries={"total_max_attempts": 1}))
+    return create_aws_client(service, config["AWS_REGION"], connect_timeout=2, read_timeout=2)
 
 
 def _check_s3(config):

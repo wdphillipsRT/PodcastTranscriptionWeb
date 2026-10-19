@@ -6,10 +6,9 @@ import re
 import time
 from urllib.parse import urlsplit
 
-import boto3
-from botocore.config import Config
 from botocore.exceptions import ClientError, ConnectionError, HTTPClientError
 
+from aws_clients import create_aws_client
 from config import load_settings
 from s3_utils import (BUCKET_NAME, DEFAULT_MAX_BYTES, StoragePermanentError,
                       StorageTransientError, get_s3_manager, setting,
@@ -56,7 +55,7 @@ def _failure(error):
 def get_transcribe_client(settings=None):
     settings = settings if settings is not None else load_settings()
     try:
-        return boto3.client("transcribe", region_name=setting(settings, "AWS_REGION"), config=Config(retries={"total_max_attempts": 1}, connect_timeout=10, read_timeout=60))
+        return create_aws_client("transcribe", setting(settings, "AWS_REGION"))
     except Exception as error:
         _failure(error)
 
