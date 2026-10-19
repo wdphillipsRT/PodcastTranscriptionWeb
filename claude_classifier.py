@@ -52,6 +52,12 @@ _CATEGORIES = {"claude_timeout": True, "claude_unavailable": True, "claude_inval
 
 
 @dataclass(frozen=True, slots=True)
+class ClassifierExample:
+    label: str
+    segments: tuple[TranscriptSegment, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class BlockDecision:
     first_segment_id: str
     last_segment_id: str
@@ -153,7 +159,7 @@ def _result(raw, window, settings):
         _fail()
 
 
-def _input(window):
+def _input(window, examples):
     if not isinstance(window, ClassifierWindow):
         _fail("claude_config")
     if any(not isinstance(values, (tuple, list)) for values in
@@ -189,6 +195,34 @@ def _input(window):
         seen_signals.add(entry)
     if sum(len(segment.text) for segment in window.target_segments) > MAX_BLOCK_TEXT_CHARS:
         _fail("claude_config")
+    if not isinstance(examples, tuple) or len(examples) > 20:
+        _fail("claude_config")
+    source_examples, seen_examples = [], set()
+    for example in examples:
+        if (not isinstance(example, ClassifierExample)
+                or not isinstance(example.label, str) or example.label not in LABELS
+                or not isinstance(example.segments, tuple)
+                or not 1 <= len(example.segments) <= TARGET_SEGMENTS_PER_BLOCK):
+            _fail("claude_config")
+        previous_ordinal, text_chars = None, 0
+        for segment in example.segments:
+            if not isinstance(segment, TranscriptSegment):
+                _fail("claude_config")
+            segment.__post_init__()
+            ordinal = int(segment.id[4:10])
+            if ordinal <= 0 or previous_ordinal is not None and ordinal != previous_ordinal + 1:
+                _fail("claude_config")
+            previous_ordinal = ordinal
+            text_chars += len(segment.text)
+            if text_chars > MAX_BLOCK_TEXT_CHARS:
+                _fail("claude_config")
+        identity = (example.label, tuple(segment.id for segment in example.segments))
+        if identity in seen_examples:
+            _fail("claude_config")
+        seen_examples.add(identity)
+        source_examples.append({"label": example.label, "segments": [
+            {key: getattr(segment, key) for key in ("start", "end", "text")}
+            for segment in example.segments]})
     def record(segment):
         return {key: getattr(segment, key) for key in ("id", "start", "end", "text")}
     payload = {"schema": "commercial-segment-classifier-input/v1", "untrusted_quoted_data": True,
@@ -197,7 +231,7 @@ def _input(window):
         "context_before": [record(segment) for segment in window.context_before],
         "context_after": [record(segment) for segment in window.context_after],
         "signals": [{key: getattr(entry, key) for key in ("code", "first_segment_id", "last_segment_id")}
-                    for entry in window.signals]}
+                    for entry in window.signals], "source_examples": source_examples}
     encoded = canonical_json(payload).encode("utf-8")
     if len(encoded) >= 10_000_000:
         _fail("claude_config")
@@ -292,11 +326,12 @@ class ClaudeClassifier:
         self.popen_factory = popen_factory
         self.selector_factory = selector_factory
 
-    def classify(self, window: ClassifierWindow) -> ClassifierResult:
+    def classify(self, window: ClassifierWindow, *,
+                 examples: tuple[ClassifierExample, ...] = ()) -> ClassifierResult:
         process = None
         completed = False
         try:
-            payload = _input(window)
+            payload = _input(window, examples)
             environment = _environment(os.environ if self.environment is None else self.environment)
             settings = self.settings
             argv = ["claude", "--restricted", "--safe-mode", "-p", "--tools", "", "--disallowedTools", "mcp__*",
