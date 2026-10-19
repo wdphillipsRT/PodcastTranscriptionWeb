@@ -4,6 +4,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 from bs4 import BeautifulSoup
+from flask import url_for
 import pytest
 import sqlalchemy as sa
 
@@ -33,6 +34,12 @@ def correction(review, **changes):
     return dict(active_revision_id=review.active,
         first_segment_id=review.transcript.segments[0].id,
         last_segment_id=review.transcript.segments[1].id, label="paid_commercial", **changes)
+
+
+def test_browser_url_building_prefers_html_mutation_routes(app):
+    with app.test_request_context():
+        assert url_for("workspace.classification_override", item_id=1) == "/items/1/classification/overrides"
+        assert url_for("workspace.classification_retry", item_id=1) == "/items/1/classification/retry"
 
 
 def test_review_is_authenticated_escaped_and_private(review, app):

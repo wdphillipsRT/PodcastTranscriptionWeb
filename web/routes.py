@@ -504,8 +504,8 @@ def classification_payload(allowed):
     return data
 
 
-@workspace.post("/items/<int:item_id>/classification/overrides")
 @workspace.post("/api/items/<int:item_id>/classification/overrides")
+@workspace.post("/items/<int:item_id>/classification/overrides")
 @login_required
 def classification_override(item_id):
     row = item_owned(item_id)
@@ -545,8 +545,8 @@ def classification_override(item_id):
         location=url_for("workspace.classification_item", item_id=item_id), message="Correction saved. Classification requested.")
 
 
-@workspace.post("/items/<int:item_id>/classification/retry")
 @workspace.post("/api/items/<int:item_id>/classification/retry")
+@workspace.post("/items/<int:item_id>/classification/retry")
 @login_required
 def classification_retry(item_id):
     item_owned(item_id)
