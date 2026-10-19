@@ -275,13 +275,17 @@ def test_unknown_retry_publication_replays_stable_checkpoint_safely(worker, monk
     assert row.attempts == 1
 
 
-def test_stale_recovery_exhaustion_does_not_publish(worker):
+@pytest.mark.parametrize("revision_state", ["running", "retrying"])
+def test_stale_recovery_exhaustion_does_not_publish(worker, revision_state):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
     revision = db.session.get(m.ClassificationRevision, identity)
     block = m.ClassificationBlock.query.one()
     block.state, revision.error_category = "running", None
     block.heartbeat_at = block.started_at = revision.heartbeat_at = m.utc_now() - timedelta(seconds=3000)
+    revision.state = revision_state
+    if revision_state == "retrying":
+        revision.heartbeat_at = m.utc_now()
     revision.attempts = 4
     db.session.commit()
     worker.sent.clear()
@@ -376,3 +380,65 @@ def test_worker_preserves_per_revision_budget_limits(worker, limit):
     task().run(identity, "block", 2)
     assert row.state == "failed" and row.error_category == "revision_budget_exhausted"
     assert row.total_cost_microusd == 25 and len(worker.env.classifier.calls) == 1 and not worker.sent
+
+
+def test_acknowledged_prepare_lost_to_contention_replays_after_delivery_grace(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    item_id = worker.env.item.id
+    revision = db.session.get(m.ClassificationRevision, identity)
+    dispatch = tasks._revision_dispatch(revision)
+    assert tasks._publish_classification(dispatch)
+    assert revision.error_category is None and len(worker.sent) == 1
+    with tasks._item_lock(item_id) as acquired:
+        assert acquired
+        task().run(identity, "prepare")
+    assert revision.error_category is None and revision.state == "pending"
+    assert revision.attempts == 0 and m.ClassificationBlock.query.count() == 0
+    reconcile()
+    assert len(worker.sent) == 1
+
+    # Seven days after the acknowledged delivery, no worker ever started it.
+    revision.updated_at = m.utc_now() - timedelta(days=7)
+    db.session.commit()
+    worker.app.config["CLASSIFICATION_ENABLED"] = False
+    reconcile()
+    assert len(worker.sent) == 1 and revision.error_category is None
+    worker.app.config["CLASSIFICATION_ENABLED"] = True
+    with tasks._item_lock(item_id) as acquired:
+        assert acquired
+        reconcile()
+    assert len(worker.sent) == 1 and revision.error_category is None
+    result = reconcile()
+    assert result["scanned"] == result["published"] == 1
+    assert len(worker.sent) == 2 and worker.sent[-1][1] == [identity, "prepare", None]
+    assert worker.sent[-1][2]["task_id"] == dispatch.task_id
+    assert m.ClassificationRevision.query.count() == 1 and revision.attempts == 0
+    assert revision.state == "pending" and revision.error_category is None
+    reconcile()
+    assert len(worker.sent) == 2, "successful delivery replay must renew the delivery grace"
+
+
+@pytest.mark.parametrize("phase", ["prepare", "block", "finalize"])
+def test_aged_queued_retry_replays_without_consuming_fifth_attempt(worker, phase):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    if phase != "prepare":
+        task().run(identity, "prepare")
+    if phase == "finalize":
+        task().run(identity, "block", 1)
+    revision = db.session.get(m.ClassificationRevision, identity)
+    revision.state, revision.attempts, revision.error_category = "retrying", 4, "storage_transient"
+    revision.heartbeat_at = revision.updated_at = m.utc_now() - timedelta(days=7)
+    if phase == "block":
+        block = m.ClassificationBlock.query.one()
+        block.state, block.error_category = "failed", "storage_transient"
+    task_id = revision.celery_task_id
+    db.session.commit()
+    worker.sent.clear()
+    reconcile()
+    assert (revision.state, revision.attempts, revision.error_category) == ("retrying", 4, "storage_transient")
+    assert len(worker.sent) == 1
+    assert worker.sent[-1][1] == [identity, phase, 1 if phase == "block" else None]
+    assert worker.sent[-1][2]["task_id"] == task_id
+    assert 241 <= worker.sent[-1][2]["countdown"] <= 270
+    reconcile()
+    assert len(worker.sent) == 1 and revision.attempts == 4

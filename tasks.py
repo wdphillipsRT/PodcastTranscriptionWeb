@@ -403,9 +403,15 @@ class _ProcessingPipeline:
             complete_media()
             self.session.commit()
             return None
-        revision = self.session.get(ClassificationRevision, revision_id)
-        message = _revision_dispatch(revision) if revision.error_category == "dispatch_pending" else None
-        self.session.commit()
+        try:
+            revision = self.session.get(ClassificationRevision, revision_id)
+            message = _revision_dispatch(revision) if revision.error_category == "dispatch_pending" else None
+            self.session.commit()
+        except Exception:
+            # Media completion and the outbox are already durable. Failures in
+            # this optional read/dispatch handoff must only defer publication.
+            self.session.rollback()
+            return None
         return ("classification", message) if message else None
 
     def run(self, item_id, requested_stage=None):
@@ -457,11 +463,11 @@ class _ProcessingPipeline:
             if following is None:
                 if not _completed_valid(item):
                     raise ValueError("invalid artifact lineage")
-                return self._complete(item, job)
-            job.state, job.completed_at, job.error_category = "completed", utc_now(), None
-            item.last_successful_stage, item.error_category = stage, None
-            self.session.commit()
-            return self._queue(item, following) if following else None
+            else:
+                job.state, job.completed_at, job.error_category = "completed", utc_now(), None
+                item.last_successful_stage, item.error_category = stage, None
+                self.session.commit()
+                return self._queue(item, following)
         except Exception as error:
             # Roll back partial metadata changes; completed upstream artifact
             # tuples are committed in their own stage and remain reusable.
@@ -486,6 +492,9 @@ class _ProcessingPipeline:
             item.status = "deferred" if retryable else "unavailable" if unavailable else "failed"
             self.session.commit()
             return None
+        # The terminal classification handoff cannot enter the media failure
+        # handler, including after the final completion commit has succeeded.
+        return self._complete(item, job)
 
     def _save_audio(self, item, media):
         from hashlib import sha256
@@ -951,7 +960,7 @@ def _missing_classification_query():
 
 
 def _reconcile_revision(revision_id, item_id, cutoff):
-    """Recover only a checkpoint proven abandoned by time AND lifetime lock."""
+    """Separate aged delivery replays from proven abandoned running work."""
     from extensions import db
     from models import ClassificationRevision, ClassificationBlock
     with _item_lock(item_id) as acquired:
@@ -964,25 +973,36 @@ def _reconcile_revision(revision_id, item_id, cutoff):
         block = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id, state="running").order_by(
             ClassificationBlock.ordinal).first()
         heartbeat = (block.heartbeat_at or block.started_at) if block else revision.heartbeat_at or revision.started_at
-        if block is not None or revision.error_category != "dispatch_pending":
+        if block is not None or revision.state == "running" and revision.error_category != "dispatch_pending":
             if heartbeat is None or heartbeat >= cutoff:
                 db.session.commit()
                 return None, None, None
             dispatch = _revision_dispatch(revision)
             phase, ordinal = ("block", block.ordinal) if block else (dispatch.phase, dispatch.block_ordinal)
             return _classification_failed(revision_id, phase, ordinal, "worker_timeout")
+        if revision.error_category != "dispatch_pending":
+            delivered_at = revision.updated_at or revision.created_at
+            if delivered_at is None or delivered_at >= cutoff:
+                db.session.commit()
+                return None, None, None
         dispatch = _revision_dispatch(revision)
         category, countdown = None, None
         if revision.state == "retrying":
             from classification_service import RETRYABLE_CLASSIFICATION_ERRORS
+            if revision.error_category in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
+                category = revision.error_category
             # Block failures retain their category while the revision's sole
             # error field is used by the outbox. Prepare/finalize cannot recover
             # the original category after an unknown send; the next call will.
             failed = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id,
                 ordinal=dispatch.block_ordinal, state="failed").one_or_none() if dispatch.phase == "block" else None
-            if failed is not None and failed.error_category in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
+            if category is None and failed is not None and failed.error_category in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
                 category = failed.error_category
             countdown = _classification_delay(revision.attempts) if revision.attempts else None
+        # Pending and retrying deliveries did not execute a failed checkpoint.
+        # Re-arm the stable outbox without consuming the worker-attempt budget;
+        # publication updates updated_at, renewing the delivery grace period.
+        revision.error_category = "dispatch_pending"
         db.session.commit()
         return dispatch, countdown, category
 
@@ -993,7 +1013,7 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
     import sqlalchemy as sa
     import celeryconfig
     from extensions import db
-    from models import ClassificationRevision, utc_now
+    from models import ClassificationRevision, ClassificationBlock, utc_now
     from classification_service import ClassificationServiceError
     bound = min(current_app.config["CLASSIFICATION_RECONCILE_BATCH_SIZE"], 100, limit if limit is not None else 100)
     if type(bound) is not int or bound < 1:
@@ -1006,11 +1026,19 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
     enabled = current_app.config["CLASSIFICATION_ENABLED"]
     cutoff = utc_now() - timedelta(seconds=celeryconfig.task_time_limit + 300)
     if enabled and not create_only:
+        stale_running = sa.and_(ClassificationRevision.state == "running",
+            sa.func.coalesce(ClassificationRevision.heartbeat_at, ClassificationRevision.started_at) < cutoff)
+        stale_delivery = sa.and_(sa.or_(ClassificationRevision.state == "retrying",
+            sa.and_(ClassificationRevision.state == "pending", ClassificationRevision.started_at.is_(None),
+                ClassificationRevision.heartbeat_at.is_(None))),
+            sa.func.coalesce(ClassificationRevision.updated_at, ClassificationRevision.created_at) < cutoff)
+        stale_block = sa.exists().where(ClassificationBlock.revision_id == ClassificationRevision.id,
+            ClassificationBlock.state == "running",
+            sa.func.coalesce(ClassificationBlock.heartbeat_at, ClassificationBlock.started_at) < cutoff)
         candidates = list(db.session.execute(sa.select(ClassificationRevision.id, ClassificationRevision.item_id).where(
             ClassificationRevision.id > after_revision_id,
             ClassificationRevision.state.in_(("pending", "running", "retrying")),
-            sa.or_(ClassificationRevision.error_category == "dispatch_pending",
-                sa.func.coalesce(ClassificationRevision.heartbeat_at, ClassificationRevision.started_at) < cutoff))
+            sa.or_(ClassificationRevision.error_category == "dispatch_pending", stale_running, stale_delivery, stale_block))
             .order_by(ClassificationRevision.id).limit(bound)))
         db.session.commit()
         for identity, item_id in candidates:
