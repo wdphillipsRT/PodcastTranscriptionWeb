@@ -5,6 +5,8 @@ from hashlib import sha256
 import importlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -303,3 +305,152 @@ def test_public_parser_rejects_valid_json_with_noncanonical_storage_bytes():
     for raw in (json.dumps(transcript.to_dict()), transcript.to_json() + "\n"):
         with pytest.raises(module().TranscriptValidationError):
             parse_stored(raw, transcript)
+
+
+def whisper_data():
+    return json.loads(Path("tests/fixtures/whisper-provider-result.json").read_bytes())
+
+
+def normalize_whisper(content=None, **updates):
+    api = module()
+    raw = api.canonical_json(whisper_data() if content is None else content).encode()
+    options = dict(platform="youtube", external_id=METADATA["external_id"], item_id=7,
+                   source_id=3, audio_sha256="a" * 64, raw_sha256=sha256(raw).hexdigest())
+    return api.normalize_local_whisper(raw, **{**options, **updates})
+
+
+def test_local_whisper_builds_stable_canonical_segments_and_round_trips():
+    import whisper_transcribe as provider
+    first = normalize_whisper()
+    repeated = normalize_whisper(json.loads(json.dumps(whisper_data(), sort_keys=True)))
+    assert first.to_json() == repeated.to_json()
+    assert first.transcript_sha256 == "17a9a415ac9039028861b3059f77e0029e52f37cb83f1d45f33512bcddfa4b50"
+    assert sha256(first.to_json().encode()).hexdigest() == "3e2b41db79af34b70615d9f3eb5e1a24dac7cf1ccb607a5dd34dacee1e606909"
+    assert first.origin == "local_whisper" and first.provider == "faster-whisper"
+    assert first.language == "en" and first.duration == 2.0
+    assert first.provider_version == provider.CANONICAL_PROVIDER_VERSION
+    assert first.tool_version == module().NORMALIZER_VERSION == provider.NORMALIZER_VERSION
+    assert first.source_sha256 == sha256(module().canonical_json(whisper_data()).encode()).hexdigest()
+    assert [(s.start, s.end, s.text) for s in first.segments] == [(0.0, 2.0, "Hello world.")]
+    assert first.segments[0].id == f"seg-000001-{first.segments[0].sha256[:16]}"
+    assert first.segments[0].sha256 == "8790915715c93f562582d4d630819b293d19f37c1d7f873e2e126b5ce1c3320c"
+    assert first.segments[0].citation == "https://www.youtube.com/watch?v=abc123xyz_1&t=0s"
+    assert "words" not in first.to_json() and "probability" not in first.to_json()
+    assert first.to_text() == "[0.000–2.000] Hello world."
+    assert parse_stored(first.to_json(), first) == first
+
+
+def test_local_whisper_preserves_multiple_segments_and_podcast_citations():
+    data = whisper_data()
+    data["duration"] = 4.0
+    data["segments"].append(dict(start=2.5, end=4.0, text="  Next.  ", words=[]))
+    result = normalize_whisper(data, platform="podcast", external_id="episode-123",
+                               canonical_url="https://podcasts.example/episode")
+    assert [(s.start, s.end, s.text) for s in result.segments] == [(0.0, 2.0, "Hello world."), (2.5, 4.0, "Next.")]
+    assert result.segments[1].citation == "https://podcasts.example/episode#t=2.5,4"
+    with pytest.raises(module().TranscriptValidationError):
+        normalize_whisper(data, max_segments=1)
+
+
+def test_local_whisper_accepts_text_bytes_and_hashes_canonical_provider_data():
+    api = module()
+    raw = json.dumps(whisper_data(), indent=2)
+    result = api.normalize_local_whisper(raw, platform="youtube", external_id=METADATA["external_id"],
+                                         item_id=7, source_id=3, audio_sha256="a" * 64,
+                                         raw_sha256=sha256(raw.encode()).hexdigest())
+    assert result.to_json() == normalize_whisper().to_json()
+
+
+@pytest.mark.parametrize("updates", [{"provider": "yt-dlp"}, {"provider_version": "1.2.1"}, {"language": "fr"}])
+def test_local_whisper_lineage_rejects_inconsistent_canonical_identity(updates):
+    with pytest.raises(module().TranscriptValidationError):
+        replace(normalize_whisper(), **updates)
+
+
+@pytest.mark.parametrize("field", ["schema", "provider", "provider_version", "model", "model_repository", "model_revision", "compute_type", "language", "audio_sha256", "job_name"])
+def test_local_whisper_rejects_identity_mismatches(field):
+    data = whisper_data()
+    data[field] = {"audio_sha256": "b" * 64, "job_name": "whisper-" + "b" * 64}.get(field, "unexpected")
+    with pytest.raises(module().TranscriptValidationError, match="^invalid transcript input$"):
+        normalize_whisper(data)
+
+
+@pytest.mark.parametrize("damage", ["unknown", "segment_unknown", "word_unknown", "inference_unknown", "empty", "null", "text", "regression", "reverse", "nan", "infinity", "bool_time", "string_time", "duration", "private_text", "private_word"])
+def test_local_whisper_rejects_malformed_provider_output(damage):
+    data = whisper_data()
+    if damage == "unknown":
+        data["extra"] = "SECRET"
+    elif damage == "segment_unknown":
+        data["segments"][0]["extra"] = "SECRET"
+    elif damage == "word_unknown":
+        data["segments"][0]["words"][0]["extra"] = "SECRET"
+    elif damage == "inference_unknown":
+        data["inference"]["extra"] = "SECRET"
+    elif damage in {"empty", "null"}:
+        data["segments"] = [] if damage == "empty" else None
+    elif damage == "text":
+        data["segments"][0]["text"] = "  "
+    elif damage == "regression":
+        data["segments"].append(dict(start=0.0, end=1.0, text="SECRET", words=[]))
+    elif damage in {"reverse", "bool_time", "string_time"}:
+        data["segments"][0]["start"] = {"reverse": 3.0, "bool_time": True, "string_time": "0"}[damage]
+    elif damage == "duration":
+        data["duration"] = 1.0
+    elif damage == "private_text":
+        data["segments"][0]["text"] = "s3://private/SECRET"
+    elif damage == "private_word":
+        data["segments"][0]["words"][0]["word"] = "https://example.com/?token=SECRET"
+    else:
+        data["segments"][0]["end"] = float("nan" if damage == "nan" else "inf")
+    raw = json.dumps(data).encode()
+    with pytest.raises(module().TranscriptValidationError, match="^invalid transcript input$"):
+        module().normalize_local_whisper(raw, platform="youtube", external_id=METADATA["external_id"],
+                                         item_id=7, source_id=3, audio_sha256="a" * 64,
+                                         raw_sha256=sha256(raw).hexdigest())
+
+
+@pytest.mark.parametrize("updates", [
+    {"audio_sha256": "b" * 64}, {"audio_sha256": "bad"},
+    {"raw_sha256": "b" * 64}, {"raw_sha256": None},
+    {"max_bytes": 5}, {"max_bytes": True}, {"max_text_chars": 2}, {"max_segments": 0},
+    {"canonical_url": "https://bucket.s3.amazonaws.com/SECRET"},
+])
+def test_local_whisper_enforces_hashes_and_shared_limits(updates):
+    with pytest.raises(module().TranscriptValidationError, match="^invalid transcript input$"):
+        normalize_whisper(**updates)
+
+
+@pytest.mark.parametrize("raw", [b"SECRET not-json", b"\xff", b"null", b"{}", b"", b'{"schema":1,"schema":2}'])
+def test_local_whisper_rejects_unparseable_bytes_safely(raw):
+    with pytest.raises(module().TranscriptValidationError, match="^invalid transcript input$"):
+        module().normalize_local_whisper(raw, platform="youtube", external_id=METADATA["external_id"],
+                                         item_id=7, source_id=3, audio_sha256="a" * 64,
+                                         raw_sha256=sha256(raw).hexdigest())
+
+
+def test_local_whisper_normalization_never_imports_inference_runtime():
+    code = '''
+import builtins
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name.split(".")[0] in {"faster_whisper", "ctranslate2"}:
+        raise AssertionError("inference runtime imported")
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+from tests.test_transcripts import normalize_whisper
+normalize_whisper()
+'''
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_historical_caption_and_amazon_canonical_bytes_remain_unchanged():
+    caption = module().normalize_vtt(VTT, origin="creator_caption", **METADATA)
+    amazon = module().normalize_amazon_transcribe(provider_data(), canonical_url="https://podcasts.example/episode",
+               **{**METADATA, "platform": "podcast", "external_id": "episode-123", "provider_version": "2017-10-26"})
+    assert (caption.transcript_sha256, sha256(caption.to_json().encode()).hexdigest()) == (
+        "9a398858e6f0b231b8a647cfb1870bcd8a763eebf6b95d3fd11ab203cb2244d3",
+        "c839771da8f769cdab9e9e0591372dbce069dec700ecd87d634f73e3e837c12f")
+    assert (amazon.transcript_sha256, sha256(amazon.to_json().encode()).hexdigest()) == (
+        "387eb7d1709d1ebc32d95c13d3dc4c535f65f485afdf253c68c9fd4630cac3ca",
+        "4c8de6f27cad889db890578f68a1eb1bcbd79a07173eca9b1983ec12d0b58e27")

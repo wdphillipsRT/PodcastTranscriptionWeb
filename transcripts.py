@@ -15,6 +15,8 @@ import re
 
 from ingestion_types import normalize_public_url
 from s3_utils import DEFAULT_MAX_BYTES, validate_segment
+from whisper_transcribe import (CANONICAL_PROVIDER_VERSION, LANGUAGE, PROVIDER,
+                                parse_whisper_result, whisper_job_name)
 
 
 SCHEMA = "media-transcript-segments/v1"
@@ -221,11 +223,14 @@ def _lineage(platform, external_id, item_id, source_id, origin, provider,
         item_id, source_id = _identity(item_id), _identity(source_id)
     except ValueError:
         _invalid()
-    if platform not in {"youtube", "podcast"} or origin not in {"creator_caption", "automatic_caption", "amazon_transcribe"}:
+    if platform not in {"youtube", "podcast"} or origin not in {"creator_caption", "automatic_caption", "amazon_transcribe", "local_whisper"}:
         _invalid()
     if platform == "youtube" and not re.fullmatch(r"[A-Za-z0-9_-]{11}", external_id):
         _invalid()
-    if origin == "amazon_transcribe" and provider != "amazon_transcribe" or origin != "amazon_transcribe" and provider != "yt-dlp":
+    expected_provider = {"amazon_transcribe": "amazon_transcribe", "local_whisper": PROVIDER}.get(origin, "yt-dlp")
+    if provider != expected_provider:
+        _invalid()
+    if origin == "local_whisper" and (provider_version != CANONICAL_PROVIDER_VERSION or language != LANGUAGE):
         _invalid()
     for value in (provider_version, tool_version, language, provider):
         if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.+/-]{1,128}", value):
@@ -380,5 +385,41 @@ def normalize_amazon_transcribe(content, *, platform, external_id, item_id, sour
                       item_id=item_id, source_id=source_id, origin="amazon_transcribe", provider="amazon_transcribe",
                       provider_version=provider_version, tool_version=tool_version, language=language,
                       duration=duration, canonical_url=canonical_url, max_text_chars=max_text_chars, max_segments=max_segments)
+    except (ValueError, UnicodeError, IndexError, KeyError, TypeError, OverflowError, RecursionError):
+        _invalid()
+
+
+def normalize_local_whisper(content, *, platform, external_id, item_id, source_id,
+                            audio_sha256, raw_sha256, tool_version=NORMALIZER_VERSION,
+                            canonical_url=None, max_bytes=DEFAULT_MAX_BYTES,
+                            max_text_chars=MAX_TEXT_CHARS, max_segments=MAX_SEGMENTS):
+    """Verify a local provider artifact and reuse canonical segment construction.
+
+    The provider parser is pure data validation; importing it never loads the
+    optional inference runtime. Raw digest checks bind the exact stored bytes,
+    while source lineage covers their sorted, compact provider JSON.
+    """
+    try:
+        raw = content.encode("utf-8") if isinstance(content, str) else content
+        if (not isinstance(raw, bytes) or type(max_bytes) is not int
+                or not 0 < len(raw) <= max_bytes <= DEFAULT_MAX_BYTES
+                or not isinstance(raw_sha256, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", raw_sha256)
+                or sha256(raw).hexdigest() != raw_sha256):
+            _invalid()
+        result = parse_whisper_result(raw, expected_audio_sha256=audio_sha256,
+                                      expected_job_name=whisper_job_name(item_id, audio_sha256))
+        # Word rows are excluded from canonical segments but still cannot carry
+        # private locators into the provider artifact accepted by this boundary.
+        for segment in result.segments:
+            for word in segment.words:
+                _text(word.word, max_text_chars)
+        source = canonical_json(json.loads(raw)).encode("utf-8")
+        return _build(((segment.start, segment.end, segment.text) for segment in result.segments),
+                      source_sha256=sha256(source).hexdigest(), platform=platform, external_id=external_id,
+                      item_id=item_id, source_id=source_id, origin="local_whisper", provider=PROVIDER,
+                      provider_version=CANONICAL_PROVIDER_VERSION, tool_version=tool_version, language=LANGUAGE,
+                      duration=result.duration, canonical_url=canonical_url,
+                      max_text_chars=max_text_chars, max_segments=max_segments)
     except (ValueError, UnicodeError, IndexError, KeyError, TypeError, OverflowError, RecursionError):
         _invalid()
