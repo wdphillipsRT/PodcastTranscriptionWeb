@@ -1,7 +1,9 @@
 """The artifact boundary never exposes URLs or follows bucket redirects."""
 
 from io import BytesIO
+from dataclasses import asdict
 from hashlib import sha256
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -450,3 +452,192 @@ def test_concurrent_immutable_writers_create_once_and_reuse_identical_bytes():
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: storage.put_content_addressed(content, key), range(2)))
     assert results == [key, key] and writes == [content] and objects == {key: content}
+
+
+def test_verified_download_streams_to_disk_and_syncs_before_return(tmp_path, monkeypatch):
+    storage, client = manager()
+    destination = tmp_path / "private-audio.mp3"
+    size = 180_000
+    class Stream:
+        remaining = size
+        closed = False
+        def read(self, count):
+            assert 0 < count <= 65536
+            # Earlier complete chunks must already have reached the file.
+            if self.remaining and self.remaining < size:
+                assert destination.stat().st_size == size - self.remaining
+            produced = min(count, self.remaining)
+            self.remaining -= produced
+            return b"a" * produced
+        def close(self):
+            self.closed = True
+    body = Stream()
+    client.get_object.return_value = {"Body": body, "ContentLength": size}
+    monkeypatch.setattr(storage, "get_bytes", Mock(side_effect=AssertionError("must stream")))
+    synced = []
+    real_fsync = os.fsync
+    def sync(fd):
+        assert destination.read_bytes() == b"a" * size
+        synced.append(fd)
+        real_fsync(fd)
+    monkeypatch.setattr(os, "fsync", sync)
+    digest = sha256(b"a" * size).hexdigest()
+    result = storage.download_file_verified(KEY, destination, expected_sha256=digest, max_bytes=size)
+    assert asdict(result) == {"byte_count": size, "sha256": digest}
+    assert destination.read_bytes() == b"a" * size
+    assert destination.stat().st_mode & 0o777 == 0o600
+    assert body.closed and synced
+    client.get_object.assert_called_once_with(Bucket=BUCKET, Key=KEY)
+
+
+@pytest.mark.parametrize("declared,actual,maximum,digest", [
+    (0, b"", 5, sha256(b"").hexdigest()),
+    (6, b"abcdef", 5, sha256(b"abcdef").hexdigest()),
+    (4, b"abcde", 5, sha256(b"abcde").hexdigest()),
+    (5, b"abc", 5, sha256(b"abc").hexdigest()),
+    (None, b"abc", 5, sha256(b"abc").hexdigest()),
+    (True, b"x", 5, sha256(b"x").hexdigest()),
+    (5, b"audio", 5, "f" * 64),
+])
+def test_verified_download_rejects_corruption_and_removes_partial_file(tmp_path, declared, actual, maximum, digest):
+    storage, client = manager()
+    destination = tmp_path / "private-audio.mp3"
+    body = BytesIO(actual)
+    client.get_object.return_value = {"Body": body, "ContentLength": declared}
+    with pytest.raises(s3_utils.StorageIntegrityError) as caught:
+        storage.download_file_verified(KEY, destination, expected_sha256=digest, max_bytes=maximum)
+    assert body.closed and not destination.exists()
+    assert KEY not in str(caught.value) and str(destination) not in str(caught.value)
+
+
+@pytest.mark.parametrize("failure", ["provider", "stream", "sync", "interrupt"])
+def test_verified_download_cleans_failures_and_redacts_diagnostics(tmp_path, monkeypatch, failure):
+    from botocore.exceptions import ResponseStreamingError
+    storage, client = manager()
+    destination = tmp_path / "SECRET-audio.mp3"
+    body = Mock()
+    body.read.side_effect = [b"audio", b""]
+    client.get_object.return_value = {"Body": body, "ContentLength": 5}
+    error_type = s3_utils.StorageTransientError
+    if failure == "provider":
+        client.get_object.side_effect = ClientError({"Error": {"Code": "SlowDown", "Message": f"SECRET {KEY} {destination}"}}, "GetObject")
+    elif failure == "stream":
+        body.read.side_effect = [b"au", ResponseStreamingError(error=f"SECRET {KEY} {destination}")]
+    elif failure == "sync":
+        monkeypatch.setattr(os, "fsync", Mock(side_effect=OSError(f"SECRET {destination}")))
+        error_type = s3_utils.StoragePermanentError
+    else:
+        body.read.side_effect = [b"au", KeyboardInterrupt()]
+        error_type = KeyboardInterrupt
+    with pytest.raises(error_type) as caught:
+        storage.download_file_verified(KEY, destination, expected_sha256=sha256(b"audio").hexdigest(), max_bytes=5)
+    assert not destination.exists()
+    assert "SECRET" not in str(caught.value) and KEY not in str(caught.value)
+    assert caught.value.__cause__ is None
+    if failure != "provider":
+        body.close.assert_called_once()
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink", "fifo", "missing-parent", "invalid-type"])
+def test_verified_download_rejects_invalid_destinations_without_clobbering(tmp_path, kind):
+    storage, client = manager()
+    destination = tmp_path / "private-audio.mp3"
+    target = tmp_path / "keep.mp3"
+    target.write_bytes(b"keep")
+    if kind == "file":
+        destination.write_bytes(b"original")
+    elif kind == "directory":
+        destination.mkdir()
+    elif kind == "symlink":
+        destination.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(destination)
+    elif kind == "missing-parent":
+        destination = tmp_path / "missing" / "audio.mp3"
+    else:
+        destination = None
+    with pytest.raises(s3_utils.StoragePermanentError) as caught:
+        storage.download_file_verified(KEY, destination, expected_sha256="a" * 64, max_bytes=5)
+    assert str(destination) not in str(caught.value) and caught.value.__cause__ is None
+    assert target.read_bytes() == b"keep"
+    if kind == "file":
+        assert destination.read_bytes() == b"original"
+    elif kind in {"directory", "symlink", "fifo"}:
+        assert destination.lstat()
+    client.get_object.assert_not_called()
+
+
+@pytest.mark.parametrize("changes", [dict(expected_sha256=None), dict(expected_sha256="A" * 64),
+    dict(expected_sha256=True), dict(max_bytes=0), dict(max_bytes=True), dict(s3_key="https://SECRET.invalid")])
+def test_verified_download_validates_inputs_before_creating_file(tmp_path, changes):
+    storage, client = manager()
+    destination = tmp_path / "private-audio.mp3"
+    kwargs = dict(s3_key=KEY, expected_sha256="a" * 64, max_bytes=5)
+    kwargs.update(changes)
+    with pytest.raises(s3_utils.StoragePermanentError):
+        storage.download_file_verified(local_path=destination, **kwargs)
+    assert not destination.exists()
+    client.get_object.assert_not_called()
+
+
+def test_verified_download_reuses_response_region_checks(tmp_path):
+    storage, client = manager()
+    body = BytesIO(b"audio")
+    client.get_object.return_value = {"Body": body, "ContentLength": 5,
+        "ResponseMetadata": {"HTTPStatusCode": 301, "HTTPHeaders": {"location": "https://SECRET.invalid"}}}
+    destination = tmp_path / "private-audio.mp3"
+    with pytest.raises(s3_utils.StoragePermanentError, match="redirect"):
+        storage.download_file_verified(KEY, destination, expected_sha256=sha256(b"audio").hexdigest(), max_bytes=5)
+    assert body.closed and not destination.exists()
+
+
+@pytest.mark.parametrize("operation", ["write", "flush", "close"])
+def test_verified_download_local_io_failure_closes_body_and_removes_file(tmp_path, monkeypatch, operation):
+    storage, client = manager()
+    body = BytesIO(b"audio")
+    client.get_object.return_value = {"Body": body, "ContentLength": 5}
+    destination = tmp_path / "SECRET-audio.mp3"
+    real_fdopen = os.fdopen
+    class FailingFile:
+        def __init__(self, fd, mode):
+            self.file = real_fdopen(fd, mode)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.file.close()
+            if operation == "close":
+                raise OSError(f"SECRET {destination}")
+        def write(self, chunk):
+            if operation == "write":
+                self.file.write(chunk[:2])
+                raise OSError(f"SECRET {destination}")
+            return self.file.write(chunk)
+        def flush(self):
+            if operation == "flush":
+                raise OSError(f"SECRET {destination}")
+            self.file.flush()
+        def fileno(self):
+            return self.file.fileno()
+    monkeypatch.setattr(os, "fdopen", FailingFile)
+    with pytest.raises(s3_utils.StoragePermanentError) as caught:
+        storage.download_file_verified(KEY, destination, expected_sha256=sha256(b"audio").hexdigest(), max_bytes=5)
+    assert body.closed and not destination.exists()
+    assert "SECRET" not in str(caught.value) and caught.value.__cause__ is None
+
+
+def test_verified_download_cleanup_preserves_replaced_destination(tmp_path, monkeypatch):
+    storage, client = manager()
+    destination = tmp_path / "audio.mp3"
+    original = tmp_path / "moved-partial.mp3"
+    replacement = tmp_path / "replacement.mp3"
+    replacement.write_bytes(b"keep")
+    body = BytesIO(b"audio")
+    client.get_object.return_value = {"Body": body, "ContentLength": 5}
+    def replace_then_fail(fd):
+        destination.rename(original)
+        replacement.rename(destination)
+        raise OSError("SECRET")
+    monkeypatch.setattr(os, "fsync", replace_then_fail)
+    with pytest.raises(s3_utils.StoragePermanentError):
+        storage.download_file_verified(KEY, destination, expected_sha256=sha256(b"audio").hexdigest(), max_bytes=5)
+    assert destination.read_bytes() == b"keep" and body.closed

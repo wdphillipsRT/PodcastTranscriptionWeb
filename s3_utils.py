@@ -2,9 +2,12 @@
 
 from collections.abc import Mapping
 from contextlib import closing
+from dataclasses import dataclass
 from hashlib import sha256
+import os
 from pathlib import Path
 import re
+import stat
 
 from botocore.exceptions import (ClientError, ConnectionError, HTTPClientError,
                                  IncompleteReadError, ResponseStreamingError)
@@ -38,6 +41,14 @@ class StorageIntegrityError(StoragePermanentError):
 
 class StorageRangeError(StoragePermanentError):
     """A byte range cannot be served; contains no storage diagnostics."""
+
+
+@dataclass(frozen=True)
+class VerifiedDownload:
+    """Verified content metadata, without storage or local path details."""
+
+    byte_count: int
+    sha256: str
 
 
 def parse_media_range(header):
@@ -385,6 +396,58 @@ class S3Manager:
         except OSError:
             raise StoragePermanentError("artifact local write failed") from None
         return True
+
+    def download_file_verified(self, s3_key, local_path, *, expected_sha256,
+                               max_bytes) -> VerifiedDownload:
+        """Stream verified audio to a new private file in an existing directory.
+
+        The caller owns the temporary directory. Existing destinations are never
+        replaced; failures remove only the regular file created by this call.
+        """
+        validate_artifact_key(s3_key)
+        if (not isinstance(expected_sha256, str)
+                or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None):
+            raise StoragePermanentError("invalid artifact hash")
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise StoragePermanentError("invalid artifact byte limit")
+        destination, identity, descriptor = None, None, None
+        complete = False
+        try:
+            destination = Path(local_path)
+            descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created = os.fstat(descriptor)
+            identity = (created.st_dev, created.st_ino)
+            digest, total = sha256(), 0
+            with os.fdopen(descriptor, "wb") as output:
+                descriptor = None  # The file context now owns the descriptor.
+                with closing(self._object_chunks(s3_key, max_bytes=max_bytes)) as chunks:
+                    for chunk in chunks:
+                        output.write(chunk)
+                        digest.update(chunk)
+                        total += len(chunk)
+                actual_sha256 = digest.hexdigest()
+                if not total or actual_sha256 != expected_sha256:
+                    raise StorageIntegrityError("artifact hash or empty body mismatch")
+                output.flush()
+                os.fsync(output.fileno())
+            complete = True
+            return VerifiedDownload(byte_count=total, sha256=actual_sha256)
+        except StorageError:
+            raise
+        except Exception as error:
+            _failure(error)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if not complete and identity is not None:
+                try:
+                    current = destination.lstat()
+                    if (stat.S_ISREG(current.st_mode)
+                            and (current.st_dev, current.st_ino) == identity):
+                        destination.unlink()
+                except OSError:
+                    # Cleanup must not replace a safe error with local details.
+                    pass
 
     def get_file_info(self, s3_key):
         validate_artifact_key(s3_key)
