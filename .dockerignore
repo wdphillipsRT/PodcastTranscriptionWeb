@@ -61,4 +61,6 @@ build
 dist
 *.egg-info
 *.md
+# Include only the pinned public-domain local inference smoke fixture.
+!assets/whisper-smoke.flac
 # Migrations, templates, static assets and startup scripts remain included.
