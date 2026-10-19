@@ -89,7 +89,7 @@ def test_live_caption_priority(live_settings, tmp_path):
             return
         pytest.fail("Selected caption video has no usable preferred-language captions", pytrace=False)
     except Exception:
-        pytest.fail("Live caption check failed; inspect provider access privately", pytrace=False)
+        raise pytest.fail.Exception("Live caption check failed; inspect provider access privately", pytrace=False) from None
 
 
 @pytest.mark.parametrize("setting,kind", [
@@ -183,7 +183,7 @@ def test_live_newest25_and_historical_backfill(live_settings, setting, kind, mon
                 db.session.remove()
                 db.drop_all()
     except Exception:
-        pytest.fail("Live discovery/backfill check failed; inspect provider access privately", pytrace=False)
+        raise pytest.fail.Exception("Live discovery/backfill check failed; inspect provider access privately", pytrace=False) from None
 
 
 def test_live_deliberate_amazon_fallback(live_settings, tmp_path):
@@ -217,7 +217,7 @@ def test_live_deliberate_amazon_fallback(live_settings, tmp_path):
         assert bool(first == second), "Amazon replay changed artifact identity"
         assert bool(first["provider"] == "amazon_transcribe"), "Unexpected fallback provider"
     except Exception:
-        pytest.fail("Live Amazon check failed; inspect provider access privately", pytrace=False)
+        raise pytest.fail.Exception("Live Amazon check failed; inspect provider access privately", pytrace=False) from None
 
 
 def test_live_small_public_rss(live_settings):
@@ -232,4 +232,4 @@ def test_live_small_public_rss(live_settings):
             page = discover_podcast_items(source, live_settings, session, limit=25)
             assert bool(0 < len(page.items) <= 25), "Selected RSS feed has no playable episodes"
     except Exception:
-        pytest.fail("Live RSS check failed; inspect feed access privately", pytrace=False)
+        raise pytest.fail.Exception("Live RSS check failed; inspect feed access privately", pytrace=False) from None

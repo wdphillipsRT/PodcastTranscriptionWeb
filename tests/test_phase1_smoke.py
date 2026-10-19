@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from io import BytesIO
 import json
+import runpy
 from pathlib import Path
 import re
 import socket
@@ -277,6 +278,8 @@ def test_phase1_ingests_backfills_and_replays_privately(smoke, monkeypatch, capl
     ]
     request_ids = []
     for kind, selector, accepted, queued in selectors:
+        before_memberships = {row.external_id for row in ContentItem.query.join(SourceItem).filter(
+            SourceItem.source_id == sources[kind])}
         response = browser.post(f"/api/sources/{sources[kind]}/backfills", json=selector, headers=headers)
         assert response.status_code == 201
         request_ids.append(response.json["id"])
@@ -284,6 +287,16 @@ def test_phase1_ingests_backfills_and_replays_privately(smoke, monkeypatch, capl
         status = browser.get(f"/api/backfills/{response.json['id']}").json
         assert status["state"] == "completed" and status["items_scanned"] >= accepted
         assert (status["items_accepted"], status["items_queued"]) == (accepted, queued)
+        if selector["selector_type"] == "date_range":
+            selected = ContentItem.query.join(SourceItem).filter(
+                SourceItem.source_id == sources[kind],
+                ContentItem.external_id.notin_(before_memberships)).all()
+            # Assert immediately, before another backfill or scheduled scan can
+            # add neighboring dates and obscure what this selector imported.
+            assert {row.external_id: row.published_at.date().isoformat() for row in selected} == {
+                video_id(3): "2026-01-04", video_id(4): "2026-01-05"}
+            request = db.session.get(BackfillRequest, response.json["id"])
+            assert (request.start_date.isoformat(), request.end_date.isoformat()) == ("2026-01-04", "2026-01-05")
         before = counts()
         tasks.run_backfill.run(response.json["id"])
         smoke.drain()
@@ -340,9 +353,13 @@ def test_phase1_ingests_backfills_and_replays_privately(smoke, monkeypatch, capl
             expected_hash = sha256(canonical_json({**lineage, "ordinal": ordinal, **value}).encode()).hexdigest()
             assert segment["sha256"] == expected_hash
             assert segment["id"] == f"seg-{ordinal + 1:06d}-{expected_hash[:16]}"
-            expected = (f"https://www.youtube.com/watch?v={row.external_id}&t="
-                        if row.platform == "youtube" else row.canonical_url + "#t=")
-            assert segment["citation"].startswith(expected)
+            if row.platform == "youtube":
+                # Nonnegative timestamps truncate to the whole-second target.
+                # Derive it independently rather than trusting the normalizer.
+                expected = f"https://www.youtube.com/watch?v={row.external_id}&t={int(segment['start'])}s"
+                assert segment["citation"] == expected
+            else:
+                assert segment["citation"].startswith(row.canonical_url + "#t=")
         keys = [row.transcript_s3_key, row.segments_s3_key, row.provider_transcript_s3_key]
         if row.media_s3_key:
             keys.append(row.media_s3_key)
@@ -391,3 +408,65 @@ def test_live_verification_is_opt_in_and_documented():
         text = (root / name).read_text()
         assert "RUN_LIVE_YOUTUBE" in text, "Missing explicit live-test opt-in instructions"
         assert "tests/test_phase1_smoke.py" in text
+
+
+@pytest.mark.parametrize("case,message", [
+    ("caption", "Live caption check failed; inspect provider access privately"),
+    ("discovery", "Live discovery/backfill check failed; inspect provider access privately"),
+    ("amazon", "Live Amazon check failed; inspect provider access privately"),
+    ("rss", "Live RSS check failed; inspect feed access privately"),
+])
+def test_live_failure_formatter_suppresses_provider_exception_chain(case, message, monkeypatch, tmp_path):
+    """Render real live handlers offline, including nested provider exceptions."""
+    import boto3
+    import episode_fetcher
+    import feed_resolver
+    from youtube_discovery import YouTubeDiscoveryClient
+
+    secret = "-".join(("synthetic", "provider", "secret", "for", "redaction"))
+    locator = "https://" + "private-bucket.s3.amazonaws.com/items/private?X-Amz-Signature=synthetic-capability"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Privacy regression test attempted live network access")
+
+    def provider_failure(*args, **kwargs):
+        try:
+            raise ValueError(secret)
+        except ValueError:
+            raise RuntimeError(locator)
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(YouTubeDiscoveryClient, "resolve_video", provider_failure)
+    monkeypatch.setattr(YouTubeDiscoveryClient, "resolve_source", provider_failure)
+    monkeypatch.setattr(feed_resolver, "resolve_podcast_source", provider_failure)
+    monkeypatch.setattr(episode_fetcher, "discover_podcast_items", forbidden)
+    monkeypatch.setattr(boto3, "Session", lambda: SimpleNamespace(get_credentials=lambda: object()))
+    monkeypatch.setenv("RUN_LIVE_AWS_TRANSCRIBE", "1")
+    module = runpy.run_path(str(Path(__file__).with_name("live") / "test_youtube_live.py"))
+    functions = {name: value for name, value in module.items() if callable(value)}
+    # runpy's result mapping is separate from each function's global namespace.
+    globals_ = functions["test_live_caption_priority"].__globals__
+    monkeypatch.setitem(globals_, "required", lambda name:
+        "creator_caption" if name == "LIVE_YOUTUBE_EXPECTED_ORIGIN" else "https://youtu.be/abcdefghijk")
+    settings = SimpleNamespace(YOUTUBE_API_KEY="synthetic-api-key")
+    calls = {
+        "caption": lambda: functions["test_live_caption_priority"](settings, tmp_path),
+        "discovery": lambda: functions["test_live_newest25_and_historical_backfill"](
+            settings, "LIVE_YOUTUBE_CHANNEL_URL", "youtube_channel", monkeypatch),
+        "amazon": lambda: functions["test_live_deliberate_amazon_fallback"](settings, tmp_path),
+        "rss": lambda: functions["test_live_small_public_rss"](settings),
+    }
+    with pytest.raises(pytest.fail.Exception) as failure:
+        calls[case]()
+    # This is pytest's actual chained-traceback formatter, without disabling
+    # chaining globally or relying on the operator's selected --tb style.
+    rendered = str(failure.getrepr(style="long", chain=True))
+    assert isinstance(failure.value.__context__, RuntimeError)
+    assert str(failure.value.__context__) == locator
+    assert str(failure.value.__context__.__context__) == secret
+    assert message in rendered
+    assert secret not in rendered
+    assert locator not in rendered
+    assert failure.value.__suppress_context__
+    assert failure.value.__cause__ is None
