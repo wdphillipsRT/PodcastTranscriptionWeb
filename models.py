@@ -348,6 +348,9 @@ class DiscoveryCandidate(Timestamps, db.Model):
     platform = db.Column(db.String(32), nullable=False)
     external_id = db.Column(db.String(1024), nullable=False)
     descriptor = db.Column(MutableDict.as_mutable(DescriptorJSON(none_as_null=True)))
+    # Retained after descriptor cleanup: unavailable identities may be revisited,
+    # whereas usable initial history omitted by the limit requires backfill.
+    was_available = db.Column(db.Boolean, nullable=False, default=True, server_default=sa.true())
     run = db.relationship("DiscoveryRun", back_populates="candidates")
     __table_args__ = (
         sa.UniqueConstraint("run_id", "platform", "external_id", name="uq_discovery_candidates_identity"),

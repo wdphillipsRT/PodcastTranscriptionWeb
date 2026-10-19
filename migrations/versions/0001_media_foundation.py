@@ -181,6 +181,7 @@ def upgrade():
         sa.Column("platform", sa.String(32), nullable=False),
         sa.Column("external_id", sa.String(1024), nullable=False),
         sa.Column("descriptor", sa.JSON(none_as_null=True)),
+        sa.Column("was_available", sa.Boolean, nullable=False, server_default=sa.true()),
         *timestamps(),
         sa.UniqueConstraint("run_id", "platform", "external_id", name="uq_discovery_candidates_identity"),
         sa.CheckConstraint("platform IN ('podcast', 'youtube')", name="ck_discovery_candidates_platform"),

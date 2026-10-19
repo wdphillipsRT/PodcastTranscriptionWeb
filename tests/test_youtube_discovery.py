@@ -342,11 +342,12 @@ def test_invalid_source_or_cursor_is_rejected_before_http(source, token):
     session.get.assert_not_called()
 
 
-def test_unavailable_playlist_member_has_typed_error_without_advancing_cursor():
+def test_unavailable_playlist_member_retains_identity_and_advances_cursor():
     client, _ = client_with(response(fixture("playlist_page")), response({"items": []}))
     source = SourceDescriptor("youtube_playlist", PLAYLIST, "https://youtube.com/", "Lessons")
-    with pytest.raises(YouTubeDiscoveryError, match="private_or_deleted"):
-        client.discover_page(source)
+    page = client.discover_page(source)
+    assert page.items == () and page.unavailable_ids == (VIDEO,)
+    assert page.next_cursor == "CAUQAA" and not page.exhausted
 
 
 def test_close_transport_failure_is_safe():

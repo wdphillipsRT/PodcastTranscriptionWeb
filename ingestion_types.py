@@ -218,9 +218,13 @@ class DiscoveryPage:
     next_cursor: str | None = None
     exhausted: bool = True
     etag: str | None = None
+    # YouTube identities observed in this page but not currently usable. Keep
+    # them separate from ItemDescriptor so no unavailable video can be queued.
+    unavailable_ids: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "items", tuple(self.items))
+        object.__setattr__(self, "unavailable_ids", tuple(self.unavailable_ids))
 
 
 @dataclass(frozen=True)

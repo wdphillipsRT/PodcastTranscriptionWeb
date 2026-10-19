@@ -9,6 +9,7 @@ import json
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from ingestion_types import SourceDescriptor, normalize_public_url
 from models import (BackfillRequest, ContentItem, ContentSource, DiscoveryCandidate,
@@ -125,13 +126,21 @@ class DiscoveryService:
         self.continue_discovery(run_id)
         return run_id
 
-    def _stage(self, run, items):
-        for item in items:
+    def _stage(self, run, items, unavailable_ids=()):
+        for identity in unavailable_ids:
             _, created = self._unique(DiscoveryCandidate,
+                dict(run_id=run.id, platform="youtube", external_id=identity),
+                dict(was_available=False))
+            if created:
+                run.items_scanned += 1
+        for item in items:
+            candidate, created = self._unique(DiscoveryCandidate,
                 dict(run_id=run.id, platform=item.platform, external_id=item.external_id),
                 dict(descriptor=item_projection(item)))
             if created:
                 run.items_scanned += 1
+            elif not candidate.was_available:
+                candidate.descriptor, candidate.was_available = item_projection(item), True
 
     @staticmethod
     def _cursor(cursor):
@@ -245,7 +254,7 @@ class DiscoveryService:
             cursor = self._cursor(page.next_cursor)
             if not page.exhausted and (cursor is None or cursor == run.cursor):
                 raise ValueError("nonadvancing discovery cursor")
-            self._stage(run, page.items)
+            self._stage(run, page.items, page.unavailable_ids)
             run.cursor = cursor
             run.state = "finalizing" if page.exhausted else "scanning"
             if request:
@@ -342,7 +351,19 @@ class DiscoveryService:
         # only its bounded batch, even when a playlist has extensive history.
         query = self.session.query(DiscoveryCandidate).filter(
             DiscoveryCandidate.run_id == run.id, DiscoveryCandidate.descriptor.is_not(None)
-        ).order_by(DiscoveryCandidate.descriptor["published_at"].as_string().desc().nullslast(),
+        )
+        if run.run_type == "scheduled":
+            previous, prior_run = aliased(DiscoveryCandidate), aliased(DiscoveryRun)
+            # Completed scans retain every observed identity, including the
+            # initial history deliberately omitted by newest-25. No timestamp
+            # cutoff can substitute for this per-source baseline.
+            query = query.filter(~sa.exists().where(
+                previous.run_id == prior_run.id, prior_run.source_id == run.source_id,
+                prior_run.id != run.id, prior_run.backfill_id.is_(None),
+                prior_run.state == "completed", previous.was_available.is_(True),
+                previous.platform == DiscoveryCandidate.platform,
+                previous.external_id == DiscoveryCandidate.external_id))
+        query = query.order_by(DiscoveryCandidate.descriptor["published_at"].as_string().desc().nullslast(),
                    DiscoveryCandidate.external_id.desc())
         return (query.limit(limit) if limit is not None else query).all()
 
@@ -387,7 +408,11 @@ class DiscoveryService:
 
     def finalize_discovery(self, run_id):
         run = self._locked(DiscoveryRun, run_id)
-        if run is None or run.state != "finalizing" or not run.source.enabled:
+        if run is None or run.state != "finalizing":
+            self.session.commit()
+            return None
+        source = self._locked(ContentSource, run.source_id)
+        if source is None or not source.enabled:
             self.session.commit()
             return None
         candidates = self._ordered_candidates(run, 25 if run.run_type == "initial" else None)
@@ -599,8 +624,8 @@ class DiscoveryService:
             elif request.selector_type == "explicit_url":
                 matches = value.get("canonical_url") == request.explicit_url
             if matches:
-                _, _, queued = self._accept(request.source, candidate)
-                request.items_accepted += 1
+                _, membership, queued = self._accept(request.source, candidate)
+                request.items_accepted += int(membership)
                 request.items_queued += int(queued)
                 run.items_accepted, run.items_queued = request.items_accepted, request.items_queued
             else:

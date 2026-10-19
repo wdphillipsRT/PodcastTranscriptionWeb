@@ -23,6 +23,8 @@ _PARTS = {"videos": "snippet,contentDetails,status,liveStreamingDetails",
           "channels": "snippet,contentDetails", "playlists": "snippet,contentDetails,status",
           "playlistItems": "snippet,contentDetails,status"}
 _RETRYABLE = frozenset({"transport_error", "quota_exhausted", "rate_limited", "upstream_error", "upcoming", "live"})
+_UNAVAILABLE = frozenset({"private", "unlisted", "deleted", "unavailable", "private_or_deleted",
+                          "upcoming", "live", "region_restricted", "age_restricted", "members_only"})
 
 
 class YouTubeDiscoveryError(IngestionError):
@@ -319,7 +321,7 @@ class YouTubeDiscoveryClient:
         if upload != "processed":
             _fail("upcoming")
 
-    def _videos(self, data, identities, source_type, source_id):
+    def _videos(self, data, identities, source_type, source_id, *, skip_unavailable=False):
         entries = {}
         for entry in data["items"]:
             identity = _identity(entry.get("id"), VIDEO_ID)
@@ -329,44 +331,52 @@ class YouTubeDiscoveryClient:
         items = []
         for identity in identities:
             if identity not in entries:
+                if skip_unavailable:
+                    continue
                 _fail("private_or_deleted")
             entry = entries[identity]
-            self._public_status(entry)
-            snippet = _mapping(entry.get("snippet"))
-            live = _text(snippet.get("liveBroadcastContent", "none"), required=True)
-            if live in {"live", "upcoming"}:
-                _fail(live)
-            if live != "none":
-                _fail("invalid_response")
-            live_details = _mapping(entry.get("liveStreamingDetails", {}))
-            if live_details.get("scheduledStartTime") and not live_details.get("actualStartTime"):
-                _fail("upcoming")
-            if live_details.get("actualStartTime") and not live_details.get("actualEndTime"):
-                _fail("live")
-            details = _mapping(entry.get("contentDetails"))
-            restriction = _mapping(details.get("regionRestriction", {}))
-            if restriction:
-                _fail("region_restricted")
-            rating = _mapping(details.get("contentRating", {}))
-            if rating.get("ytRating") == "ytAgeRestricted":
-                _fail("age_restricted")
-            channel = _identity(snippet.get("channelId"), CHANNEL_ID)
-            channel_name = _text(snippet.get("channelTitle"))
             try:
-                item = ItemDescriptor(source_type=source_type, source_external_id=source_id, external_id=identity,
-                                      title=_text(snippet.get("title"), required=True),
-                                      published_at=_published(snippet.get("publishedAt")),
-                                      canonical_url=f"https://www.youtube.com/watch?v={identity}",
-                                      description=_text(snippet.get("description", "")),
-                                      platform="youtube", item_type="youtube_video", creator_id=channel,
-                                      creator_name=channel_name, channel_id=channel, channel_name=channel_name,
-                                      channel_url=f"https://www.youtube.com/channel/{channel}",
-                                      thumbnail_url=_thumbnail(snippet), duration_seconds=_duration(details.get("duration")),
-                                      requires_reacquisition=True)
-            except IngestionError:
-                raise YouTubeDiscoveryError("invalid_response") from None
-            items.append(item)
+                items.append(self._video(entry, identity, source_type, source_id))
+            except YouTubeDiscoveryError as error:
+                if not skip_unavailable or error.category not in _UNAVAILABLE:
+                    raise
         return tuple(items)
+
+    def _video(self, entry, identity, source_type, source_id):
+        self._public_status(entry)
+        snippet = _mapping(entry.get("snippet"))
+        live = _text(snippet.get("liveBroadcastContent", "none"), required=True)
+        if live in {"live", "upcoming"}:
+            _fail(live)
+        if live != "none":
+            _fail("invalid_response")
+        live_details = _mapping(entry.get("liveStreamingDetails", {}))
+        if live_details.get("scheduledStartTime") and not live_details.get("actualStartTime"):
+            _fail("upcoming")
+        if live_details.get("actualStartTime") and not live_details.get("actualEndTime"):
+            _fail("live")
+        details = _mapping(entry.get("contentDetails"))
+        restriction = _mapping(details.get("regionRestriction", {}))
+        if restriction:
+            _fail("region_restricted")
+        rating = _mapping(details.get("contentRating", {}))
+        if rating.get("ytRating") == "ytAgeRestricted":
+            _fail("age_restricted")
+        channel = _identity(snippet.get("channelId"), CHANNEL_ID)
+        channel_name = _text(snippet.get("channelTitle"))
+        try:
+            return ItemDescriptor(source_type=source_type, source_external_id=source_id, external_id=identity,
+                                  title=_text(snippet.get("title"), required=True),
+                                  published_at=_published(snippet.get("publishedAt")),
+                                  canonical_url=f"https://www.youtube.com/watch?v={identity}",
+                                  description=_text(snippet.get("description", "")),
+                                  platform="youtube", item_type="youtube_video", creator_id=channel,
+                                  creator_name=channel_name, channel_id=channel, channel_name=channel_name,
+                                  channel_url=f"https://www.youtube.com/channel/{channel}",
+                                  thumbnail_url=_thumbnail(snippet), duration_seconds=_duration(details.get("duration")),
+                                  requires_reacquisition=True)
+        except IngestionError:
+            raise YouTubeDiscoveryError("invalid_response") from None
 
     def discover_page(self, source: SourceDescriptor, page_token: str | None = None) -> DiscoveryPage:
         if not isinstance(source, SourceDescriptor):
@@ -395,8 +405,32 @@ class YouTubeDiscoveryClient:
             params["pageToken"] = page_token
         data = self._request("playlistItems", **params)
         identities = []
+        unavailable = []
         for entry in data["items"]:
-            self._public_status(entry)
+            blocked = False
+            try:
+                self._public_status(entry)
+            except YouTubeDiscoveryError as error:
+                if error.category not in _UNAVAILABLE:
+                    raise
+                blocked = True
+            if blocked:
+                # Private/deleted placeholders may omit contentDetails or even
+                # the video identity. Retain any exposed identity for revisits;
+                # an unidentifiable placeholder must not stop usable siblings.
+                details = _mapping(entry.get("contentDetails", {}))
+                snippet = _mapping(entry.get("snippet", {}))
+                resource_id = _mapping(snippet.get("resourceId", {}))
+                exposed = [_identity(value, VIDEO_ID) for value in
+                           (details.get("videoId"), resource_id.get("videoId")) if value is not None]
+                if len(set(exposed)) > 1:
+                    _fail("invalid_response")
+                if not exposed:
+                    continue
+                identity = exposed[0]
+                if identity not in unavailable:
+                    unavailable.append(identity)
+                continue
             details = _mapping(entry.get("contentDetails"))
             identity = _identity(details.get("videoId"), VIDEO_ID)
             snippet = _mapping(entry.get("snippet"))
@@ -408,6 +442,9 @@ class YouTubeDiscoveryClient:
         items = ()
         if identities:
             videos = self._request("videos", id=",".join(identities))
-            items = self._videos(videos, identities, source.source_type, source.external_id)
+            items = self._videos(videos, identities, source.source_type, source.external_id, skip_unavailable=True)
+            usable = {item.external_id for item in items}
+            unavailable.extend(identity for identity in identities if identity not in usable and identity not in unavailable)
         cursor = data.get("nextPageToken")
-        return DiscoveryPage(items, next_cursor=cursor, exhausted=cursor is None, etag=data.get("etag"))
+        return DiscoveryPage(items, next_cursor=cursor, exhausted=cursor is None, etag=data.get("etag"),
+                             unavailable_ids=tuple(unavailable))
