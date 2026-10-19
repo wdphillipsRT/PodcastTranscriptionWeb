@@ -366,6 +366,9 @@ def test_example_text_only_enters_stdin(adapter, harness, window, monkeypatch):
 
 def test_schema_has_exact_closed_vocabularies(adapter):
     schema = adapter.OUTPUT_SCHEMA
+    # Claude Code 2.1.303 rejects the draft URI even though it accepts this
+    # schema's supported validation keywords.
+    assert "$schema" not in schema
     assert schema["additionalProperties"] is False and schema["required"] == ["ranges"]
     ranges = schema["properties"]["ranges"]
     assert (ranges["minItems"], ranges["maxItems"]) == (1, 80)

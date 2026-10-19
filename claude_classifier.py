@@ -29,7 +29,6 @@ SYSTEM_PROMPT = (
 )
 _ID_SCHEMA = {"type": "string", "pattern": "^seg-[0-9]{6}-[a-f0-9]{16}$"}
 OUTPUT_SCHEMA = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object", "additionalProperties": False, "required": ["ranges"],
     "properties": {"ranges": {"type": "array", "minItems": 1, "maxItems": 80,
         "items": {"type": "object", "additionalProperties": False,
