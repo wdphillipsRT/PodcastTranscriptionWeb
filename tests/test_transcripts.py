@@ -137,3 +137,11 @@ def test_provider_language_mismatch_cannot_be_silently_relabelled():
     data["results"]["language_code"] = "fr-FR"
     with pytest.raises(module().TranscriptValidationError):
         module().normalize_amazon_transcribe(data, **METADATA)
+
+
+@pytest.mark.parametrize("start,end,expected", [(12345.678, 12346.120, "12345.678,12346.12"), (1_000_000.001, 1_000_001.990, "1000000.001,1000001.99"), (1.200, 2.000, "1.2,2"), (0.000, 0.010, "0,0.01")])
+def test_podcast_citations_preserve_milliseconds_without_exponent_or_rounding(start, end, expected):
+    data = provider_data()
+    data["results"]["items"] = [{"type": "pronunciation", "start_time": str(start), "end_time": str(end), "alternatives": [{"content": "Word."}]}]
+    result = module().normalize_amazon_transcribe(data, canonical_url="https://podcasts.example/episode", **{**METADATA, "platform": "podcast", "external_id": "episode-123"})
+    assert result.segments[0].citation == f"https://podcasts.example/episode#t={expected}"

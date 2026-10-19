@@ -203,7 +203,9 @@ def _build(rows, *, source_sha256, platform, external_id, item_id, source_id,
         if platform == "youtube":
             citation = f"https://www.youtube.com/watch?v={external_id}&t={math.floor(start)}s"
         else:
-            citation = f"{canonical_url or 'podcast:' + external_id}#t={start:g},{end:g}"
+            start_target = f"{start:.3f}".rstrip("0").rstrip(".")
+            end_target = f"{end:.3f}".rstrip("0").rstrip(".")
+            citation = f"{canonical_url or 'podcast:' + external_id}#t={start_target},{end_target}"
         digest = _hash({**lineage, "ordinal": len(segments), "start": start, "end": end, "text": text, "citation": citation})
         segments.append(TranscriptSegment(f"seg-{len(segments) + 1:06d}-{digest[:16]}", digest, start, end, text, citation))
         previous_start, previous_end = start, end

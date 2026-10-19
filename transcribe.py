@@ -1,8 +1,10 @@
 """Deterministic Amazon Transcribe jobs over private S3 artifacts only."""
 
+import json
 import math
 import re
 import time
+from urllib.parse import urlsplit
 
 import boto3
 from botocore.config import Config
@@ -79,13 +81,47 @@ def _get_job(client, job_name, *, allow_missing=False):
         _failure(error)
 
 
-def _validate_job(job, name, media_uri, audio_sha256, language):
+def _validate_result_uri(uri, bucket, key, region):
+    """Validate an AWS output locator without retaining or using its capability.
+
+    GetTranscriptionJob currently exposes the completed output only through
+    TranscriptFileUri. Accept exact private S3 identity in canonical S3 or HTTPS
+    endpoint forms. Reject signed/query-bearing, foreign, ambiguous and insecure
+    locators; the caller still reads only the predicted key through S3Manager.
+    """
+    try:
+        if not isinstance(uri, str) or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in uri) or "?" in uri or "#" in uri:
+            raise ValueError
+        parts = urlsplit(uri)
+        suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
+        expected = {
+            ("s3", bucket, f"/{key}"),
+            ("https", f"{bucket}.s3.{region}.{suffix}", f"/{key}"),
+            ("https", f"s3.{region}.{suffix}", f"/{bucket}/{key}"),
+        }
+        if region == "us-east-1":
+            expected.update({
+                ("https", f"{bucket}.s3.amazonaws.com", f"/{key}"),
+                ("https", "s3.amazonaws.com", f"/{bucket}/{key}"),
+            })
+        if (parts.scheme, parts.netloc, parts.path) not in expected:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise TranscriptionPermanentError("transcription output identity mismatch") from None
+
+
+def _validate_job(job, name, media_uri, audio_sha256, language, bucket, output_key, region):
     try:
         tags = {tag["Key"]: tag["Value"] for tag in job.get("Tags", [])}
         if job["TranscriptionJobName"] != name or job["Media"]["MediaFileUri"] != media_uri or tags.get("audio-sha256") != audio_sha256:
             raise TranscriptionPermanentError("transcription job identity mismatch")
         if job.get("LanguageCode", language) != language:
             raise TranscriptionPermanentError("transcription job language mismatch")
+        for field, expected in (("OutputBucketName", bucket), ("OutputKey", output_key)):
+            if field in job and job[field] != expected:
+                raise TranscriptionPermanentError("transcription output identity mismatch")
+        if job.get("TranscriptionJobStatus") == "COMPLETED":
+            _validate_result_uri(job["Transcript"]["TranscriptFileUri"], bucket, output_key, region)
     except (KeyError, TypeError):
         raise TranscriptionPermanentError("transcription job identity unavailable") from None
 
@@ -100,7 +136,7 @@ def transcribe_audio_from_s3(audio_s3_key, *, item_id, source_id, platform,
     A 128-bit job-name hash prefix is additionally verified against the full
     audio hash tag on every provider response. Existing jobs must match exact
     input identity and language. Completed jobs remain available for retries.
-    Provider TranscriptFileUri is deliberately never inspected or fetched.
+    Completed output locators are validated for exact identity and never fetched.
     """
     settings = settings if settings is not None else load_settings()
     job_name = deterministic_job_name(item_id, audio_sha256)
@@ -143,7 +179,8 @@ def transcribe_audio_from_s3(audio_s3_key, *, item_id, source_id, platform,
             _failure(error)
         job = _get_job(client, job_name)
     while True:
-        _validate_job(job, job_name, media_uri, audio_sha256, language)
+        _validate_job(job, job_name, media_uri, audio_sha256, language,
+                      storage.bucket_name, provider_key, storage.region)
         status = job.get("TranscriptionJobStatus")
         if status == "COMPLETED":
             break
@@ -160,6 +197,12 @@ def transcribe_audio_from_s3(audio_s3_key, *, item_id, source_id, platform,
         job = _get_job(client, job_name)
     try:
         data = storage.get_bytes(provider_key, max_bytes=max_result_bytes)
+        try:
+            data = json.loads(data)
+        except (ValueError, UnicodeError, TypeError, RecursionError):
+            raise TranscriptionPermanentError("invalid transcription artifact") from None
+        if not isinstance(data, dict) or data.get("jobName") != job_name:
+            raise TranscriptionPermanentError("transcription result job identity mismatch")
         transcript = normalize_amazon_transcribe(data, platform=platform, external_id=external_id,
             item_id=item_id, source_id=source_id, language=language, canonical_url=canonical_url)
         digest = transcript.transcript_sha256

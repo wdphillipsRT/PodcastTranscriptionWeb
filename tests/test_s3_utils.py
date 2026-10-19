@@ -163,3 +163,29 @@ def test_credential_errors_are_permanent_and_stream_errors_close_body():
         storage.get_bytes(KEY)
     assert "SECRET" not in str(caught.value)
     body.close.assert_called_once()
+
+
+@pytest.mark.parametrize("status,headers", [(301, {}), (200, {"x-amz-bucket-region": "us-west-2"}), (200, {"location": "https://SECRET.invalid?token=SECRET"})])
+def test_rejected_retry_hook_closes_parsed_body_raw_and_http_response(status, headers):
+    storage, _ = manager()
+    body, raw, http_response = Mock(), Mock(), Mock()
+    http_response.status_code, http_response.headers, http_response.raw = status, headers, raw
+    with pytest.raises(s3_utils.StoragePermanentError) as caught:
+        storage._reject_redirect(response=(http_response, {"Body": body}))
+    assert "SECRET" not in str(caught.value) and caught.value.__cause__ is None
+    body.close.assert_called_once()
+    raw.close.assert_called_once()
+    http_response.close.assert_called_once()
+
+
+def test_retry_hook_close_errors_do_not_escape_redaction():
+    storage, _ = manager()
+    raw = Mock()
+    raw.close.side_effect = OSError("SECRET")
+    body = Mock()
+    response = SimpleNamespace(status_code=301, headers={}, raw=raw)
+    with pytest.raises(s3_utils.StoragePermanentError) as caught:
+        storage._reject_redirect(response=(response, {"Body": body}))
+    assert "SECRET" not in str(caught.value)
+    body.close.assert_called_once()
+    raw.close.assert_called_once()

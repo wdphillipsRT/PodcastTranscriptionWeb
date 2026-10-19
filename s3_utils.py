@@ -98,11 +98,26 @@ class S3Manager:
     def _reject_redirect(self, response=None, **kwargs):
         if response is None:
             return
-        http_response, _ = response
+        http_response, parsed = response
         headers = {str(k).lower(): v for k, v in http_response.headers.items()}
         region = headers.get("x-amz-bucket-region")
         if http_response.status_code in {301, 302, 303, 307, 308} or "location" in headers or region and region != self.region:
-            raise StoragePermanentError("storage redirect or region mismatch")
+            # This hook runs before get_object returns, so get_bytes cannot yet
+            # own/close the stream. Release every available response layer here.
+            body = parsed.get("Body") if isinstance(parsed, Mapping) else None
+            candidates = (body, getattr(http_response, "raw", None), http_response)
+            closed = set()
+            for candidate in candidates:
+                if candidate is None or id(candidate) in closed:
+                    continue
+                closed.add(id(candidate))
+                try:
+                    close = getattr(candidate, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    pass
+            raise StoragePermanentError("storage redirect or region mismatch") from None
 
     def _check_response(self, response):
         metadata = response.get("ResponseMetadata", {})

@@ -30,7 +30,7 @@ def setup():
     aws.get_object.side_effect = lambda **_: {"ContentLength": len(payload), "Body": BytesIO(payload)}
     storage = s3_utils.S3Manager(settings, client=aws)
     client = Mock()
-    complete = {"TranscriptionJob": {"TranscriptionJobName": JOB, "TranscriptionJobStatus": "COMPLETED", "LanguageCode": "en-US", "Media": {"MediaFileUri": f"s3://{BUCKET}/{AUDIO}"}, "Tags": [{"Key": "audio-sha256", "Value": DIGEST}], "Transcript": {"TranscriptFileUri": "https://signed.invalid?X-Amz-Signature=DO-NOT-FETCH"}}}
+    complete = {"TranscriptionJob": {"TranscriptionJobName": JOB, "TranscriptionJobStatus": "COMPLETED", "LanguageCode": "en-US", "Media": {"MediaFileUri": f"s3://{BUCKET}/{AUDIO}"}, "Tags": [{"Key": "audio-sha256", "Value": DIGEST}], "Transcript": {"TranscriptFileUri": f"https://s3.us-east-1.amazonaws.com/{BUCKET}/{OUTPUT}"}}}
     client.get_transcription_job.return_value = complete
     clock = Mock(side_effect=[0, 0, 2, 4, 5, 5])
     kwargs = dict(item_id=7, source_id=3, platform="podcast", external_id="episode-123", audio_sha256=DIGEST, settings=settings, s3_manager=storage, client=client, clock=clock, sleeper=Mock(), canonical_url="https://podcasts.example/episode")
@@ -158,3 +158,67 @@ def test_malformed_job_payload_is_typed_without_provider_data():
         with pytest.raises(transcribe.TranscriptionPermanentError) as caught:
             transcribe.transcribe_audio_from_s3(AUDIO, **{**kwargs, "clock": lambda: 0})
         assert "SECRET" not in str(caught.value)
+
+
+@pytest.mark.parametrize("uri", [
+    f"s3://{BUCKET}/{OUTPUT}",
+    f"https://s3.us-east-1.amazonaws.com/{BUCKET}/{OUTPUT}",
+    f"https://{BUCKET}.s3.us-east-1.amazonaws.com/{OUTPUT}",
+    f"https://s3.amazonaws.com/{BUCKET}/{OUTPUT}",
+    f"https://{BUCKET}.s3.amazonaws.com/{OUTPUT}",
+])
+def test_completed_job_exact_output_binding_reads_only_private_key(uri, monkeypatch):
+    kwargs, _, aws, complete = setup()
+    complete["TranscriptionJob"]["Transcript"]["TranscriptFileUri"] = uri
+    monkeypatch.setattr("requests.get", Mock(side_effect=AssertionError("URI must never be fetched")))
+    result = transcribe.transcribe_audio_from_s3(AUDIO, **kwargs)
+    assert result["provider_result_key"] == OUTPUT
+    assert uri not in json.dumps(result)
+    aws.get_object.assert_called_once_with(Bucket=BUCKET, Key=OUTPUT)
+
+
+@pytest.mark.parametrize("uri", [
+    f"s3://other/{OUTPUT}", f"s3://{BUCKET}/other.json",
+    f"https://{BUCKET}.s3.us-east-1.amazonaws.com/other.json",
+    f"https://other.s3.us-east-1.amazonaws.com/{OUTPUT}",
+    f"https://{BUCKET}.s3.us-west-2.amazonaws.com/{OUTPUT}",
+    f"https://s3.us-east-1.amazonaws.com/other/{OUTPUT}",
+    f"https://s3.us-west-2.amazonaws.com/{BUCKET}/{OUTPUT}",
+    f"https://foreign.invalid/{BUCKET}/{OUTPUT}",
+    f"http://s3.us-east-1.amazonaws.com/{BUCKET}/{OUTPUT}",
+    f"https://{BUCKET}.s3.us-east-1.amazonaws.com/{OUTPUT}?X-Amz-Signature=SECRET",
+    f"s3://{BUCKET}/{OUTPUT}?token=SECRET", None, "SECRET malformed",
+    f"https://user:SECRET@{BUCKET}.s3.us-east-1.amazonaws.com/{OUTPUT}",
+    f"https://{BUCKET}.s3.us-east-1.amazonaws.com/{OUTPUT}#SECRET",
+])
+def test_completed_job_rejects_unbound_or_presigned_output_before_read(uri):
+    kwargs, _, aws, complete = setup()
+    complete["TranscriptionJob"]["Transcript"]["TranscriptFileUri"] = uri
+    with pytest.raises(transcribe.TranscriptionPermanentError) as caught:
+        transcribe.transcribe_audio_from_s3(AUDIO, **kwargs)
+    assert "SECRET" not in str(caught.value) and caught.value.__cause__ is None
+    aws.get_object.assert_not_called()
+
+
+@pytest.mark.parametrize("fields", [{"OutputBucketName": "other"}, {"OutputKey": "other.json"}, {"OutputBucketName": BUCKET, "OutputKey": "other.json"}])
+def test_authoritative_output_fields_cannot_disagree_with_expected_key(fields):
+    kwargs, _, aws, complete = setup()
+    complete["TranscriptionJob"].update(fields)
+    with pytest.raises(transcribe.TranscriptionPermanentError):
+        transcribe.transcribe_audio_from_s3(AUDIO, **kwargs)
+    aws.get_object.assert_not_called()
+
+
+@pytest.mark.parametrize("job_name", ["another-job", "media-7-stale-v1", None])
+def test_plausible_provider_json_must_name_the_expected_job(job_name):
+    kwargs, _, aws, _ = setup()
+    data = json.loads(Path("tests/fixtures/transcribe-result.json").read_text())
+    if job_name is None:
+        data.pop("jobName")
+    else:
+        data["jobName"] = job_name
+    payload = json.dumps(data).encode()
+    aws.get_object.side_effect = lambda **_: {"ContentLength": len(payload), "Body": BytesIO(payload)}
+    with pytest.raises(transcribe.TranscriptionPermanentError, match="identity"):
+        transcribe.transcribe_audio_from_s3(AUDIO, **kwargs)
+    aws.put_object.assert_not_called()
