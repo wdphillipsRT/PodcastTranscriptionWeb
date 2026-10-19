@@ -7,9 +7,11 @@ broker publication, retries, and stale-claim reclamation belong to the worker.
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
+import hmac
 import json
 import math
 import re
+import secrets
 
 import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
@@ -35,7 +37,7 @@ PERMANENT_CLASSIFICATION_ERRORS = frozenset({"claude_auth", "claude_config", "mo
     "invalid_canonical", "invalid_policy", "revision_budget_exhausted"})
 _LOCK_NAMESPACE = 0x434C5346
 _BLOCK_SCHEMA = "commercial-block-decisions/v1"
-_ITEM_FIELDS = ("id", "admin_id", "platform", "external_id", "status", "transcript_s3_key",
+_ITEM_FIELDS = ("id", "admin_id", "platform", "external_id", "transcript_s3_key",
                 "segments_s3_key", "transcript_sha256", "segments_sha256")
 _OVERRIDE_FIELDS = ("id", "item_id", "source_id", "admin_id", "transcript_sha256",
     "first_segment_id", "last_segment_id", "label", "range_fingerprint_sha256", "supersedes_id")
@@ -46,6 +48,28 @@ _TOTAL_FIELDS = ("included_segments", "excluded_segments", "uncertain_segments",
 _REVISION_IDENTITY_FIELDS = ("id", "item_id", "source_id", "previous_revision_id", "revision", "request_reason",
     "transcript_sha256", "segments_sha256", "input_identity_sha256", "idempotency_key", "policy_version",
     "prompt_version", "prompt_sha256", "requested_model", "classifier_cli_version", "source_rule_set_sha256", "override_set_sha256")
+_PREPARED_REQUEST_KEY = secrets.token_bytes(32)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PreparedRevisionRequest:
+    """Opaque, process-local proof of validated artifacts; contains metadata only."""
+
+    _item_id: int
+    _source_id: int
+    _identity: str
+    _previous_revision_id: int | None
+    _allow_precompletion: bool
+    _seal: str
+
+    def __repr__(self):
+        return "<PreparedRevisionRequest>"
+
+
+def _request_seal(request):
+    payload = (request._item_id, request._source_id, request._identity,
+               request._previous_revision_id, request._allow_precompletion)
+    return hmac.new(_PREPARED_REQUEST_KEY, canonical_json(payload).encode(), sha256).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,12 +242,18 @@ class ClassificationService:
             self.settings.CLAUDE_CLASSIFIER_MODEL, self.settings.CLAUDE_CLASSIFIER_MODEL,
             PROMPT_VERSION, sha256(SYSTEM_PROMPT.encode()).hexdigest())
 
-    def _read_inputs(self, item_id, *, build_windows=True):
+    @staticmethod
+    def _eligible(item, allow_precompletion=False):
+        return item.status == "completed" or allow_precompletion and item.status == "transcribing"
+
+    def _read_inputs(self, item_id, *, build_windows=True, allow_precompletion=False):
         with self._transaction():
             item = self._item_lock(item_id)
+            if not self._eligible(item, allow_precompletion):
+                _fail("invalid_canonical")
             snapshot = _values(item, _ITEM_FIELDS)
         try:
-            if (snapshot["status"] != "completed" or not all(snapshot[field] for field in _ITEM_FIELDS)
+            if (not all(snapshot[field] for field in _ITEM_FIELDS)
                     or snapshot["segments_s3_key"] != _key(snapshot, "transcripts", snapshot["transcript_sha256"])):
                 _fail("invalid_canonical")
             raw = self.storage.get_bytes(snapshot["segments_s3_key"], max_bytes=DEFAULT_MAX_BYTES)
@@ -235,7 +265,7 @@ class ClassificationService:
             _fail("storage_transient" if isinstance(error, StorageTransientError) else "invalid_canonical")
         with self._transaction():
             item = self._item_lock(item_id)
-            if _values(item, _ITEM_FIELDS) != snapshot:
+            if not self._eligible(item, allow_precompletion) or _values(item, _ITEM_FIELDS) != snapshot:
                 _fail("invalid_canonical")
             metadata = self._metadata(item, transcript.source_id)
         cache = {(item_id, transcript.transcript_sha256): transcript}
@@ -320,12 +350,18 @@ class ClassificationService:
             windows = build_classifier_windows(transcript.segments, exact, signals) if build_windows else ()
         except CommercialSignalError:
             _fail()
+        rule_hash, override_hash, identity = self._input_identity(snapshot, metadata)
+        return _Inputs(snapshot, metadata, transcript, tuple(examples), exact, windows, rule_hash, override_hash, identity)
+
+    def _input_identity(self, snapshot, metadata):
+        current_overrides = [row for row in metadata["overrides"] if row["item_id"] == snapshot["id"]
+                             and row["transcript_sha256"] == snapshot["transcript_sha256"]]
         rule_hash, override_hash = _hash(metadata["rules"]), _hash(current_overrides)
-        identity = _hash({"item": snapshot, "source_id": transcript.source_id, "policy_version": POLICY_VERSION,
+        identity = _hash({"item": snapshot, "source_id": metadata["source_id"], "policy_version": POLICY_VERSION,
             "classifier": asdict(self._provenance()), "source_rule_set_sha256": rule_hash,
             "override_set_sha256": override_hash, "examples": metadata["overrides"],
             "rule_origins": metadata["origins"], "referenced_items": metadata["items"]})
-        return _Inputs(snapshot, metadata, transcript, tuple(examples), exact, windows, rule_hash, override_hash, identity)
+        return rule_hash, override_hash, identity
 
     @staticmethod
     def _signals_by_segment(transcript, signals):
@@ -336,37 +372,77 @@ class ClassificationService:
                 values[segment.id].add(signal.code)
         return {key: tuple(code for code in SIGNAL_CODES if code in codes) for key, codes in values.items()}
 
-    def ensure_revision(self, item_id, reason, *, idempotency_key=None):
+    def prepare_revision_request(self, item_id: int, *, allow_precompletion: bool = False) -> PreparedRevisionRequest:
+        if type(allow_precompletion) is not bool:
+            _fail("invalid_canonical")
+        inputs = self._read_inputs(item_id, build_windows=False, allow_precompletion=allow_precompletion)
+        with self._transaction():
+            item = self._item_lock(item_id)
+            if (not self._same_inputs(item, inputs, allow_precompletion=allow_precompletion)
+                    or self._input_identity(inputs.item, inputs.metadata)[2] != inputs.identity):
+                _fail("invalid_canonical")
+            request = PreparedRevisionRequest(item_id, inputs.transcript.source_id, inputs.identity,
+                item.active_classification_revision_id, allow_precompletion, "")
+            request = replace(request, _seal=_request_seal(request))
+        return request
+
+    def ensure_revision(self, item_id, reason, *, idempotency_key=None,
+                        prepared_request: PreparedRevisionRequest | None = None, commit: bool = True) -> int:
         if reason not in CLASSIFICATION_REASONS or idempotency_key is not None and (
                 not isinstance(idempotency_key, str) or re.fullmatch(r"[A-Za-z0-9:._-]{1,255}", idempotency_key) is None):
             _fail()
-        inputs = self._read_inputs(item_id, build_windows=False)
-        key = idempotency_key or f"auto:{reason}:{inputs.identity}"
+        if type(commit) is not bool or not commit and prepared_request is None:
+            _fail()
+        if prepared_request is None:
+            prepared_request = self.prepare_revision_request(item_id)
+        try:
+            valid = (type(prepared_request) is PreparedRevisionRequest
+                and type(item_id) is int and prepared_request._item_id == item_id
+                and hmac.compare_digest(prepared_request._seal, _request_seal(prepared_request)))
+        except (AttributeError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            _fail("invalid_canonical")
+        if not commit:
+            return self._insert_revision(item_id, reason, idempotency_key, prepared_request)
         with self._transaction():
-            item = self._item_lock(item_id)
-            if not self._same_inputs(item, inputs):
-                _fail("invalid_canonical")
-            previous = self.session.scalar(sa.select(ClassificationRevision).where(
-                ClassificationRevision.item_id == item_id, ClassificationRevision.idempotency_key == key).with_for_update())
-            if previous is not None:
-                return previous.id
-            ordinal = (self.session.scalar(sa.select(sa.func.max(ClassificationRevision.revision)).where(ClassificationRevision.item_id == item_id)) or 0) + 1
-            provenance = self._provenance()
-            revision = ClassificationRevision(item_id=item_id, source_id=inputs.transcript.source_id,
-                previous_revision_id=item.active_classification_revision_id, revision=ordinal,
-                request_reason=reason, transcript_sha256=inputs.transcript.transcript_sha256,
-                segments_sha256=inputs.item["segments_sha256"], input_identity_sha256=inputs.identity,
-                idempotency_key=key, policy_version=POLICY_VERSION, prompt_version=provenance.prompt_version,
-                prompt_sha256=provenance.prompt_sha256, requested_model=provenance.requested_model,
-                classifier_cli_version=provenance.cli_version, source_rule_set_sha256=inputs.rule_hash,
-                override_set_sha256=inputs.override_hash, error_category="dispatch_pending",
-                celery_task_id=f"classify-{item_id}-{inputs.transcript.transcript_sha256[:16]}-r{ordinal}-prepare")
-            self.session.add(revision)
-            self.session.flush()
-            return revision.id
+            return self._insert_revision(item_id, reason, idempotency_key, prepared_request)
 
-    def _same_inputs(self, item, inputs):
-        return _values(item, _ITEM_FIELDS) == inputs.item and self._metadata(item, inputs.transcript.source_id) == inputs.metadata
+    def _insert_revision(self, item_id, reason, idempotency_key, request):
+        # No transaction manager or external I/O here: the caller may own the
+        # atomic transcript-completion transaction, including failure rollback.
+        item = self._item_lock(item_id)
+        if (not self._eligible(item, request._allow_precompletion)
+                or item.active_classification_revision_id != request._previous_revision_id):
+            _fail("invalid_canonical")
+        snapshot = _values(item, _ITEM_FIELDS)
+        metadata = self._metadata(item, request._source_id)
+        rule_hash, override_hash, identity = self._input_identity(snapshot, metadata)
+        if identity != request._identity:
+            _fail("invalid_canonical")
+        key = idempotency_key or f"auto:{reason}:{identity}"
+        previous = self.session.scalar(sa.select(ClassificationRevision).where(
+            ClassificationRevision.item_id == item_id, ClassificationRevision.idempotency_key == key).with_for_update())
+        if previous is not None:
+            return previous.id
+        ordinal = (self.session.scalar(sa.select(sa.func.max(ClassificationRevision.revision)).where(ClassificationRevision.item_id == item_id)) or 0) + 1
+        provenance = self._provenance()
+        revision = ClassificationRevision(item_id=item_id, source_id=request._source_id,
+            previous_revision_id=item.active_classification_revision_id, revision=ordinal,
+            request_reason=reason, transcript_sha256=item.transcript_sha256,
+            segments_sha256=item.segments_sha256, input_identity_sha256=identity,
+            idempotency_key=key, policy_version=POLICY_VERSION, prompt_version=provenance.prompt_version,
+            prompt_sha256=provenance.prompt_sha256, requested_model=provenance.requested_model,
+            classifier_cli_version=provenance.cli_version, source_rule_set_sha256=rule_hash,
+            override_set_sha256=override_hash, error_category="dispatch_pending",
+            celery_task_id=f"classify-{item_id}-{item.transcript_sha256[:16]}-r{ordinal}-prepare")
+        self.session.add(revision)
+        self.session.flush()
+        return revision.id
+
+    def _same_inputs(self, item, inputs, *, allow_precompletion=False):
+        return (self._eligible(item, allow_precompletion) and _values(item, _ITEM_FIELDS) == inputs.item
+            and self._metadata(item, inputs.transcript.source_id) == inputs.metadata)
 
     @contextmanager
     def _operation(self, revision_id, block_ordinal=None, claim=None):

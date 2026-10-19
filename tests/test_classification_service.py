@@ -1,6 +1,6 @@
 """Durable classifier orchestration with real SQLite and immutable in-memory S3."""
 
-from dataclasses import asdict, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from datetime import timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -677,3 +677,192 @@ def test_revision_identity_cannot_change_while_claude_runs(env, field, value):
     env.classifier.on_call = change
     result = env.service.run_block(revision_id, 1)
     assert result.state == "superseded" and result.next_dispatch is None
+
+
+def test_prepared_request_is_opaque_immutable_metadata_and_ends_transactions(env):
+    example_item, example = add_item(env, external_id="request-example")
+    rule(env, override(env, 0, item=example_item, transcript=example))
+    item_id = env.item.id
+    request = env.service.prepare_revision_request(item_id)
+    assert type(request) is env.module.PreparedRevisionRequest
+    assert not db.session().in_transaction()
+    assert len(env.storage.reads) == 2 and not env.classifier.calls
+    assert not hasattr(request, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        request._item_id = item_id + 1
+    representation = repr(request) + str(asdict(request))
+    for private in (env.transcript.segments[0].text, "https://", "items/podcast/", "SECRET"):
+        assert private not in representation
+    assert "PreparedRevisionRequest" in repr(request)
+
+
+@pytest.mark.parametrize("status", [status for status in m.ITEM_STATUSES if status != "completed"])
+@pytest.mark.parametrize("allow_precompletion", [False, True])
+def test_prepared_request_only_permits_completed_or_explicit_transcribing(env, status, allow_precompletion):
+    item_id = env.item.id
+    env.item.status = status
+    db.session.commit()
+    if allow_precompletion and status == "transcribing":
+        env.service.prepare_revision_request(item_id, allow_precompletion=True)
+        assert not db.session().in_transaction()
+    else:
+        with pytest.raises(env.module.ClassificationServiceError) as caught:
+            env.service.prepare_revision_request(item_id, allow_precompletion=allow_precompletion)
+        assert caught.value.category == "invalid_canonical"
+        assert not env.storage.reads
+
+
+@pytest.mark.parametrize("complete_first", [False, True])
+def test_prepared_request_atomically_completes_item_without_external_io(env, monkeypatch, complete_first):
+    item_id = env.item.id
+    env.item.status = "transcribing"
+    db.session.commit()
+    request = env.service.prepare_revision_request(item_id, allow_precompletion=True)
+    def forbidden(*args, **kwargs):
+        pytest.fail("prepared insertion crossed an external or transaction ownership boundary")
+    with monkeypatch.context() as patch:
+        for target, method in ((env.storage, "get_bytes"), (env.storage, "put_content_addressed"),
+                (env.classifier, "classify"), (db.session, "commit"), (db.session, "rollback")):
+            patch.setattr(target, method, forbidden)
+        with db.session.begin():
+            item = db.session.get(m.ContentItem, item_id)
+            if complete_first:
+                item.status = "completed"
+            revision_id = env.service.ensure_revision(item_id, "transcript_completed", prepared_request=request, commit=False)
+            assert db.session.get(m.ClassificationRevision, revision_id).state == "pending"
+            assert env.service.ensure_revision(item_id, "transcript_completed", prepared_request=request, commit=False) == revision_id
+            item.status = "completed"
+    revision = db.session.get(m.ClassificationRevision, revision_id)
+    assert revision.celery_task_id == f"classify-{item_id}-{env.transcript.transcript_sha256[:16]}-r1-prepare"
+    assert env.service.prepare_revision(revision_id).state == "running"
+    assert env.service.ensure_revision(item_id, "transcript_completed") == revision_id
+
+
+def test_prepared_request_insertion_rollback_keeps_item_transcribing(env):
+    item_id = env.item.id
+    env.item.status = "transcribing"
+    db.session.commit()
+    request = env.service.prepare_revision_request(item_id, allow_precompletion=True)
+    with pytest.raises(RuntimeError, match="force caller rollback"):
+        with db.session.begin():
+            revision_id = env.service.ensure_revision(item_id, "transcript_completed", prepared_request=request, commit=False)
+            assert db.session.get(m.ClassificationRevision, revision_id) is not None
+            db.session.get(m.ContentItem, item_id).status = "completed"
+            db.session.flush()
+            raise RuntimeError("force caller rollback")
+    assert db.session.get(m.ContentItem, item_id).status == "transcribing"
+    assert not db.session.scalar(sa.select(sa.func.count()).select_from(m.ClassificationRevision))
+
+
+def test_caller_transaction_requires_a_prepared_request_without_io_or_transaction_control(env, monkeypatch):
+    item_id = env.item.id
+    db.session.commit()
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid caller request performed I/O or controlled the transaction")
+    for target, method in ((env.storage, "get_bytes"), (db.session, "commit"), (db.session, "rollback")):
+        monkeypatch.setattr(target, method, forbidden)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.ensure_revision(item_id, "backfill", commit=False)
+    assert not db.session().in_transaction()
+
+
+@pytest.mark.parametrize("change", ["transcript_s3_key", "segments_s3_key", "transcript_sha256",
+    "segments_sha256", "platform", "external_id", "membership", "override", "rule",
+    "example", "example_identity", "origin", "model", "cli", "prompt", "policy", "lineage", "status"])
+def test_prepared_request_rechecks_all_database_and_configuration_identity(env, change, monkeypatch):
+    item_id = env.item.id
+    example_item, example = add_item(env, external_id="stale-example")
+    origin = override(env, 0, item=example_item, transcript=example)
+    active_rule = rule(env, origin)
+    previous_id = env.service.ensure_revision(item_id, "backfill")
+    request = env.service.prepare_revision_request(item_id)
+    if change in {"transcript_s3_key", "segments_s3_key"}:
+        setattr(env.item, change, "items/podcast/changed/transcripts/" + "a" * 64 + ".json")
+    elif change in {"transcript_sha256", "segments_sha256"}:
+        setattr(env.item, change, "a" * 64)
+    elif change in {"platform", "external_id"}:
+        setattr(env.item, change, "youtube" if change == "platform" else "changed")
+        if change == "platform":
+            env.item.item_type = "youtube_video"
+    elif change == "membership":
+        db.session.execute(sa.delete(m.SourceItem).where(m.SourceItem.item_id == item_id))
+    elif change == "override":
+        override(env, 1)
+    elif change == "rule":
+        active_rule.label = "editorial"
+    elif change == "example":
+        override(env, 1, item=example_item, transcript=example)
+    elif change == "example_identity":
+        example_item.external_id = "changed"
+    elif change == "origin":
+        origin.range_fingerprint_sha256 = "a" * 64
+    elif change == "model":
+        monkeypatch.setattr(env.service, "settings", replace(env.settings, CLAUDE_CLASSIFIER_MODEL="changed"))
+    elif change == "cli":
+        monkeypatch.setattr(env.service, "settings", replace(env.settings, CLAUDE_EXPECTED_VERSION="changed"))
+    elif change == "prompt":
+        monkeypatch.setattr(env.module, "SYSTEM_PROMPT", "changed")
+    elif change == "policy":
+        monkeypatch.setattr(env.module, "POLICY_VERSION", "changed")
+    elif change == "lineage":
+        env.item.active_classification_revision_id = previous_id
+    else:
+        env.item.status = "transcribing"
+    db.session.commit()
+    reads = len(env.storage.reads)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.ensure_revision(item_id, "manual_retry", prepared_request=request, commit=False)
+    assert db.session().in_transaction()
+    db.session.rollback()
+    assert len(env.storage.reads) == reads and not env.classifier.calls
+    assert db.session.scalar(sa.select(sa.func.count()).select_from(m.ClassificationRevision)) == 1
+
+
+@pytest.mark.parametrize("kind", ["wrong_type", "cross_item", "forged", "mutated"])
+def test_invalid_prepared_requests_fail_closed(env, kind):
+    item_id = env.item.id
+    other, _ = add_item(env, external_id="other-request")
+    other_id = other.id
+    request = env.service.prepare_revision_request(item_id)
+    if kind == "wrong_type":
+        request = object()
+    elif kind == "cross_item":
+        item_id = other_id
+    elif kind == "forged":
+        request = object.__new__(env.module.PreparedRevisionRequest)
+    else:
+        object.__setattr__(request, "_item_id", other_id)
+        item_id = other_id
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.ensure_revision(item_id, "backfill", prepared_request=request, commit=False)
+    db.session.rollback()
+    assert not db.session.scalar(sa.select(sa.func.count()).select_from(m.ClassificationRevision))
+
+
+def test_prepared_database_failure_leaves_rollback_to_caller(env, monkeypatch):
+    item_id = env.item.id
+    request = env.service.prepare_revision_request(item_id)
+    def invalid_row(mapper, connection, target):
+        target.idempotency_key = None
+    def forbidden(*args, **kwargs):
+        pytest.fail("service took ownership of the caller transaction")
+    sa.event.listen(m.ClassificationRevision, "before_insert", invalid_row)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(db.session, "commit", forbidden)
+            patch.setattr(db.session, "rollback", forbidden)
+            with pytest.raises(sa.exc.IntegrityError):
+                env.service.ensure_revision(item_id, "backfill", prepared_request=request, commit=False)
+    finally:
+        sa.event.remove(m.ClassificationRevision, "before_insert", invalid_row)
+    db.session.rollback()
+    assert not db.session.scalar(sa.select(sa.func.count()).select_from(m.ClassificationRevision))
+
+
+def test_prepared_request_explicit_replay_and_committing_mode_remain_compatible(env):
+    item_id = env.item.id
+    first = env.service.ensure_revision(item_id, "manual_retry", idempotency_key="prepared:explicit")
+    override(env, 0)
+    request = env.service.prepare_revision_request(item_id)
+    assert env.service.ensure_revision(item_id, "manual_retry", idempotency_key="prepared:explicit", prepared_request=request) == first
+    assert not db.session().in_transaction()
