@@ -55,6 +55,9 @@ celerybeat.pid
 
 # Environment
 .env
+.aws/
+.claude/
+.superpowers/
 .venv
 env/
 venv/
