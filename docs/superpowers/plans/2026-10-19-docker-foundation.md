@@ -1,5 +1,7 @@
 # Docker Foundation Implementation Plan
 
+> **Superseded:** Use `docs/superpowers/plans/2026-10-19-podcast-youtube-docker-foundation.md`. The replacement incorporates the approved public-YouTube source amendment.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Run PodcastTranscriptionWeb on this machine as a durable, admin-only Docker Compose application that can add a feed and complete an S3-backed Amazon Transcribe episode workflow.
