@@ -551,9 +551,8 @@ Add only safe allowlisted values to `item_view()`/source rows. Document this S3-
     {
       "Sid": "BucketMetadata",
       "Effect": "Allow",
-      "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
-      "Resource": "arn:aws:s3:::podcast-transcriptions-web-2025",
-      "Condition": {"StringLike": {"s3:prefix": ["items/*"]}}
+      "Action": "s3:GetBucketLocation",
+      "Resource": "arn:aws:s3:::podcast-transcriptions-web-2025"
     },
     {
       "Sid": "PodcastArtifacts",
@@ -632,7 +631,7 @@ Start/recreate the `whisper` service while Amazon remains primary. Run the docum
 
 - [ ] **Step 6: Run exactly one explicit production canary**
 
-Select one failed/deferred/unavailable item with valid owned audio and no completed transcript. Temporarily set `TRANSCRIPTION_PRIMARY=faster_whisper`, recreate all configuration-reading app services, request that one item retry, and observe it through local raw artifact, canonical normalization, classification creation, cleanup, and safe UI provenance. Confirm no other completed item changed and no unrelated failed item was enqueued.
+Stop `beat`, drain discovery/download/transcription work, and verify no non-canary media job is pending or dispatchable. Select one failed/deferred/unavailable item with valid owned audio and no completed transcript. Temporarily set `TRANSCRIPTION_PRIMARY=faster_whisper`, recreate the configuration-reading services needed for the canary while leaving `beat` stopped, request that one item retry, and observe it through local raw artifact, canonical normalization, classification creation, cleanup, and safe UI provenance. Confirm no other completed item changed and no unrelated failed item was enqueued.
 
 - [ ] **Step 7: Enable normal local routing or roll back safely**
 
