@@ -857,3 +857,35 @@ def test_terminal_item_does_not_clear_references_without_durable_repair_decision
     assert row.provider_transcript_s3_key == provider and row.transcript_s3_key == canonical
     assert not db.session.dirty
     pipeline.media.inventory.assert_called_once()
+
+
+@pytest.mark.parametrize("unknown_outcome", [False, True])
+def test_old_processing_sender_preserves_new_pending_generation_same_task_id(pipeline, monkeypatch, unknown_outcome):
+    row = pipeline.item()
+    def fast_repair(name, item_id, **options):
+        assert name == "transcribe_item_audio" and item_id == row.id
+        job = ProcessingJob.query.filter_by(item_id=item_id, stage="transcribe").one()
+        assert job.attempts == 0 and job.error_category == "dispatch_pending"
+        original_task_id = job.celery_task_id
+        assert original_task_id == options["task_id"]
+        # A fast worker claims attempt 1 and prepares a same-stage repair
+        # before the older attempt-0 publication returns from the broker.
+        job.attempts, job.state, job.error_category = 1, "pending", "dispatch_pending"
+        db.session.commit()
+        assert job.celery_task_id == original_task_id
+        if unknown_outcome:
+            raise TimeoutError("unknown broker outcome")
+    monkeypatch.setattr(tasks, "dispatch_task", fast_repair)
+    tasks.process_item.run(row.id)
+    job = ProcessingJob.query.filter_by(item_id=row.id, stage="transcribe").one()
+    assert job.attempts == 1 and job.state == "pending"
+    assert job.error_category == "dispatch_pending"
+
+
+def test_unchanged_processing_publication_generation_clears_its_own_marker(pipeline):
+    row = pipeline.item()
+    tasks.process_item.run(row.id)
+    job = ProcessingJob.query.filter_by(item_id=row.id, stage="transcribe").one()
+    assert job.attempts == 0 and job.state == "pending"
+    assert job.celery_task_id == f"process-item-{row.id}-transcribe"
+    assert job.error_category is None

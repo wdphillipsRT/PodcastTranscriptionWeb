@@ -242,8 +242,12 @@ class _ProcessingPipeline:
         item.processing_stage = stage
         job.celery_task_id = job.celery_task_id or f"process-item-{item.id}-{stage}"
         job.error_category = "dispatch_pending"
+        self.session.flush()
+        # Capture the generation in the transaction that durably prepares this
+        # publication. A post-commit read could observe a newer repair attempt.
+        message = job.id, stage, job.celery_task_id, item.id, job.attempts
         self.session.commit()
-        return job.id, stage, job.celery_task_id, item.id
+        return message
 
     def _verify_completed(self, item):
         from hashlib import sha256
@@ -665,7 +669,7 @@ def _processing_failure(error):
 def _publish_processing(message):
     if message is None:
         return
-    job_id, stage, task_id, item_id = message
+    job_id, stage, task_id, item_id, attempts = message
     from extensions import db
     from models import ProcessingJob
     names = {"podcast_audio": "acquire_podcast_audio", "youtube_captions": "acquire_youtube_transcript",
@@ -676,7 +680,8 @@ def _publish_processing(message):
         # Unknown broker outcome: the committed outbox can be replayed by
         # discovery's process_item dispatcher. No worker updates are undone.
         return
-    db.session.query(ProcessingJob).filter_by(id=job_id, state="pending", celery_task_id=task_id, error_category="dispatch_pending").update(
+    db.session.query(ProcessingJob).filter_by(id=job_id, item_id=item_id, stage=stage, state="pending",
+        celery_task_id=task_id, attempts=attempts, error_category="dispatch_pending").update(
         {"error_category": None}, synchronize_session="fetch")
     db.session.commit()
 
