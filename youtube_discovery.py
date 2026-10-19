@@ -160,23 +160,31 @@ class YouTubeDiscoveryClient:
                                              timeout=self._timeout, stream=True, allow_redirects=False,
                                              auth=_public_api_auth, headers={"Accept": "application/json"})
                 status = response.status_code
+                failed_status = not 200 <= status < 300
                 content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
                 if content_type != "application/json":
-                    if status != 200:
+                    if failed_status:
                         self._http_error(status, {})
                     _fail("invalid_response")
                 body = bytearray()
                 for chunk in response.iter_content(chunk_size=16384):
                     if len(body) + len(chunk) > self._max_bytes:
+                        if failed_status:
+                            self._http_error(status, {})
                         _fail("response_too_large")
                     body.extend(chunk)
                 try:
                     data = json.loads(body)
                 except (ValueError, UnicodeError, RecursionError):
+                    if failed_status:
+                        self._http_error(status, {})
                     _fail("invalid_response")
+                if failed_status:
+                    # Error bodies are optional hints, never the authority for
+                    # whether an HTTP failure can be retried. Proxies commonly
+                    # return empty, malformed or scalar bodies for 429/5xx.
+                    self._http_error(status, data if isinstance(data, dict) else {})
                 data = _mapping(data)
-                if status != 200:
-                    self._http_error(status, data)
                 if "error" in data:
                     _fail("invalid_response")
                 items = data.get("items")

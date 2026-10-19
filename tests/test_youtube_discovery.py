@@ -394,3 +394,45 @@ def test_private_playlist_is_rejected():
     client, _ = client_with(response(payload))
     with pytest.raises(YouTubeDiscoveryError, match="private"):
         client.resolve_source(f"https://youtube.com/playlist?list={PLAYLIST}")
+
+
+@pytest.mark.parametrize("status,category,retryable", [
+    (429, "rate_limited", True), (500, "upstream_error", True), (503, "upstream_error", True),
+    (400, "bad_request", False), (401, "forbidden", False),
+    (403, "forbidden", False), (404, "not_found", False),
+])
+@pytest.mark.parametrize("body", [b"", b"{malformed", b"[]", b'"scalar"', b"null", b"42",
+                                  b'{"error": {"errors": "invalid"}}'])
+def test_http_status_classification_survives_invalid_error_body(status, category, retryable, body, caplog):
+    result = response(body=body, status=status)
+    client, _ = client_with(result)
+    with pytest.raises(YouTubeDiscoveryError) as caught:
+        client.resolve_video(f"https://youtu.be/{VIDEO}")
+    assert (caught.value.category, caught.value.retryable) == (category, retryable)
+    assert KEY not in "".join(traceback.format_exception(caught.value)) + caplog.text
+    result.close.assert_called_once()
+
+
+@pytest.mark.parametrize("body", [b"", b"{malformed", b"[]", b'"scalar"', b"null"])
+def test_successful_status_still_requires_strict_json_object(body):
+    result = response(body=body)
+    client, _ = client_with(result)
+    with pytest.raises(YouTubeDiscoveryError) as caught:
+        client.resolve_video(f"https://youtu.be/{VIDEO}")
+    assert caught.value.category == "invalid_response" and not caught.value.retryable
+    result.close.assert_called_once()
+
+
+@pytest.mark.parametrize("status,category", [(429, "rate_limited"), (503, "upstream_error"),
+                                             (403, "forbidden")])
+def test_oversized_error_body_stops_reading_and_falls_back_to_http_status(status, category):
+    result = response(status=status)
+    def chunks(**kwargs):
+        yield b"x" * 129
+        raise AssertionError("must stop after the byte ceiling")
+    result.iter_content.side_effect = chunks
+    client, _ = client_with(result, max_response_bytes=128)
+    with pytest.raises(YouTubeDiscoveryError) as caught:
+        client.resolve_video(f"https://youtu.be/{VIDEO}")
+    assert caught.value.category == category
+    result.close.assert_called_once()
