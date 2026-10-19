@@ -26,6 +26,12 @@ def create_app(config_override: Mapping | None = None) -> Flask:
     csrf.init_app(app)
     limiter.init_app(app)
 
+    from admin_cli import admin_cli
+    from web.auth import auth
+
+    app.cli.add_command(admin_cli)
+    app.register_blueprint(auth)
+
     @app.get("/healthz")
     def healthz():
         return {"status": "ok"}
