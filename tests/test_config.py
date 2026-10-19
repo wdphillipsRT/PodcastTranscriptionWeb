@@ -1,4 +1,5 @@
 import os
+from decimal import Decimal
 
 import pytest
 
@@ -33,6 +34,11 @@ NUMERIC_DEFAULTS = {
     "YTDLP_TIMEOUT_SECONDS": 1800,
     "TRANSCRIBE_POLL_SECONDS": 10,
     "TRANSCRIBE_TIMEOUT_SECONDS": 14_400,
+    "CLAUDE_CLASSIFIER_TIMEOUT_SECONDS": 180,
+    "CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS": 7200,
+    "CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES": 2_097_152,
+    "CLASSIFICATION_RECONCILE_INTERVAL_SECONDS": 300,
+    "CLASSIFICATION_RECONCILE_BATCH_SIZE": 100,
 }
 
 
@@ -170,3 +176,62 @@ def test_injected_mapping_is_isolated_from_process_environment(valid_environment
 def test_load_settings_reads_process_environment_by_default(valid_environment, monkeypatch):
     monkeypatch.setattr(os, "environ", valid_environment)
     assert load_settings().SECRET_KEY == valid_environment["SECRET_KEY"]
+
+
+def test_classifier_defaults(valid_environment):
+    settings = load_settings(valid_environment)
+    assert settings.CLAUDE_CLASSIFIER_MODEL == "claude-sonnet-5-5"
+    assert settings.CLAUDE_EXPECTED_VERSION == "2.1.303"
+    assert settings.CLAUDE_CLASSIFIER_MAX_BUDGET_USD == Decimal("0.50")
+    assert settings.CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD == Decimal("5.00")
+    assert settings.CLASSIFICATION_ENABLED is False
+
+
+@pytest.mark.parametrize("name", ["CLAUDE_CLASSIFIER_MAX_BUDGET_USD", "CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD"])
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "-Infinity", "", "secret", "1_0", "1e-2", "+1", "01", ".5", "1.", "١"])
+def test_classifier_rejects_invalid_budgets(valid_environment, name, value):
+    valid_environment[name] = value
+    with pytest.raises(ConfigError, match=name):
+        load_settings(valid_environment)
+
+
+@pytest.mark.parametrize("name,value", [
+    ("CLAUDE_CLASSIFIER_MODEL", "sonnet"), ("CLAUDE_CLASSIFIER_MODEL", "claude-sonnet-latest"),
+    ("CLAUDE_CLASSIFIER_MODEL", "claude-sonnet-5"), ("CLAUDE_CLASSIFIER_MODEL", "claude-latest-5-5"),
+    ("CLAUDE_EXPECTED_VERSION", "2.1"), ("CLAUDE_EXPECTED_VERSION", "v2.1.303"),
+    ("CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES", "2097153"),
+    ("CLASSIFICATION_RECONCILE_BATCH_SIZE", "501"),
+    ("CLASSIFICATION_ENABLED", "yes"), ("CLASSIFICATION_ENABLED", "1"),
+    ("CLASSIFICATION_ENABLED", ""),
+])
+def test_classifier_rejects_invalid_settings(valid_environment, name, value):
+    valid_environment[name] = value
+    with pytest.raises(ConfigError, match=name):
+        load_settings(valid_environment)
+
+
+@pytest.mark.parametrize("value,expected", [("true", True), ("TRUE", True), ("false", False), ("FALSE", False)])
+def test_classifier_boolean(valid_environment, value, expected):
+    valid_environment["CLASSIFICATION_ENABLED"] = value
+    assert load_settings(valid_environment).CLASSIFICATION_ENABLED is expected
+
+
+def test_classifier_accepts_pinned_snapshot_and_decimal_budget(valid_environment):
+    valid_environment.update(CLAUDE_CLASSIFIER_MODEL="claude-sonnet-5-5-20261019",
+                             CLAUDE_EXPECTED_VERSION="12.34.567", CLAUDE_CLASSIFIER_MAX_BUDGET_USD="0.123456789")
+    settings = load_settings(valid_environment)
+    assert settings.CLAUDE_CLASSIFIER_MODEL == "claude-sonnet-5-5-20261019"
+    assert settings.CLAUDE_EXPECTED_VERSION == "12.34.567"
+    assert settings.CLAUDE_CLASSIFIER_MAX_BUDGET_USD == Decimal("0.123456789")
+
+
+@pytest.mark.parametrize("name,value,match", [
+    ("CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD", "0.49", "CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD"),
+    ("CLAUDE_CLASSIFIER_MAX_BUDGET_USD", "5.01", "CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD"),
+    ("CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS", "179", "CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS"),
+    ("CLAUDE_CLASSIFIER_TIMEOUT_SECONDS", "7201", "CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS"),
+])
+def test_classifier_revision_limits_cover_one_call(valid_environment, name, value, match):
+    valid_environment[name] = value
+    with pytest.raises(ConfigError, match=match):
+        load_settings(valid_environment)
