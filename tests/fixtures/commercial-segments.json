@@ -1,0 +1,124 @@
+{
+  "metadata": {
+    "platform": "youtube",
+    "external_id": "abc123xyz_1",
+    "item_id": 7,
+    "source_id": 3,
+    "language": "en-US",
+    "provider_version": "2026.08.19",
+    "tool_version": "normalizer-v1",
+    "origin": "creator_caption"
+  },
+  "vtt": "WEBVTT\n\n00:00:00.000 --> 00:00:10.000\nA hypothesis is a testable explanation.\n\n00:00:10.000 --> 00:00:12.000\nA word from our sponsor.\n\n00:00:12.000 --> 00:00:20.000\nBuy Acme notebooks with discount code SCIENCE.\n\n00:00:20.000 --> 00:00:22.000\nNow back to our lesson.\n\n00:00:22.000 --> 00:00:32.000\nControl variables to isolate the effect.\n\n00:00:32.000 --> 00:00:40.000\nJoin my paid experimental methods course.\n\n00:00:40.000 --> 00:00:48.000\nSubscribe to our partner show Science Weekly.\n\n00:00:48.000 --> 00:00:52.000\nNext week we publish on Tuesday.\n\n00:00:52.000 --> 00:00:55.000\nBefore we continue, consider this offer.\n",
+  "labels": [
+    "editorial",
+    "paid_commercial",
+    "paid_commercial",
+    "editorial",
+    "editorial",
+    "self_promotion",
+    "cross_promotion",
+    "housekeeping",
+    "uncertain"
+  ],
+  "reason_codes": [
+    "substantive_content",
+    "sponsor_transition",
+    "discount_or_affiliate",
+    "return_to_program",
+    "substantive_content",
+    "creator_offer",
+    "other_show_promo",
+    "routine_housekeeping",
+    "ambiguous_boundary"
+  ],
+  "canonical_transcript": {
+    "duration": 55.0,
+    "external_id": "abc123xyz_1",
+    "item_id": 7,
+    "language": "en-US",
+    "origin": "creator_caption",
+    "platform": "youtube",
+    "provider": "yt-dlp",
+    "provider_version": "2026.08.19",
+    "schema": "media-transcript-segments/v1",
+    "segments": [
+      {
+        "citation": "https://www.youtube.com/watch?v=abc123xyz_1&t=0s",
+        "end": 10.0,
+        "id": "seg-000001-ca01fc6d8932e978",
+        "sha256": "ca01fc6d8932e97872a598d2edfa5ce69e9f4014e94956809879c9bce88026b9",
+        "start": 0.0,
+        "text": "A hypothesis is a testable explanation."
+      },
+      {
+        "citation": "https://www.youtube.com/watch?v=abc123xyz_1&t=10s",
+        "end": 12.0,
+        "id": "seg-000002-944f295c873db11c",
+        "sha256": "944f295c873db11c0800428c8399b671b0ed45608463b38dcf975eb7b00bdc77",
+        "start": 10.0,
+        "text": "A word from our sponsor."
+      },
+      {
+        "citation": "https://www.youtube.com/watch?v=abc123xyz_1&t=12s",
+        "end": 20.0,
+        "id": "seg-000003-2488036cf3b398bc",
+        "sha256": "2488036cf3b398bcdd4adcdda8c06eb57e376622c773345b75344fe0f5ff4763",
+        "start": 12.0,
+        "text": "Buy Acme notebooks with discount code SCIENCE."
+      },
+      {
+        "citation": "https://www.youtube.com/watch?v=abc123xyz_1&t=20s",
+        "end": 22.0,
+        "id": "seg-000004-67ac3dcfde849c67",
+        "sha256": "67ac3dcfde849c67a273a4f3f453351bef3dbca844ef1cf17ee8348b5763cbe0",
+        "start": 20.0,
+        "text": "Now back to our lesson."
+      },
+      {
+        "citation": "https://www.youtube.com/watch?v=abc123xyz_1&t=22s",
+        "end": 32.0,
+        "id": "seg-000005-9d639df5629af63d",
+        "sha256": "9d639df5629af63dce33bb5b2adc61f0c8c9a030e7d12a7e521b76033f7b1d55",
+        "start": 22.0,
+        "text": "Control variables to isolate the effect."
+      },
+      {
+        "citation": "https://www.youtube.com/watch?v=abc123xyz_1&t=32s",
+        "end": 40.0,
+        "id": "seg-000006-e54de6b7afc0c798",
+        "sha256": "e54de6b7afc0c798b69e26395dc4df0fd557b5ed300be9c9179ff84356e8ac59",
+        "start": 32.0,
+        "text": "Join my paid experimental methods course."
+      },
+      {
+        "citation": "https://www.youtube.com/watch?v=abc123xyz_1&t=40s",
+        "end": 48.0,
+        "id": "seg-000007-2e9016668511b245",
+        "sha256": "2e9016668511b2457ca6927e3a37a5cfc3520113d1a97e17f37e47d50ea9303a",
+        "start": 40.0,
+        "text": "Subscribe to our partner show Science Weekly."
+      },
+      {
+        "citation": "https://www.youtube.com/watch?v=abc123xyz_1&t=48s",
+        "end": 52.0,
+        "id": "seg-000008-d93314a8e594aba3",
+        "sha256": "d93314a8e594aba3cd7f7fe6869ffbf3784565be367cc51ff7e0513844fe233c",
+        "start": 48.0,
+        "text": "Next week we publish on Tuesday."
+      },
+      {
+        "citation": "https://www.youtube.com/watch?v=abc123xyz_1&t=52s",
+        "end": 55.0,
+        "id": "seg-000009-10ffa8cf80b3c078",
+        "sha256": "10ffa8cf80b3c078794356edc78782edf9ead862ec5a22d3c60905f149ba2140",
+        "start": 52.0,
+        "text": "Before we continue, consider this offer."
+      }
+    ],
+    "source_id": 3,
+    "source_sha256": "6795475b5c5d1710f5ee6a8b398d8042c826f29e95c5c16a82b07edb769a1733",
+    "tool_version": "normalizer-v1",
+    "transcript_sha256": "f78f64bee3002422b9209563f9478f55539e50ca6e752ead23a6130d9eea0f38"
+  }
+}

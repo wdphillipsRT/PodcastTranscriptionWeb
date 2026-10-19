@@ -148,6 +148,64 @@ class CanonicalTranscript:
         return "\n".join(f"[{s.start:.3f}–{s.end:.3f}] {s.text}" for s in self.segments)
 
 
+def parse_canonical_transcript(raw, *, expected_item_id,
+                               expected_transcript_sha256, expected_segments_sha256):
+    """Validate stored canonical JSON, its exact bytes, and expected lineage.
+
+    Optional digest expectations may be ``None``; the embedded transcript digest
+    is always verified. Reconstruction remains owned by the canonical objects.
+    """
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                _invalid()
+            result[key] = value
+        return result
+
+    def number(value):
+        if type(value) not in (int, float) or not math.isfinite(value):
+            _invalid()
+
+    try:
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        if not isinstance(raw, bytes) or not 0 < len(raw) <= DEFAULT_MAX_BYTES:
+            _invalid()
+        for digest in (expected_transcript_sha256, expected_segments_sha256):
+            if digest is not None and (not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)):
+                _invalid()
+        if expected_segments_sha256 is not None and sha256(raw).hexdigest() != expected_segments_sha256:
+            _invalid()
+        payload = json.loads(raw, object_pairs_hook=unique_object,
+                             parse_constant=lambda _: _invalid())
+        fields = set(CanonicalTranscript.__dataclass_fields__) | {"schema", "transcript_sha256"}
+        if not isinstance(payload, dict) or set(payload) != fields or payload["schema"] != SCHEMA:
+            _invalid()
+        digest = payload.pop("transcript_sha256")
+        payload.pop("schema")
+        number(payload["duration"])
+        segments = payload["segments"]
+        if not isinstance(segments, list) or not 0 < len(segments) <= MAX_SEGMENTS:
+            _invalid()
+        for segment in segments:
+            if not isinstance(segment, dict) or set(segment) != set(TranscriptSegment.__dataclass_fields__):
+                _invalid()
+            number(segment["start"])
+            number(segment["end"])
+        payload["segments"] = tuple(TranscriptSegment(**segment) for segment in segments)
+        transcript = CanonicalTranscript(**payload)
+        if (digest != transcript.transcript_sha256
+                or raw != transcript.to_json().encode("utf-8")
+                or type(expected_item_id) is not type(transcript.item_id)
+                or expected_item_id != transcript.item_id
+                or expected_transcript_sha256 is not None and digest != expected_transcript_sha256):
+            _invalid()
+        return transcript
+    except (ValueError, TypeError, KeyError, UnicodeError, OverflowError, RecursionError):
+        _invalid()
+
+
 def _identity(value):
     if type(value) is int and value > 0:
         return value
