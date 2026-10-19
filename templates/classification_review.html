@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% from "source_items.html" import classification_summary with context %}
+{% block title %}Classification reviews · Private media workspace{% endblock %}
+{% block content %}
+<h1>Classification reviews</h1>
+<p>Uncertain decisions appear first, then classification failures. Within each group, oldest reviews appear first.</p>
+{% for row in reviews %}<article data-review-revision="{{ row.id }}">
+<h2><a href="{{ url_for('workspace.classification_item', item_id=row.item_id) }}">{{ row.title }}</a></h2>
+{{ classification_summary(row.classification) }}
+<p>Requested: <time datetime="{{ row.created_at.isoformat() }}">{{ row.created_at }}</time></p>
+</article>{% else %}<p>No classifications need review.</p>{% endfor %}
+{% if next_url %}<nav aria-label="Review pages"><a href="{{ next_url }}" rel="next">Next reviews</a></nav>{% endif %}
+{% endblock %}

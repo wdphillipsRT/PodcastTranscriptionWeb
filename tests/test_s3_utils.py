@@ -15,6 +15,62 @@ BUCKET = "podcast-transcriptions-web-2025"
 KEY = "items/youtube/abc123xyz_1/audio/media.mp3"
 
 
+@pytest.mark.parametrize("header", [None, "", "bytes=-4", "bytes=1-2,3-4", "bytes=2-1", "bytes=0-8388608", " bytes=0-1", "bytes=0-1\n"])
+def test_media_range_rejects_ambiguous_unbounded_or_large_requests_before_io(header):
+    storage, client = manager()
+    with pytest.raises(s3_utils.StorageError):
+        storage.download_range(KEY, header)
+    client.get_object.assert_not_called()
+
+
+def test_media_range_has_exact_bounded_headers_body_and_closed_stream():
+    storage, client = manager()
+    body = BytesIO(b"abcd")
+    client.get_object.return_value = dict(Body=body, ContentLength=4, ContentRange="bytes 2-5/10",
+        ContentType="audio/mpeg", ResponseMetadata={"HTTPStatusCode": 206})
+    assert storage.download_range(KEY, "bytes=2-5") == dict(body=b"abcd", length=4,
+        content_range="bytes 2-5/10", content_type="audio/mpeg")
+    assert body.closed
+    client.get_object.assert_called_once_with(Bucket=BUCKET, Key=KEY, Range="bytes=2-5")
+
+
+@pytest.mark.parametrize("changes", [dict(ContentRange="bytes 1-4/10"), dict(ContentRange="bytes 2-5/5"),
+    dict(ContentType="text/html"), dict(ContentLength=3), dict(Body=b"abc"),
+    dict(ResponseMetadata={"HTTPStatusCode": 200}), dict(ContentRange="secret token"), dict(ContentLength=True)])
+def test_media_range_validates_upstream_semantics_and_closes(changes):
+    storage, client = manager()
+    values = dict(ContentLength=4, ContentRange="bytes 2-5/10", ContentType="audio/mpeg",
+        ResponseMetadata={"HTTPStatusCode": 206})
+    values.update(changes)
+    body = BytesIO(values.pop("Body", b"abcd"))
+    client.get_object.return_value = dict(values, Body=body)
+    with pytest.raises(s3_utils.StorageError) as error:
+        storage.download_range(KEY, "bytes=2-5")
+    assert body.closed and "secret" not in str(error.value)
+
+
+def test_media_metadata_is_closed_safe_and_requires_nonempty_audio():
+    storage, client = manager()
+    client.head_object.return_value = dict(ContentLength=10, ContentType="audio/mpeg", ETag="private")
+    assert storage.media_info(KEY) == {"length": 10, "content_type": "audio/mpeg"}
+    for value in (0, -1, True, None):
+        client.head_object.return_value["ContentLength"] = value
+        with pytest.raises(s3_utils.StorageError):
+            storage.media_info(KEY)
+
+
+def test_open_ended_media_range_is_capped_and_eof_is_validated():
+    storage, client = manager()
+    client.head_object.return_value = dict(ContentLength=20_000_000, ContentType="audio/mpeg")
+    content = b"x" * (8 * 1024 * 1024)
+    client.get_object.return_value = dict(Body=BytesIO(content), ContentLength=len(content),
+        ContentRange="bytes 2-8388609/20000000", ContentType="audio/mpeg", ResponseMetadata={"HTTPStatusCode": 206})
+    assert len(storage.download_range(KEY, "bytes=2-")["body"]) == len(content)
+    client.get_object.assert_called_once_with(Bucket=BUCKET, Key=KEY, Range="bytes=2-8388609")
+    with pytest.raises(s3_utils.StorageError):
+        storage.download_range(KEY, "bytes=20000000-")
+
+
 def manager(region="us-east-1", location=None):
     client = Mock()
     client.get_bucket_location.return_value = {"LocationConstraint": location}

@@ -15,6 +15,9 @@ from config import load_settings
 
 BUCKET_NAME = "podcast-transcriptions-web-2025"
 DEFAULT_MAX_BYTES = 52_428_800
+MEDIA_RANGE_MAX_BYTES = 8 * 1024 * 1024
+AUDIO_CONTENT_TYPES = frozenset({"audio/mpeg", "audio/mp4", "audio/x-m4a", "audio/wav",
+    "audio/x-wav", "audio/flac", "audio/ogg", "audio/amr", "audio/webm"})
 
 
 class StorageError(ValueError):
@@ -31,6 +34,21 @@ class StoragePermanentError(StorageError):
 
 class StorageIntegrityError(StoragePermanentError):
     """Missing or corrupt artifact; a pipeline may repair its own references."""
+
+
+class StorageRangeError(StoragePermanentError):
+    """A byte range cannot be served; contains no storage diagnostics."""
+
+
+def parse_media_range(header):
+    """One explicit start, optional end; reject suffixes and multipart ranges."""
+    match = re.fullmatch(r"bytes=([0-9]{1,19})-([0-9]{1,19})?", header) if isinstance(header, str) else None
+    if match is None:
+        raise StorageRangeError("invalid media range")
+    start, end = int(match[1]), int(match[2]) if match[2] else None
+    if start > 2**63 - 1 or end is not None and (end < start or end > 2**63 - 1 or end - start + 1 > MEDIA_RANGE_MAX_BYTES):
+        raise StorageRangeError("invalid media range")
+    return start, end
 
 
 def setting(settings, name):
@@ -266,6 +284,75 @@ class S3Manager:
     def get_bytes(self, s3_key, *, max_bytes=DEFAULT_MAX_BYTES):
         with closing(self._object_chunks(s3_key, max_bytes=max_bytes)) as chunks:
             return b"".join(chunks)
+
+    def media_info(self, s3_key):
+        """Project only validated audio metadata; never return provider headers."""
+        validate_artifact_key(s3_key)
+        try:
+            response = self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            self._check_response(response)
+            length, mime = response.get("ContentLength"), response.get("ContentType")
+            if type(length) is not int or not 0 < length <= 2**63 - 1 or mime not in AUDIO_CONTENT_TYPES:
+                raise StorageIntegrityError("media unavailable")
+            return {"length": length, "content_type": mime}
+        except StorageError:
+            raise
+        except Exception as error:
+            _failure(error)
+
+    def download_range(self, s3_key, range_header):
+        """Read exactly one validated private audio range, at most eight MiB."""
+        validate_artifact_key(s3_key)
+        start, end = parse_media_range(range_header)
+        expected_total = None
+        if end is None:
+            info = self.media_info(s3_key)
+            expected_total = info["length"]
+            if start >= expected_total:
+                raise StorageRangeError("invalid media range")
+            end = min(start + MEDIA_RANGE_MAX_BYTES - 1, expected_total - 1)
+        body = None
+        try:
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key, Range=f"bytes={start}-{end}")
+            body = response.get("Body")
+            self._check_response(response)
+            content_range = response.get("ContentRange")
+            match = re.fullmatch(r"bytes ([0-9]{1,19})-([0-9]{1,19})/([0-9]{1,19})", content_range) if isinstance(content_range, str) else None
+            if match is None or response.get("ResponseMetadata", {}).get("HTTPStatusCode") != 206:
+                raise StorageIntegrityError("invalid media response")
+            actual_start, actual_end, total = map(int, match.groups())
+            length, mime = response.get("ContentLength"), response.get("ContentType")
+            if (not 0 <= actual_start <= actual_end < total <= 2**63 - 1 or actual_start != start
+                    or actual_end != min(end, total - 1) or expected_total is not None and total != expected_total
+                    or type(length) is not int or length != actual_end - start + 1
+                    or not 0 < length <= MEDIA_RANGE_MAX_BYTES or mime not in AUDIO_CONTENT_TYPES):
+                raise StorageIntegrityError("invalid media response")
+            chunks, received = [], 0
+            while True:
+                chunk = body.read(min(65536, length - received + 1))
+                if not isinstance(chunk, bytes) or received + len(chunk) > length:
+                    raise StorageIntegrityError("invalid media body")
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
+            if received != length:
+                raise StorageIntegrityError("invalid media body")
+            return dict(body=b"".join(chunks), length=length, content_type=mime, content_range=content_range)
+        except StorageError:
+            raise
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") in {"InvalidRange", "RequestedRangeNotSatisfiable", "416"}:
+                raise StorageRangeError("invalid media range") from None
+            _failure(error)
+        except Exception as error:
+            _failure(error)
+        finally:
+            if body is not None:
+                try:
+                    body.close()
+                except Exception:
+                    pass
 
     def verify_sha256(self, s3_key, *, expected_sha256=None, max_bytes=DEFAULT_MAX_BYTES):
         """Hash bounded object chunks without retaining an audio-sized buffer."""

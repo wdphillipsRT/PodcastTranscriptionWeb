@@ -1,4 +1,9 @@
 {% extends "base.html" %}
+{% macro classification_summary(value) %}
+<small>Classification: {{ value.state }} · Policy: {{ value.policy_version }}</small>
+<small>Included: {{ value.included_segments }} ({{ '%.3f'|format(value.included_milliseconds / 1000) }} seconds) · Excluded: {{ value.excluded_segments }} ({{ '%.3f'|format(value.excluded_milliseconds / 1000) }} seconds) · Uncertain: {{ value.uncertain_segments }} ({{ '%.3f'|format(value.uncertain_milliseconds / 1000) }} seconds)</small>
+<small>Review: {{ 'Needed' if value.review_required else 'Not needed' }}{% if value.failure %} · {{ value.failure }}{% endif %}</small>
+{% endmacro %}
 {% macro item_table(items) %}
 {% if items %}
 <p>Showing up to 200 imported items, newest first. Undated items follow dated items.</p>
@@ -7,7 +12,7 @@
   <thead><tr><th scope="col">Item</th><th scope="col">Status</th><th scope="col">Transcript origin</th><th scope="col">Transcript</th></tr></thead>
   <tbody>{% for item in items %}<tr>
     <th scope="row"><a href="{{ url_for('workspace.item', item_id=item.id) }}">{{ item.title }}</a></th>
-    <td>{{ item.status }}</td><td>{{ item.transcript_origin }}</td>
+    <td>{{ item.status }}{{ classification_summary(item.classification) }}<a href="{{ url_for('workspace.classification_item', item_id=item.id) }}">Review classification</a></td><td>{{ item.transcript_origin }}</td>
     <td>{% if item.transcript_available %}<a href="{{ url_for('workspace.transcript', item_id=item.id) }}">Read transcript</a>{% else %}Not available{% endif %}</td>
   </tr>{% endfor %}</tbody>
 </table></div>
@@ -19,10 +24,12 @@
 {% if older_url %}<a href="{{ older_url }}" rel="next">Older items</a>{% endif %}
 </nav>{% endif %}
 {% endmacro %}
-{% block title %}Items · {{ source.name }}{% endblock %}
+{% block title %}Items{% if source is defined %} · {{ source.name }}{% endif %}{% endblock %}
 {% block content %}
+{% if source is defined %}
 <h1>{{ source.name }} items</h1>
 <p><a href="{{ url_for('workspace.source', source_id=source.id) }}">Source and backfills</a></p>
 {{ item_table(items) }}
 {{ item_navigation() }}
+{% endif %}
 {% endblock %}
