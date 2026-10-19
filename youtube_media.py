@@ -37,7 +37,7 @@ class YouTubeMediaError(IngestionError):
 
     def __init__(self, category: str):
         self.category = category
-        self.retryable = category in {"timeout", "download_failed", "process_unavailable"}
+        self.retryable = category in {"timeout", "download_failed", "process_unavailable", "not_ready"}
         super().__init__(category)
 
 
@@ -298,9 +298,11 @@ class YouTubeMediaClient:
                 _fail("invalid_inventory")
             if type(data.get("age_limit", 0)) not in {int, float}:
                 _fail("invalid_inventory")
-            if (data.get("availability") != "public"
-                    or data.get("live_status") not in {None, "not_live", "was_live"}
-                    or data.get("age_limit", 0) != 0):
+            if data.get("availability") != "public" or data.get("age_limit", 0) != 0:
+                _fail("unavailable")
+            if data.get("live_status") in {"is_live", "is_upcoming", "post_live"}:
+                _fail("not_ready")
+            if data.get("live_status") not in {None, "not_live", "was_live"}:
                 _fail("unavailable")
             candidates = []
             for field, kind in (("subtitles", "creator"), ("automatic_captions", "automatic")):

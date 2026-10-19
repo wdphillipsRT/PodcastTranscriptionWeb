@@ -67,6 +67,34 @@ def test_inventory_preserves_kind_and_discards_signed_urls(settings, process):
     assert "SECRET" not in repr(inventory)
 
 
+@pytest.mark.parametrize("live_status", ["is_live", "is_upcoming", "post_live"])
+def test_confirmed_public_temporary_stream_states_are_retryable(settings, process, live_status):
+    process[0]["payload"]["live_status"] = live_status
+    with pytest.raises(YouTubeMediaError, match="^not_ready$") as caught:
+        YouTubeMediaClient(settings).inventory(URL)
+    assert caught.value.category == "not_ready" and caught.value.retryable
+    assert not Path(process[1][0][1]["cwd"]).exists()
+
+
+@pytest.mark.parametrize("availability", [None, "private", "unlisted", "premium_only", "subscriber_only"])
+def test_restricted_streams_remain_permanently_unavailable(settings, process, availability):
+    process[0]["payload"].update(availability=availability, live_status="is_live")
+    with pytest.raises(YouTubeMediaError, match="^unavailable$") as caught:
+        YouTubeMediaClient(settings).inventory(URL)
+    assert not caught.value.retryable
+
+
+def test_age_restricted_public_live_stream_is_unavailable(settings, process):
+    process[0]["payload"].update(age_limit=18, live_status="is_live")
+    with pytest.raises(YouTubeMediaError, match="^unavailable$"):
+        YouTubeMediaClient(settings).inventory(URL)
+
+
+def test_completed_public_stream_remains_eligible(settings, process):
+    process[0]["payload"]["live_status"] = "was_live"
+    assert YouTubeMediaClient(settings).inventory(URL).video_id == VIDEO
+
+
 @pytest.mark.parametrize(("candidates", "preferred", "expected"), [
     ((CaptionCandidate("automatic", "en"), CaptionCandidate("creator", "fr")), ("en.*", "en"), CaptionCandidate("creator", "fr")),
     ((CaptionCandidate("creator", "en"), CaptionCandidate("creator", "en-US")), ("en.*", "en"), CaptionCandidate("creator", "en")),
