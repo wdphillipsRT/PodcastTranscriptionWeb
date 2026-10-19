@@ -330,7 +330,8 @@ def test_local_whisper_builds_stable_canonical_segments_and_round_trips():
     assert first.language == "en" and first.duration == 2.0
     assert first.provider_version == provider.CANONICAL_PROVIDER_VERSION
     assert first.tool_version == module().NORMALIZER_VERSION == provider.NORMALIZER_VERSION
-    assert first.source_sha256 == sha256(module().canonical_json(whisper_data()).encode()).hexdigest()
+    artifact = module().canonical_json(whisper_data()).encode("utf-8")
+    assert first.source_sha256 == sha256(artifact).hexdigest()
     assert [(s.start, s.end, s.text) for s in first.segments] == [(0.0, 2.0, "Hello world.")]
     assert first.segments[0].id == f"seg-000001-{first.segments[0].sha256[:16]}"
     assert first.segments[0].sha256 == "8790915715c93f562582d4d630819b293d19f37c1d7f873e2e126b5ce1c3320c"
@@ -343,7 +344,7 @@ def test_local_whisper_builds_stable_canonical_segments_and_round_trips():
 def test_local_whisper_preserves_multiple_segments_and_podcast_citations():
     data = whisper_data()
     data["duration"] = 4.0
-    data["segments"].append(dict(start=2.5, end=4.0, text="  Next.  ", words=[]))
+    data["segments"].append(dict(start=2.5, end=4.0, text="Next.", words=[]))
     result = normalize_whisper(data, platform="podcast", external_id="episode-123",
                                canonical_url="https://podcasts.example/episode")
     assert [(s.start, s.end, s.text) for s in result.segments] == [(0.0, 2.0, "Hello world."), (2.5, 4.0, "Next.")]
@@ -352,13 +353,31 @@ def test_local_whisper_preserves_multiple_segments_and_podcast_citations():
         normalize_whisper(data, max_segments=1)
 
 
-def test_local_whisper_accepts_text_bytes_and_hashes_canonical_provider_data():
+@pytest.mark.parametrize("serialization", ["indented", "newline", "normalized_text", "integer_time"])
+def test_local_whisper_rejects_noncanonical_provider_serialization(serialization):
     api = module()
-    raw = json.dumps(whisper_data(), indent=2)
-    result = api.normalize_local_whisper(raw, platform="youtube", external_id=METADATA["external_id"],
-                                         item_id=7, source_id=3, audio_sha256="a" * 64,
-                                         raw_sha256=sha256(raw.encode()).hexdigest())
-    assert result.to_json() == normalize_whisper().to_json()
+    data = whisper_data()
+    if serialization == "normalized_text":
+        data["segments"][0]["text"] = "  Hello world.  "
+    elif serialization == "integer_time":
+        data["segments"][0]["start"] = 0
+    raw = json.dumps(data, indent=2) if serialization == "indented" else api.canonical_json(data)
+    if serialization == "newline":
+        raw = Path("tests/fixtures/whisper-provider-result.json").read_bytes()
+    with pytest.raises(api.TranscriptValidationError, match="^invalid transcript input$"):
+        api.normalize_local_whisper(raw, platform="youtube", external_id=METADATA["external_id"],
+                                     item_id=7, source_id=3, audio_sha256="a" * 64,
+                                     raw_sha256=sha256(raw.encode() if isinstance(raw, str) else raw).hexdigest())
+
+
+def test_local_whisper_accepts_canonical_utf8_text_and_preserves_exact_artifact_hash():
+    import whisper_transcribe as provider
+    raw = provider.parse_whisper_result(Path("tests/fixtures/whisper-provider-result.json").read_bytes()).to_json()
+    artifact_hash = sha256(raw.encode("utf-8")).hexdigest()
+    result = module().normalize_local_whisper(raw, platform="youtube", external_id=METADATA["external_id"],
+                                             item_id=7, source_id=3, audio_sha256="a" * 64,
+                                             raw_sha256=artifact_hash)
+    assert result.source_sha256 == artifact_hash
 
 
 @pytest.mark.parametrize("updates", [{"provider": "yt-dlp"}, {"provider_version": "1.2.1"}, {"language": "fr"}])

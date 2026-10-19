@@ -396,8 +396,8 @@ def normalize_local_whisper(content, *, platform, external_id, item_id, source_i
     """Verify a local provider artifact and reuse canonical segment construction.
 
     The provider parser is pure data validation; importing it never loads the
-    optional inference runtime. Raw digest checks bind the exact stored bytes,
-    while source lineage covers their sorted, compact provider JSON.
+    optional inference runtime. Only its exact canonical UTF-8 serialization is
+    accepted, and source lineage preserves the verified artifact digest.
     """
     try:
         raw = content.encode("utf-8") if isinstance(content, str) else content
@@ -409,14 +409,15 @@ def normalize_local_whisper(content, *, platform, external_id, item_id, source_i
             _invalid()
         result = parse_whisper_result(raw, expected_audio_sha256=audio_sha256,
                                       expected_job_name=whisper_job_name(item_id, audio_sha256))
+        if raw != result.to_bytes():
+            _invalid()
         # Word rows are excluded from canonical segments but still cannot carry
         # private locators into the provider artifact accepted by this boundary.
         for segment in result.segments:
             for word in segment.words:
                 _text(word.word, max_text_chars)
-        source = canonical_json(json.loads(raw)).encode("utf-8")
         return _build(((segment.start, segment.end, segment.text) for segment in result.segments),
-                      source_sha256=sha256(source).hexdigest(), platform=platform, external_id=external_id,
+                      source_sha256=raw_sha256, platform=platform, external_id=external_id,
                       item_id=item_id, source_id=source_id, origin="local_whisper", provider=PROVIDER,
                       provider_version=CANONICAL_PROVIDER_VERSION, tool_version=tool_version, language=LANGUAGE,
                       duration=result.duration, canonical_url=canonical_url,
