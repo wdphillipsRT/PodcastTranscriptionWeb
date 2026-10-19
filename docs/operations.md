@@ -26,6 +26,86 @@ all host interfaces: the app trusts one forwarding proxy.
 Phase 1 supports ingestion and transcription. Claude learning bundles and
 delivery to Lamad, Ebenezer, and Agent Factory are deferred to later phases.
 
+## Filtered learning and delivery inputs
+
+`learning_projection.py` provides the single transcript input gateway for
+future Phase 2 bundle extraction and Phase 3 Lamad, Ebenezer, and Agent Factory
+publishers. This task implements that boundary; it does not create learning
+bundles or publish to any of those systems. Downstream code must not read
+`ContentItem.segments_s3_key` or `transcript_s3_key` directly. A repository
+contract test scans `learning_*.py`, `publishers/`, and `integrations/` for
+direct artifact-field references outside the gateway.
+
+Use committed item/revision inputs and the existing private storage client:
+
+```python
+from learning_projection import load_active_learning_projection
+
+projection = load_active_learning_projection(
+    session=db.session, storage=storage, item_id=item_id,
+)
+segment = projection.assert_citable(segment_id)
+```
+
+The immutable result has the canonical `learning-transcript-projection/v1`
+schema and exact canonical editorial records, including their IDs, hashes,
+timings, text, and citations. It exposes no storage client, full transcript,
+or raw policy. Only `editorial` is eligible; `uncertain` is always excluded.
+The method and the module's `assert_citable(projection, segment_id)` both
+reject excluded, uncertain, unknown, and promotional references with the same
+safe exception, without disclosing whether an excluded segment exists.
+
+Loading requires a completed item and its active completed classification
+revision matching the current transcript and canonical-object hashes. All
+objects are read with the existing byte limit. Canonical JSON bytes, schemas,
+content-addressed keys, embedded hashes, item/source ownership and membership,
+classifier provenance, policy lineage, revision totals, and exact editorial
+projection equality are verified. Policy/projection digests follow their
+canonical schema convention: each hashes the artifact without its own digest
+field. The canonical transcript object also has its full stored-byte hash.
+After storage reads, the gateway rechecks the active revision, transcript
+identity, source membership, and newer revisions before returning.
+
+The default `require_latest=True` blocks new bundle construction while any
+higher revision is pending, retrying, running, or failed, or a higher completed
+revision has not become the active pointer. A higher superseded attempt does
+not block the valid active revision. Previously published bundles may remain
+active until replacement validation; loading does not unpublish them.
+`require_latest=False` is reserved for explicit inspection of the still-active
+prior result. It never bypasses artifact checks and must not be used for new
+bundle extraction or delivery.
+
+Any missing, corrupt, stale, failed, or superseded active input raises
+`LearningProjectionUnavailable` with the message `learning projection unavailable`. Consumers
+must stop extraction/delivery and use the existing classification recovery
+workflow; they must never retry with a full/raw transcript. The gateway makes
+no database writes, commits no caller changes, and logs no transcript text,
+artifact keys, or provider diagnostics. Its short database read sessions end
+before storage I/O. A returned DTO is a snapshot, so future publishers must
+also validate their bundle/revision identity when activating a replacement.
+
+Purpose-specific promotional research is an explicit separate path:
+
+```python
+from learning_projection import load_promotional_projection
+
+promotion = load_promotional_projection(
+    session=db.session, storage=storage, item_id=item_id,
+    labels=("self_promotion", "cross_promotion"),
+    purpose="asp-50-marketing-research",
+)
+```
+
+Purpose is a nonempty policy-valid slug (up to 128 characters); labels must
+contain only `self_promotion` and/or `cross_promotion`, without duplicates.
+This returns the distinct immutable `promotional-analysis-projection/v1`
+`PromotionalProjection`, which is rejected by the general citation API. It
+reconstructs only the requested promotion records on demand from the
+hash-validated canonical transcript and active policy, always with latest
+revision gating. No promotional artifact is stored in the revision, and the
+stored learning projection is not read for this research path. Neither path
+loads the full text artifact as a fallback.
+
 ## Credentials and environment
 
 Protect the checkout, Docker access, backups, and `.env` as administrator data.

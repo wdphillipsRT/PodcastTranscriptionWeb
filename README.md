@@ -19,6 +19,24 @@ YouTube Data API key are required by startup checks.
 
 Phase 1 implements ingestion and transcription. Claude learning bundles and
 delivery to Lamad, Ebenezer, or Agent Factory are deferred to later phases.
+Their mandatory filtered-input gateway is implemented in `learning_projection.py`:
+future Phase 2 bundle extraction and Phase 3 publishers must call
+`load_active_learning_projection(session=..., storage=..., item_id=...)` and
+validate cited segment IDs with the returned projection's `assert_citable()`.
+The immutable result contains only exact canonical segments labeled `editorial`;
+commercials, promotions, housekeeping, and `uncertain` segments are ineligible.
+Missing, corrupt, stale, failed, or superseded inputs raise
+`LearningProjectionUnavailable`; there is no full-transcript fallback.
+This gateway does not publish to Lamad, Ebenezer, or Agent Factory.
+
+New bundle construction requires the latest revision by default, including
+when a newer revision is pending, retrying, running, or failed. An already
+published prior bundle may stay active until its replacement is validated.
+Explicit promotional research instead calls `load_promotional_projection()`
+with a nonempty purpose and only `self_promotion`/`cross_promotion` labels;
+its separate `PromotionalProjection` type cannot use the general citation API.
+See the [filtered-input contract](docs/operations.md#filtered-learning-and-delivery-inputs)
+for artifact validation and integration requirements.
 
 For offline development verification, install `requirements-dev.txt` in a
 Python 3.11 virtual environment, then run:
