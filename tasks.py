@@ -1,6 +1,7 @@
 """ID-only task boundary; application/provider clients are created lazily."""
 from contextlib import contextmanager
 import logging
+import os
 from time import monotonic
 from types import SimpleNamespace
 
@@ -9,6 +10,9 @@ from flask import current_app, has_app_context
 
 celery_app = Celery("podcast_transcription")
 celery_app.config_from_object("celeryconfig")
+
+# Populated only when a task needs its own app context, never at import time.
+_worker_application = None
 
 
 def _observe_classification(event, identity, started, *, result=None, retry_category=None,
@@ -58,11 +62,25 @@ def _observe_classification(event, identity, started, *, result=None, retry_cate
 
 @contextmanager
 def application_context():
+    global _worker_application
     if has_app_context():
         yield
     else:
-        from app import create_app
-        app = create_app()
+        pid = os.getpid()
+        if _worker_application is not None and _worker_application[0] != pid:
+            inherited_app = _worker_application[1]
+            _worker_application = None
+            # Detach inherited pools without closing the parent's connections.
+            from extensions import db
+            with inherited_app.app_context():
+                for engine in db.engines.values():
+                    engine.dispose(close=False)
+        if _worker_application is None:
+            from app import create_app
+            _worker_application = (pid, create_app())
+        app = _worker_application[1]
+        # Flask-SQLAlchemy's teardown removes the task's scoped session, also
+        # when the task raises; only the app/engine live across task contexts.
         with app.app_context():
             yield
 
