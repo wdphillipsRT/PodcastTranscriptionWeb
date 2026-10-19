@@ -1,0 +1,8 @@
+{
+  "kind": "youtube#channelListResponse", "etag": "channel-page-etag",
+  "items": [{
+    "kind": "youtube#channel", "id": "UCabcdefghijklmnopqrstuv",
+    "snippet": {"title": "Teacher", "description": "Lessons", "customUrl": "@teacher"},
+    "contentDetails": {"relatedPlaylists": {"uploads": "UUabcdefghijklmnopqrstuv"}}
+  }]
+}

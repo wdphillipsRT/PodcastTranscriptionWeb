@@ -1,0 +1,16 @@
+{
+  "kind": "youtube#videoListResponse",
+  "etag": "video-page-etag",
+  "items": [{
+    "kind": "youtube#video", "etag": "video-etag", "id": "dQw4w9WgXcQ",
+    "snippet": {
+      "title": "Public teaching", "description": "A public lesson",
+      "publishedAt": "2026-10-18T12:30:00Z",
+      "channelId": "UCabcdefghijklmnopqrstuv", "channelTitle": "Teacher",
+      "liveBroadcastContent": "none",
+      "thumbnails": {"high": {"url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"}}
+    },
+    "contentDetails": {"duration": "PT1H2M3S", "contentRating": {}},
+    "status": {"privacyStatus": "public", "uploadStatus": "processed", "embeddable": true}
+  }]
+}

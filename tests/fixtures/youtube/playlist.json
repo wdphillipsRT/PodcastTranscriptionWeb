@@ -1,0 +1,8 @@
+{
+  "kind": "youtube#playlistListResponse", "etag": "playlist-page-etag",
+  "items": [{
+    "kind": "youtube#playlist", "id": "PLabcdefghijklmnopqrstuv",
+    "snippet": {"title": "Lessons", "description": "Public lessons", "channelId": "UCabcdefghijklmnopqrstuv", "channelTitle": "Teacher"},
+    "status": {"privacyStatus": "public"}, "contentDetails": {"itemCount": 2}
+  }]
+}

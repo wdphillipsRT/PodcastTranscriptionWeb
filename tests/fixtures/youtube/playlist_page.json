@@ -1,0 +1,10 @@
+{
+  "kind": "youtube#playlistItemListResponse", "etag": "membership-page-etag",
+  "nextPageToken": "CAUQAA",
+  "items": [{
+    "kind": "youtube#playlistItem", "id": "membership-id",
+    "snippet": {"title": "Public teaching", "position": 0, "resourceId": {"kind": "youtube#video", "videoId": "dQw4w9WgXcQ"}},
+    "contentDetails": {"videoId": "dQw4w9WgXcQ", "videoPublishedAt": "2026-10-18T12:30:00Z"},
+    "status": {"privacyStatus": "public"}
+  }]
+}
