@@ -206,6 +206,25 @@ def test_media_invalid_range_is_416_without_storage_read(review, header):
     assert review.client.get("/items/1/media", headers=headers).status_code == 416
 
 
+@pytest.mark.parametrize("end", [10, 20])
+def test_explicit_media_range_past_eof_returns_generic_416(review, monkeypatch, end):
+    from io import BytesIO
+    from web import routes
+    from tests.test_s3_utils import manager
+    storage, client = manager()
+    body = BytesIO(b"23456789")
+    client.get_object.return_value = dict(Body=body, ContentLength=8,
+        ContentRange="bytes 2-9/10", ContentType="audio/mpeg",
+        ResponseMetadata={"HTTPStatusCode": 206})
+    review.item.media_s3_key = "items/podcast/episode/audio/private.mp3"
+    db.session.commit()
+    monkeypatch.setattr(routes, "get_s3_manager", lambda *args: storage)
+    response = review.client.get("/items/1/media", headers={"Range": f"bytes=2-{end}"},
+        content_type="application/json")
+    assert response.status_code == 416 and response.json == {"error": "Request failed"}
+    assert "private.mp3" not in response.text and body.closed
+
+
 def test_duplicate_json_fields_and_nonobject_payloads_are_generic_400(review):
     data = json.dumps(correction(review))[:-1] + ', "label": "editorial"}'
     assert review.client.post("/api/items/1/classification/overrides", data=data,

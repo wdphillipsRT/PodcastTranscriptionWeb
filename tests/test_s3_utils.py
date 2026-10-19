@@ -71,6 +71,31 @@ def test_open_ended_media_range_is_capped_and_eof_is_validated():
         storage.download_range(KEY, "bytes=20000000-")
 
 
+@pytest.mark.parametrize("end", [10, 20])
+def test_explicit_media_range_end_at_or_past_eof_is_rejected_and_closed(end):
+    storage, client = manager()
+    body = BytesIO(b"23456789")
+    client.get_object.return_value = dict(Body=body, ContentLength=8,
+        ContentRange="bytes 2-9/10", ContentType="audio/mpeg",
+        ResponseMetadata={"HTTPStatusCode": 206})
+    with pytest.raises(s3_utils.StorageRangeError, match="invalid media range"):
+        storage.download_range(KEY, f"bytes=2-{end}")
+    assert body.closed
+
+
+def test_open_ended_media_range_still_accepts_object_eof():
+    storage, client = manager()
+    client.head_object.return_value = dict(ContentLength=10, ContentType="audio/mpeg")
+    body = BytesIO(b"23456789")
+    client.get_object.return_value = dict(Body=body, ContentLength=8,
+        ContentRange="bytes 2-9/10", ContentType="audio/mpeg",
+        ResponseMetadata={"HTTPStatusCode": 206})
+    result = storage.download_range(KEY, "bytes=2-")
+    assert result["body"] == b"23456789" and result["content_range"] == "bytes 2-9/10"
+    assert body.closed
+    client.get_object.assert_called_once_with(Bucket=BUCKET, Key=KEY, Range="bytes=2-9")
+
+
 def manager(region="us-east-1", location=None):
     client = Mock()
     client.get_bucket_location.return_value = {"LocationConstraint": location}

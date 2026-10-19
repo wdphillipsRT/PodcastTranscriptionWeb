@@ -304,8 +304,9 @@ class S3Manager:
         """Read exactly one validated private audio range, at most eight MiB."""
         validate_artifact_key(s3_key)
         start, end = parse_media_range(range_header)
+        open_ended = end is None
         expected_total = None
-        if end is None:
+        if open_ended:
             info = self.media_info(s3_key)
             expected_total = info["length"]
             if start >= expected_total:
@@ -327,6 +328,8 @@ class S3Manager:
                     or type(length) is not int or length != actual_end - start + 1
                     or not 0 < length <= MEDIA_RANGE_MAX_BYTES or mime not in AUDIO_CONTENT_TYPES):
                 raise StorageIntegrityError("invalid media response")
+            if not open_ended and end >= total:
+                raise StorageRangeError("invalid media range")
             chunks, received = [], 0
             while True:
                 chunk = body.read(min(65536, length - received + 1))
