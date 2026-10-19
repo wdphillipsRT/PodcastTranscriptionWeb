@@ -151,6 +151,30 @@ def test_startup_scripts_fail_closed_and_preserve_exec_arguments(script, selecti
     assert "SYSTEM_CHECK_SERVICES" not in content
 
 
+def test_worker_startup_pins_app_pythonpath_for_prefork_lazy_imports(tmp_path):
+    """Celery's console loader must not leave child imports dependent on cwd."""
+    script = ROOT / "scripts" / "start-worker.sh"
+    fake = tmp_path / "flask"
+    fake.write_text('#!/bin/sh\nprintf "guard:%s\\n" "$PYTHONPATH"\n')
+    fake.chmod(0o755)
+    probe = tmp_path / "probe"
+    probe.write_text('#!/bin/sh\nprintf "child:%s\\n" "$PYTHONPATH"\n')
+    probe.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": str(tmp_path) + ":" + os.environ["PATH"],
+        "PYTHONPATH": "/tmp/untrusted-shadow-path",
+    }
+
+    result = subprocess.run(
+        [str(script), str(probe)], env=environment,
+        capture_output=True, text=True, timeout=3,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == ["guard:/app", "child:/app"]
+
+
 def test_dockerignore_excludes_sensitive_and_local_material_but_ships_app_assets():
     path = ROOT / ".dockerignore"
     assert path.exists(), "image build context must exclude local secrets"
