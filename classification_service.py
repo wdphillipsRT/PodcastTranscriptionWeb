@@ -24,7 +24,7 @@ from commercial_policy import (ClassificationRange, ClassifierProvenance,
     TARGET_SEGMENTS_PER_BLOCK, build_segment_policy, build_learning_projection)
 from commercial_signals import (CommercialSignalError, ExactRule, build_classifier_windows, collect_signals,
                                 fingerprint_range, match_exact_rules)
-from models import (ContentItem, SourceItem, SegmentOverride, SourceClassificationRule,
+from models import (ContentItem, ContentSource, SourceItem, SegmentOverride, SourceClassificationRule, ClassificationSweep,
                     ClassificationRevision, ClassificationBlock, CLASSIFICATION_REASONS, utc_now)
 from s3_utils import (DEFAULT_MAX_BYTES, StorageError, StorageTransientError,
                       validate_artifact_key)
@@ -86,6 +86,26 @@ class PreparationResult:
     state: str
     block_ordinals: tuple[int, ...]
     next_dispatch: DispatchInstruction | None
+
+
+@dataclass(frozen=True, slots=True)
+class OverrideResult:
+    override_id: int
+    rule_id: int
+    revision_id: int
+    sweep_id: int
+    next_dispatch: DispatchInstruction
+
+
+@dataclass(frozen=True, slots=True)
+class SweepResult:
+    sweep_id: int
+    state: str
+    cursor_item_id: int | None
+    items_scanned: int
+    items_queued: int
+    revision_ids: tuple[int, ...]
+    next_task_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +239,17 @@ class ClassificationService:
             previous = by_id.get(row.supersedes_id)
             if previous is not None and (row.created_at, row.id) > (previous.created_at, previous.id):
                 superseded.add(previous.id)
-        active = [row for row in rules if row.id not in superseded and row.originating_override_id is not None]
+        # A fingerprint/label pair is unique forever. An A -> B -> A correction
+        # reuses the original A rule without mutating its supersession history.
+        # Only authenticated recorded corrections select that current label;
+        # independently supplied conflicting rules still resolve uncertain.
+        corrected = {}
+        for row in overrides:
+            if row.policy_revision_id is not None:
+                corrected.setdefault(row.range_fingerprint_sha256, row.label)
+        active = [row for row in rules if row.originating_override_id is not None and (
+            row.label == corrected[row.fingerprint_sha256] if row.fingerprint_sha256 in corrected
+            else row.id not in superseded)]
         origins = {}
         for row in active:
             origin = self.session.get(SegmentOverride, row.originating_override_id, populate_existing=True)
@@ -246,7 +276,7 @@ class ClassificationService:
     def _eligible(item, allow_precompletion=False):
         return item.status == "completed" or allow_precompletion and item.status == "transcribing"
 
-    def _read_inputs(self, item_id, *, build_windows=True, allow_precompletion=False):
+    def _read_canonical(self, item_id, *, allow_precompletion=False):
         with self._transaction():
             item = self._item_lock(item_id)
             if not self._eligible(item, allow_precompletion):
@@ -263,6 +293,10 @@ class ClassificationService:
                 _fail("invalid_canonical")
         except (TranscriptValidationError, StorageError) as error:
             _fail("storage_transient" if isinstance(error, StorageTransientError) else "invalid_canonical")
+        return snapshot, transcript
+
+    def _read_inputs(self, item_id, *, build_windows=True, allow_precompletion=False):
+        snapshot, transcript = self._read_canonical(item_id, allow_precompletion=allow_precompletion)
         with self._transaction():
             item = self._item_lock(item_id)
             if not self._eligible(item, allow_precompletion) or _values(item, _ITEM_FIELDS) != snapshot:
@@ -443,6 +477,229 @@ class ClassificationService:
     def _same_inputs(self, item, inputs, *, allow_precompletion=False):
         return (self._eligible(item, allow_precompletion) and _values(item, _ITEM_FIELDS) == inputs.item
             and self._metadata(item, inputs.transcript.source_id) == inputs.metadata)
+
+    def _override_result(self, row):
+        revision = self.session.scalar(sa.select(ClassificationRevision).where(
+            ClassificationRevision.item_id == row.item_id,
+            ClassificationRevision.idempotency_key.like(f"override:{row.id}:sweep:%")))
+        if revision is None:
+            _fail()
+        sweep = self.session.get(ClassificationSweep, int(revision.idempotency_key.rsplit(":", 1)[1]))
+        if sweep is None:
+            _fail()
+        task_id = f"classify-{revision.item_id}-{revision.transcript_sha256[:16]}-r{revision.revision}-prepare"
+        return OverrideResult(row.id, sweep.rule_id, revision.id, sweep.id,
+            DispatchInstruction(revision.id, "prepare", None, task_id))
+
+    def record_override(self, *, item_id, admin_id, active_revision_id,
+                        first_segment_id, last_segment_id, label):
+        """Append a reviewed range and both durable outboxes in one transaction.
+
+        A matching submission replays its original result, including after its
+        revision activates. A different stale browser submission fails closed.
+        """
+        if (type(admin_id) is not int or admin_id <= 0 or type(active_revision_id) is not int
+                or active_revision_id <= 0 or label not in LABELS
+                or not isinstance(first_segment_id, str) or not isinstance(last_segment_id, str)):
+            _fail()
+
+        def replay(item):
+            row = self.session.scalar(sa.select(SegmentOverride).where(
+                SegmentOverride.item_id == item_id, SegmentOverride.admin_id == admin_id,
+                SegmentOverride.transcript_sha256 == item.transcript_sha256,
+                SegmentOverride.policy_revision_id == active_revision_id,
+                SegmentOverride.first_segment_id == first_segment_id,
+                SegmentOverride.last_segment_id == last_segment_id, SegmentOverride.label == label)
+                .order_by(SegmentOverride.id.desc()).limit(1))
+            return self._override_result(row) if row else None
+
+        with self._transaction():
+            item = self._item_lock(item_id)
+            if item.admin_id != admin_id:
+                _fail()
+            previous = replay(item)
+            if previous:
+                return previous
+            revision = self.session.get(ClassificationRevision, active_revision_id)
+            if (item.active_classification_revision_id != active_revision_id or revision is None
+                    or revision.item_id != item_id or revision.state != "completed"
+                    or revision.policy_version != POLICY_VERSION
+                    or revision.transcript_sha256 != item.transcript_sha256
+                    or revision.segments_sha256 != item.segments_sha256):
+                _fail()
+            active = _values(revision, ("policy_s3_key", "policy_sha256", "source_id"))
+        inputs = self._read_inputs(item_id, build_windows=False)
+        try:
+            if active["policy_s3_key"] != _key(inputs.item, "policy", active["policy_sha256"]):
+                _fail()
+            policy = SegmentPolicy.from_json(self.storage.get_bytes(active["policy_s3_key"], max_bytes=DEFAULT_MAX_BYTES),
+                transcript=inputs.transcript)
+            if policy.policy_sha256 != active["policy_sha256"] or active["source_id"] != inputs.transcript.source_id:
+                _fail()
+        except StorageTransientError:
+            _fail("storage_transient")
+        except (StorageError, ValueError, TypeError):
+            _fail()
+        positions = {segment.id: index for index, segment in enumerate(inputs.transcript.segments)}
+        first, last = positions.get(first_segment_id), positions.get(last_segment_id)
+        if first is None or last is None or first > last:
+            _fail()
+        fingerprint = fingerprint_range(inputs.transcript.segments[first:last + 1])
+        with self._transaction():
+            item = self._item_lock(item_id)
+            source = self.session.scalar(sa.select(ContentSource).where(ContentSource.id == inputs.transcript.source_id)
+                .with_for_update().execution_options(populate_existing=True))
+            if source is None or source.admin_id != admin_id or item.admin_id != admin_id:
+                _fail()
+            previous = replay(item)
+            if previous:
+                return previous
+            if item.active_classification_revision_id != active_revision_id or not self._same_inputs(item, inputs):
+                _fail()
+            prior = self.session.scalar(sa.select(SegmentOverride).where(
+                SegmentOverride.item_id == item_id, SegmentOverride.transcript_sha256 == item.transcript_sha256,
+                SegmentOverride.first_segment_id == first_segment_id, SegmentOverride.last_segment_id == last_segment_id)
+                .order_by(SegmentOverride.created_at.desc(), SegmentOverride.id.desc()).limit(1))
+            correction = SegmentOverride(item_id=item_id, source_id=source.id, admin_id=admin_id,
+                transcript_sha256=item.transcript_sha256, policy_revision_id=active_revision_id,
+                first_segment_id=first_segment_id, last_segment_id=last_segment_id, label=label,
+                range_fingerprint_sha256=fingerprint, supersedes_id=prior.id if prior else None)
+            self.session.add(correction)
+            self.session.flush()
+            rule = self.session.scalar(sa.select(SourceClassificationRule).where(
+                SourceClassificationRule.source_id == source.id,
+                SourceClassificationRule.fingerprint_version == "commercial-range-fingerprint/v1",
+                SourceClassificationRule.fingerprint_sha256 == fingerprint, SourceClassificationRule.label == label))
+            if rule is None:
+                prior_rule = self.session.scalar(sa.select(SourceClassificationRule).where(
+                    SourceClassificationRule.source_id == source.id,
+                    SourceClassificationRule.fingerprint_version == "commercial-range-fingerprint/v1",
+                    SourceClassificationRule.fingerprint_sha256 == fingerprint)
+                    .order_by(SourceClassificationRule.created_at.desc(), SourceClassificationRule.id.desc()).limit(1))
+                rule = SourceClassificationRule(source_id=source.id, originating_override_id=correction.id,
+                    fingerprint_sha256=fingerprint, label=label, fingerprint_version="commercial-range-fingerprint/v1",
+                    supersedes_id=prior_rule.id if prior_rule else None)
+                self.session.add(rule)
+                self.session.flush()
+            sweep = ClassificationSweep(source_id=source.id, rule_id=rule.id, error_category="dispatch_pending")
+            self.session.add(sweep)
+            self.session.flush()
+            sweep.celery_task_id = f"source-rule-{sweep.id}-after-0"
+            identity = self._input_identity(inputs.item, self._metadata(item, source.id))[2]
+            request = PreparedRevisionRequest(item_id, source.id, identity, active_revision_id, False, "")
+            request = replace(request, _seal=_request_seal(request))
+            self.ensure_revision(item_id, "override", idempotency_key=f"override:{correction.id}:sweep:{sweep.id}",
+                prepared_request=request, commit=False)
+            return self._override_result(correction)
+
+    def _sweep_lock(self, sweep_id):
+        if type(sweep_id) is not int or not 0 < sweep_id < 2**31:
+            _fail()
+        row = self.session.scalar(sa.select(ClassificationSweep).where(ClassificationSweep.id == sweep_id)
+            .with_for_update().execution_options(populate_existing=True))
+        if row is None:
+            _fail()
+        return row
+
+    @staticmethod
+    def _sweep_result(sweep, revisions=()):
+        return SweepResult(sweep.id, sweep.state, sweep.cursor_item_id, sweep.items_scanned,
+            sweep.items_queued, tuple(revisions), sweep.celery_task_id if sweep.state in {"pending", "running"} else None)
+
+    def scan_source_rule(self, sweep_id):
+        """Process at most fifty source memberships, committing each keyset step.
+
+        Transcript and example reads happen outside locks. Cursor comparison
+        discards a concurrent worker's stale observation before any insertion.
+        Revision outboxes independently recover a crash before publication.
+        """
+        revisions = []
+        try:
+            with self._transaction():
+                sweep = self._sweep_lock(sweep_id)
+                if sweep.state in {"completed", "failed"}:
+                    return self._sweep_result(sweep)
+                source = self.session.get(ContentSource, sweep.source_id)
+                rule = self.session.get(SourceClassificationRule, sweep.rule_id)
+                origin = self.session.get(SegmentOverride, rule.originating_override_id) if rule else None
+                if (source is None or rule is None or origin is None or rule.source_id != source.id
+                        or origin.source_id != source.id or origin.admin_id != source.admin_id):
+                    _fail()
+                reference = self.session.get(ContentItem, origin.item_id)
+                if reference is None or reference.admin_id != source.admin_id:
+                    _fail()
+                metadata = self._metadata(reference, source.id)
+                if rule.id not in {row["id"] for row in metadata["rules"]}:
+                    sweep.state, sweep.completed_at, sweep.error_category = "completed", utc_now(), None
+                    return self._sweep_result(sweep)
+                source_id, owner_id = source.id, source.admin_id
+                rule_values, origin_values = _values(rule, _RULE_FIELDS), _values(origin, _OVERRIDE_FIELDS)
+                reference_values = _values(reference, ("platform", "external_id"))
+                cursor = sweep.cursor_item_id
+                candidates = list(self.session.scalars(sa.select(SourceItem.item_id).where(
+                    SourceItem.source_id == source_id, SourceItem.item_id > (cursor or 0))
+                    .order_by(SourceItem.item_id).limit(50)))
+                sweep.state, sweep.error_category = "running", "dispatch_pending"
+                sweep.started_at = sweep.started_at or utc_now()
+            try:
+                raw = self.storage.get_bytes(_key(reference_values, "transcripts", origin_values["transcript_sha256"]),
+                    max_bytes=DEFAULT_MAX_BYTES)
+                example = parse_canonical_transcript(raw, expected_item_id=origin_values["item_id"],
+                    expected_transcript_sha256=origin_values["transcript_sha256"], expected_segments_sha256=None)
+                if (example.source_id, example.platform, example.external_id) != (
+                        source_id, reference_values["platform"], reference_values["external_id"]):
+                    _fail()
+                segments = _boundary(example, origin_values)
+                if (rule_values["fingerprint_version"] != "commercial-range-fingerprint/v1"
+                        or fingerprint_range(segments) != rule_values["fingerprint_sha256"]):
+                    _fail()
+                exact_rule = ExactRule(rule_values["id"], rule_values["label"], rule_values["fingerprint_sha256"], len(segments))
+            except (StorageError, TranscriptValidationError) as error:
+                _fail("storage_transient" if isinstance(error, StorageTransientError) else "invalid_canonical")
+            for item_id in candidates:
+                with self._transaction():
+                    item = self._item_lock(item_id)
+                    eligible = item.status == "completed"
+                    if item.admin_id != owner_id:
+                        _fail()
+                request = None
+                if eligible:
+                    snapshot, transcript = self._read_canonical(item_id)
+                    if snapshot["admin_id"] != owner_id or transcript.source_id != source_id:
+                        _fail()
+                    if match_exact_rules(transcript.segments, (exact_rule,)):
+                        request = self.prepare_revision_request(item_id)
+                with self._transaction():
+                    sweep = self._sweep_lock(sweep_id)
+                    if sweep.state != "running" or sweep.cursor_item_id != cursor:
+                        return self._sweep_result(sweep, revisions)
+                    if request is not None:
+                        existing = self.session.scalar(sa.select(ClassificationRevision.id).where(
+                            ClassificationRevision.item_id == item_id,
+                            ClassificationRevision.input_identity_sha256 == request._identity,
+                            ClassificationRevision.state.in_(("pending", "running", "retrying", "completed"))).limit(1))
+                        if existing is None:
+                            revision_id = self.ensure_revision(item_id, "source_rule",
+                                idempotency_key=f"source-rule:{sweep_id}:{item_id}:{snapshot['transcript_sha256']}",
+                                prepared_request=request, commit=False)
+                            revisions.append(revision_id)
+                            sweep.items_queued += 1
+                    sweep.cursor_item_id = cursor = item_id
+                    sweep.items_scanned += 1
+                    sweep.celery_task_id = f"source-rule-{sweep.id}-after-{cursor}"
+                    sweep.error_category = "dispatch_pending"
+            with self._transaction():
+                sweep = self._sweep_lock(sweep_id)
+                if sweep.state == "running" and sweep.cursor_item_id == cursor and len(candidates) < 50:
+                    sweep.state, sweep.completed_at, sweep.error_category = "completed", utc_now(), None
+                return self._sweep_result(sweep, revisions)
+        except ClassificationServiceError as error:
+            with self._transaction():
+                sweep = self._sweep_lock(sweep_id)
+                if sweep.state not in {"completed", "failed"}:
+                    sweep.state = "running" if error.retryable else "failed"
+                    sweep.error_category = "dispatch_pending" if error.retryable else error.category
+                return self._sweep_result(sweep, revisions)
 
     @contextmanager
     def _operation(self, revision_id, block_ordinal=None, claim=None):

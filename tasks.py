@@ -1084,6 +1084,8 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
 def reconcile_classifications(after_revision_id=0, after_item_id=0):
     with application_context():
         counts = reconcile_classification_batch(after_revision_id=after_revision_id, after_item_id=after_item_id)
+        if current_app.config["CLASSIFICATION_ENABLED"]:
+            _reconcile_source_sweeps()
         if (current_app.config["CLASSIFICATION_ENABLED"] and counts["scanned"]
                 == min(current_app.config["CLASSIFICATION_RECONCILE_BATCH_SIZE"], 100)):
             try:
@@ -1099,5 +1101,97 @@ def scan_source_rule(sweep_id):
     from discovery_service import positive_id
     positive_id(sweep_id)
     with application_context():
+        if not current_app.config["CLASSIFICATION_ENABLED"]:
+            import sqlalchemy as sa
+            from extensions import db
+            from models import ClassificationSweep
+            db.session.execute(sa.update(ClassificationSweep).where(ClassificationSweep.id == sweep_id,
+                ClassificationSweep.state.in_(("pending", "running"))).values(error_category="dispatch_pending"))
+            db.session.commit()
+            return
         if current_app.config["CLASSIFICATION_ENABLED"]:
-            return get_classification_service().scan_source_rule(sweep_id)
+            from extensions import db
+            from models import ClassificationRevision
+            from sqlalchemy.exc import SQLAlchemyError
+            try:
+                result = get_classification_service().scan_source_rule(sweep_id)
+                if result is None:
+                    return
+                for revision_id in result.revision_ids:
+                    revision = db.session.get(ClassificationRevision, revision_id)
+                    dispatch = _revision_dispatch(revision)
+                    db.session.commit()
+                    _publish_classification(dispatch)
+                if result.next_task_id:
+                    _publish_source_sweep(sweep_id)
+                return dict(sweep_id=result.sweep_id, state=result.state,
+                    cursor_item_id=result.cursor_item_id, items_scanned=result.items_scanned,
+                    items_queued=result.items_queued)
+            except SQLAlchemyError:
+                # Cursor/revision writes roll back together. The pending sweep
+                # outbox and revision reconciler repair unknown commit results.
+                db.session.rollback()
+
+
+def _publish_source_sweep(sweep_id):
+    """Publish only a committed stable cursor outbox; never erase newer work."""
+    import sqlalchemy as sa
+    from extensions import db
+    from models import ClassificationSweep
+    if not current_app.config["CLASSIFICATION_ENABLED"]:
+        return False
+    sweep = db.session.get(ClassificationSweep, sweep_id, populate_existing=True)
+    if sweep is None or sweep.state not in {"pending", "running"} or sweep.error_category != "dispatch_pending":
+        db.session.commit()
+        return False
+    task_id = f"source-rule-{sweep.id}-after-{sweep.cursor_item_id or 0}"
+    if sweep.celery_task_id != task_id:
+        db.session.commit()
+        return False
+    generation = dict(state=sweep.state, cursor_item_id=sweep.cursor_item_id,
+        items_scanned=sweep.items_scanned, items_queued=sweep.items_queued, updated_at=sweep.updated_at)
+    db.session.commit()
+    try:
+        celery_app.send_task("tasks.scan_source_rule", args=[sweep_id], queue="classification", task_id=task_id)
+    except Exception:
+        db.session.rollback()
+        return False
+    try:
+        conditions = [ClassificationSweep.id == sweep_id, ClassificationSweep.celery_task_id == task_id,
+            ClassificationSweep.error_category == "dispatch_pending"]
+        conditions.extend(getattr(ClassificationSweep, name) == value for name, value in generation.items())
+        db.session.execute(sa.update(ClassificationSweep).where(*conditions).values(error_category=None))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    return True
+
+
+def publish_override(result):
+    """Route/UI handoff after record_override has committed both outboxes."""
+    try:
+        _publish_classification(result.next_dispatch)
+    finally:
+        _publish_source_sweep(result.sweep_id)
+
+
+def _reconcile_source_sweeps():
+    """Bounded replay for pending and acknowledged-but-lost sweep deliveries."""
+    from datetime import timedelta
+    import sqlalchemy as sa
+    import celeryconfig
+    from extensions import db
+    from models import ClassificationSweep, utc_now
+    cutoff = utc_now() - timedelta(seconds=celeryconfig.task_time_limit + 300)
+    identities = list(db.session.scalars(sa.select(ClassificationSweep.id).where(
+        ClassificationSweep.state.in_(("pending", "running")),
+        sa.or_(ClassificationSweep.error_category == "dispatch_pending", ClassificationSweep.updated_at < cutoff))
+        .order_by(ClassificationSweep.id).limit(50)))
+    db.session.commit()
+    for identity in identities:
+        db.session.execute(sa.update(ClassificationSweep).where(ClassificationSweep.id == identity,
+            ClassificationSweep.state.in_(("pending", "running")),
+            sa.or_(ClassificationSweep.error_category == "dispatch_pending", ClassificationSweep.updated_at < cutoff))
+            .values(error_category="dispatch_pending"))
+        db.session.commit()
+        _publish_source_sweep(identity)
