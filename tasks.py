@@ -863,9 +863,9 @@ def export_knowledge():
 
 
 def get_guest_extractor():
-    """Construct lazily; only the classifier container holds Claude credentials."""
-    from guest_extractor import ClaudeGuestExtractor
-    return ClaudeGuestExtractor(SimpleNamespace(**dict(current_app.config)))
+    """Construct lazily; only the classifier container holds router credentials."""
+    from guest_extractor import RouterGuestExtractor
+    return RouterGuestExtractor(SimpleNamespace(**dict(current_app.config)))
 
 
 @celery_app.task(name="tasks.extract_guests", queue="classification")

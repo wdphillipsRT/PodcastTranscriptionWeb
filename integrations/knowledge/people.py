@@ -3,7 +3,7 @@
 Hosts belong to the content source: a non-empty administrator list wins over
 the feed-declared (or YouTube channel owner) list. Guests belong to the item:
 an administrator list (possibly empty) wins, then <podcast:person> guests, then
-a completed restricted Claude extraction for the item's current title and
+a completed restricted model-router extraction for the item's current title and
 description. Only names with an identifier (`person_entity_id`) are exported.
 """
 

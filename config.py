@@ -72,7 +72,7 @@ class Settings:
     CLASSIFICATION_RECONCILE_BATCH_SIZE: int = 100
     GUEST_EXTRACTION_ENABLED: bool = False
     CLAUDE_GUEST_MODEL: str = "claude-sonnet-5-5"
-    GUEST_EXTRACTION_TIMEOUT_SECONDS: int = 60
+    GUEST_EXTRACTION_TIMEOUT_SECONDS: int = 120
     GUEST_EXTRACTION_MAX_BUDGET_USD: Decimal = Decimal("0.05")
     GUEST_EXTRACTION_DAILY_BUDGET_USD: Decimal = Decimal("1.00")
     GUEST_EXTRACTION_MAX_ITEMS_PER_RUN: int = 25
@@ -159,8 +159,8 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
         raise ConfigError("CLASSIFICATION_RECONCILE_BATCH_SIZE must not exceed 500")
     if values["GUEST_EXTRACTION_MAX_ITEMS_PER_RUN"] > 100:
         raise ConfigError("GUEST_EXTRACTION_MAX_ITEMS_PER_RUN must not exceed 100")
-    if values["GUEST_EXTRACTION_TIMEOUT_SECONDS"] > 600:
-        raise ConfigError("GUEST_EXTRACTION_TIMEOUT_SECONDS must not exceed 600")
+    if not 5 <= values["GUEST_EXTRACTION_TIMEOUT_SECONDS"] <= 600:
+        raise ConfigError("GUEST_EXTRACTION_TIMEOUT_SECONDS must be between 5 and 600")
     if values["GUEST_EXTRACTION_INTERVAL_SECONDS"] < 3600:
         raise ConfigError("GUEST_EXTRACTION_INTERVAL_SECONDS must be at least 3600")
     for name in ("CLAUDE_CLASSIFIER_MAX_BUDGET_USD", "CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD",

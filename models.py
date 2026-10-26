@@ -584,7 +584,7 @@ class ClassificationSweep(Timestamps, db.Model):
 
 
 class GuestExtraction(db.Model):
-    """One restricted Claude guest extraction over an item's title and description."""
+    """One restricted model-router guest extraction over an item's title and description."""
 
     __tablename__ = "guest_extractions"
     id = db.Column(db.Integer, primary_key=True)
