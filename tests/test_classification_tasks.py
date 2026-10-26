@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from extensions import db
 import models as m
 import tasks
-from claude_classifier import ClassifierError
+from router_classifier import ClassifierError
 from tests.test_classification_service import env, add_item, finish
 
 
@@ -114,7 +114,7 @@ def test_fast_worker_cannot_be_overwritten_by_publication_cleanup(worker, monkey
     assert revision.celery_task_id.endswith("-finalize")
 
 
-@pytest.mark.parametrize("category", ["claude_timeout", "claude_unavailable", "claude_invalid_output", "storage_transient"])
+@pytest.mark.parametrize("category", ["model_invalid_output", "storage_transient"])
 def test_transient_errors_exhaust_at_five_persisted_failures(worker, category):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
@@ -139,7 +139,7 @@ def test_transient_errors_exhaust_at_five_persisted_failures(worker, category):
     assert len(worker.env.classifier.calls) == 5
 
 
-@pytest.mark.parametrize("category", ["claude_auth", "claude_config", "model_mismatch"])
+@pytest.mark.parametrize("category", ["model_auth", "model_config", "model_mismatch"])
 def test_permanent_classifier_errors_stop_immediately(worker, category):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
@@ -323,12 +323,13 @@ def test_reconciliation_caps_total_candidates_at_one_hundred(worker):
     assert not worker.sent
 
 
-def test_lazy_service_construction_does_not_require_claude_configuration(worker, monkeypatch):
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    # Use the production factory with an injected offline storage boundary.
+def test_lazy_service_construction_reads_no_router_credentials(worker, monkeypatch):
+    from router_classifier import RouterClassifier
     monkeypatch.setattr(tasks, "get_processing_storage", lambda: worker.env.storage)
     service = worker.production_factory()
-    assert service.classifier.settings.CLAUDE_CLASSIFIER_MODEL == worker.app.config["CLAUDE_CLASSIFIER_MODEL"]
+    assert isinstance(service.classifier, RouterClassifier)
+    assert service.classifier.client.token_file == worker.app.config["ROUTER_TOKEN_FILE"]
+    assert service.classifier.client.expected_model == worker.app.config["ROUTER_EXPECTED_MODEL"]
 
 
 def test_queued_message_delivered_during_disabled_rollout_remains_recoverable(worker):
@@ -348,7 +349,7 @@ def test_queued_message_delivered_during_disabled_rollout_remains_recoverable(wo
 def test_fast_retry_same_task_id_cannot_lose_new_outbox(worker, monkeypatch):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
-    worker.env.classifier.error = ClassifierError("claude_timeout")
+    worker.env.classifier.error = ClassifierError("model_invalid_output")
     sending = []
     def fast(name, *, args, **options):
         worker.send(name, args=args, **options)
@@ -362,20 +363,17 @@ def test_fast_retry_same_task_id_cannot_lose_new_outbox(worker, monkeypatch):
     assert (row.attempts, row.state, row.error_category) == (2, "retrying", "dispatch_pending")
 
 
-@pytest.mark.parametrize("limit", ["cost", "time"])
-def test_worker_preserves_per_revision_budget_limits(worker, limit):
-    from dataclasses import replace
-    from decimal import Decimal
+def test_worker_preserves_the_generation_time_limit(worker):
     item, _ = add_item(worker.env, external_id="budget", texts=tuple(f"Line {n}" for n in range(81)))
     identity = worker.env.service.ensure_revision(item.id, "backfill")
     task().run(identity, "prepare")
     task().run(identity, "block", 1)
     row = db.session.get(m.ClassificationRevision, identity)
-    if limit == "cost":
-        worker.env.service.settings = replace(worker.env.settings, CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD=Decimal("0.50"))
-    else:
-        row.started_at = m.utc_now() - timedelta(seconds=7100)
-        db.session.commit()
+    block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+    settings = worker.env.settings
+    block.started_at = block.completed_at - timedelta(
+        seconds=settings.CLASSIFIER_MAX_REVISION_SECONDS - settings.CLASSIFIER_TIMEOUT_SECONDS + 1)
+    db.session.commit()
     worker.sent.clear()
     task().run(identity, "block", 2)
     assert row.state == "failed" and row.error_category == "revision_budget_exhausted"

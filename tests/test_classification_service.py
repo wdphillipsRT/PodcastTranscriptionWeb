@@ -12,7 +12,8 @@ from types import SimpleNamespace
 import pytest
 import sqlalchemy as sa
 
-from claude_classifier import BlockDecision, ClassifierResult, ClassifierError, SYSTEM_PROMPT
+import router_classifier
+from router_classifier import BlockDecision, ClassifierResult, ClassifierError, expected_provenance
 from commercial_policy import (ClassifierProvenance, PROMPT_VERSION, SegmentPolicy,
                                LearningProjection)
 from commercial_signals import fingerprint_range
@@ -50,27 +51,26 @@ class MemoryStorage:
 class FakeClassifier:
     def __init__(self, settings):
         self.calls = []
+        self.keys = []
         self.settings = settings
         self.labels = {}
         self.cost = 25
         self.error = None
         self.on_call = None
 
-    def classify(self, window, *, examples=()):
-        assert not db.session().in_transaction(), "Claude call held a database transaction"
+    def classify(self, window, *, examples=(), request_key=None):
+        assert not db.session().in_transaction(), "Router call held a database transaction"
         self.calls.append((window, examples))
+        self.keys.append(request_key)
         if self.on_call:
             self.on_call()
         if self.error:
             raise self.error
-        provenance = ClassifierProvenance(self.settings.CLAUDE_EXPECTED_VERSION,
-            self.settings.CLAUDE_CLASSIFIER_MODEL, self.settings.CLAUDE_CLASSIFIER_MODEL,
-            PROMPT_VERSION, sha256(SYSTEM_PROMPT.encode()).hexdigest())
         decisions = []
         for segment in window.target_segments:
             label, confidence = self.labels.get(segment.id, ("editorial", 1.0))
             decisions.append(BlockDecision(segment.id, segment.id, label, confidence, ("substantive_content",)))
-        return ClassifierResult(tuple(decisions), self.cost, provenance)
+        return ClassifierResult(tuple(decisions), self.cost, expected_provenance(self.settings))
 
 
 def add_item(env, *, source=None, texts=("First editorial insight", "Buy now with promo code", "Final editorial insight"), external_id=None):
@@ -378,26 +378,52 @@ def test_hash_valid_block_artifacts_are_strictly_reparsed(env, corruption):
     assert db.session.get(m.ContentItem, env.item.id).active_classification_revision_id is None
 
 
-@pytest.mark.parametrize("limit", ["cost", "time"])
-def test_revision_limits_stop_before_next_paid_call(env, limit):
+def _long_revision(env):
     env.item, env.transcript = add_item(env, external_id="long", texts=tuple(f"Line {i}" for i in range(81)))
     revision_id = env.service.ensure_revision(env.item.id, "backfill")
     env.service.prepare_revision(revision_id)
     env.service.run_block(revision_id, 1)
-    if limit == "cost":
-        env.service.settings = replace(env.settings, CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD=Decimal("0.50"))
-    else:
-        revision = db.session.get(m.ClassificationRevision, revision_id)
-        revision.started_at = m.utc_now() - timedelta(seconds=7100)
-        db.session.commit()
+    return revision_id
+
+
+def test_generation_time_limit_stops_before_the_next_call(env):
+    revision_id = _long_revision(env)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(
+        m.ClassificationBlock.revision_id == revision_id, m.ClassificationBlock.ordinal == 1))
+    block.started_at = block.completed_at - timedelta(
+        seconds=env.settings.CLASSIFIER_MAX_REVISION_SECONDS - env.settings.CLASSIFIER_TIMEOUT_SECONDS + 1)
+    db.session.commit()
     with pytest.raises(env.module.ClassificationServiceError) as caught:
         env.service.run_block(revision_id, 2)
     assert caught.value.category == "revision_budget_exhausted"
     assert len(env.classifier.calls) == 1
 
 
-@pytest.mark.parametrize("error,category", [(ClassifierError("claude_timeout"), "claude_timeout"),
-    (StorageTransientError("SECRET body"), "storage_transient"), (RuntimeError("SECRET body"), "claude_config")])
+def test_waiting_for_a_busy_router_does_not_count_against_the_generation_limit(env):
+    revision_id = _long_revision(env)
+    revision = db.session.get(m.ClassificationRevision, revision_id)
+    revision.started_at = m.utc_now() - timedelta(seconds=10 * env.settings.CLASSIFIER_MAX_REVISION_SECONDS)
+    db.session.commit()
+    assert env.service.run_block(revision_id, 2).state == "completed"
+    assert len(env.classifier.calls) == 2
+
+
+def test_block_calls_carry_a_stable_router_key(env):
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.service.run_block(revision_id, 1)
+    assert env.classifier.keys == [f"podcast.classification:rev-{revision_id}:block-1:g0"]
+
+
+def test_model_decisions_are_recorded_as_the_model_decision_source(env):
+    revision_id, _ = finish(env)
+    _, policy, _ = artifacts(env, revision_id)
+    assert {entry.decision_source for entry in policy.ranges} == {"model"}
+    assert policy.classifier == expected_provenance(env.settings)
+
+
+@pytest.mark.parametrize("error,category", [(ClassifierError("model_invalid_output"), "model_invalid_output"),
+    (StorageTransientError("SECRET body"), "storage_transient"), (RuntimeError("SECRET body"), "model_config")])
 def test_failure_persistence_contains_only_closed_categories(env, error, category):
     revision_id = env.service.ensure_revision(env.item.id, "backfill")
     env.service.prepare_revision(revision_id)
@@ -565,7 +591,7 @@ def test_late_failure_cannot_fail_a_reclaimed_block(env):
         block.started_at = m.utc_now()
         db.session.commit()
     env.classifier.on_call = reclaim
-    env.classifier.error = ClassifierError("claude_timeout")
+    env.classifier.error = ClassifierError("model_invalid_output")
     with pytest.raises(env.module.ClassificationServiceError):
         env.service.run_block(revision_id, 1)
     block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
@@ -797,11 +823,11 @@ def test_prepared_request_rechecks_all_database_and_configuration_identity(env, 
     elif change == "origin":
         origin.range_fingerprint_sha256 = "a" * 64
     elif change == "model":
-        monkeypatch.setattr(env.service, "settings", replace(env.settings, CLAUDE_CLASSIFIER_MODEL="changed"))
+        monkeypatch.setattr(env.service, "settings", replace(env.settings, ROUTER_EXPECTED_MODEL="changed:1"))
     elif change == "cli":
-        monkeypatch.setattr(env.service, "settings", replace(env.settings, CLAUDE_EXPECTED_VERSION="changed"))
+        monkeypatch.setattr(router_classifier, "CLASSIFICATION_ROUTE", "podcast.changed")
     elif change == "prompt":
-        monkeypatch.setattr(env.module, "SYSTEM_PROMPT", "changed")
+        monkeypatch.setattr(router_classifier, "SYSTEM_PROMPT", "changed")
     elif change == "policy":
         monkeypatch.setattr(env.module, "POLICY_VERSION", "changed")
     elif change == "lineage":

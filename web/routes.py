@@ -32,12 +32,16 @@ ITEM_PAGE_SIZE = 200
 REVIEW_PAGE_SIZE = 50
 CLASSIFICATION_STATES = {state: state.capitalize() for state in
     ("pending", "running", "retrying", "completed", "failed", "superseded")}
-CLASSIFICATION_FAILURES = {"claude_timeout": "Classifier timeout", "claude_unavailable": "Classifier unavailable",
-    "claude_invalid_output": "Invalid classifier result", "storage_transient": "Storage unavailable",
-    "worker_timeout": "Worker timeout", "claude_auth": "Classifier authentication",
-    "claude_config": "Classifier configuration", "model_mismatch": "Classifier configuration",
-    "invalid_canonical": "Transcript unavailable", "invalid_policy": "Policy unavailable",
-    "revision_budget_exhausted": "Classification budget reached", "dispatch_pending": "Awaiting dispatch"}
+CLASSIFICATION_FAILURES = {"router_busy": "Model router busy", "model_invalid_output": "Invalid classifier result",
+    "model_auth": "Classifier authentication", "model_config": "Classifier configuration",
+    "model_mismatch": "Classifier configuration", "storage_transient": "Storage unavailable",
+    "worker_timeout": "Worker timeout", "invalid_canonical": "Transcript unavailable",
+    "invalid_policy": "Policy unavailable", "revision_budget_exhausted": "Classification budget reached",
+    "dispatch_pending": "Awaiting dispatch", "reclassify_queued": "Queued for reclassification",
+    # Claude-era categories stay readable on stored rows.
+    "claude_timeout": "Classifier timeout", "claude_unavailable": "Classifier unavailable",
+    "claude_invalid_output": "Invalid classifier result", "claude_auth": "Classifier authentication",
+    "claude_config": "Classifier configuration"}
 CLASSIFICATION_TOTALS = ("included_segments", "excluded_segments", "uncertain_segments",
     "included_milliseconds", "excluded_milliseconds", "uncertain_milliseconds")
 PEOPLE_BASIS_LABELS = {"admin_set": "Set by the administrator", "feed_declared": "Declared by the feed or channel",

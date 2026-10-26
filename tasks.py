@@ -833,13 +833,13 @@ def normalize_item_transcript(self, item_id):
 
 
 def get_classification_service():
-    """Construct lazily; media workers need no Claude credential configuration."""
+    """Construct lazily; only the classifier container holds router credentials, read per call."""
     from classification_service import ClassificationService
-    from claude_classifier import ClaudeClassifier
+    from router_classifier import RouterClassifier
     from extensions import db
     settings = SimpleNamespace(**dict(current_app.config))
     return ClassificationService(session=db.session, storage=get_processing_storage(),
-        classifier=ClaudeClassifier(settings), settings=settings)
+        classifier=RouterClassifier(settings), settings=settings)
 
 
 @celery_app.task(name="tasks.export_knowledge", queue="knowledge")

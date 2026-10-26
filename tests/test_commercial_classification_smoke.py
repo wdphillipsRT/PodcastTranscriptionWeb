@@ -15,7 +15,7 @@ from learning_projection import (LearningProjectionUnavailable, assert_citable,
     load_active_learning_projection, load_promotional_projection)
 import models as m
 import tasks
-from claude_classifier import ClassifierError
+from router_classifier import ClassifierError
 from tests.test_classification_service import env  # shared offline storage/classifier boundaries
 from transcripts import normalize_vtt
 
@@ -277,7 +277,7 @@ def test_failures_never_return_canonical_content(acceptance, failure, caplog):
     revision_id = final_hook(env, item)
     if failure == "classifier":
         # A provider-controlled diagnostic is never an event field or traceback.
-        error = ClassifierError("claude_auth")
+        error = ClassifierError("model_auth")
         error.args = ("PRIVATE_DIAGNOSTIC CREDENTIAL_SECRET https://synthetic.invalid",)
         env.classifier.error = error
     drain(env)
@@ -297,7 +297,7 @@ def test_failures_never_return_canonical_content(acceptance, failure, caplog):
     required = {"commercial_classification_failed"} if failure == "classifier" else {"commercial_classification_finalize"}
     records = assert_safe_events(env, caplog, required=required)
     if failure == "classifier":
-        assert any(r.commercial_event.get("retry_category") == "claude_auth" for r in records)
+        assert any(r.commercial_event.get("retry_category") == "model_auth" for r in records)
 
 
 def test_observation_encoder_omits_untrusted_values_and_extra_count_fields(acceptance, caplog):

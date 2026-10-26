@@ -17,10 +17,10 @@ import secrets
 import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 
-from claude_classifier import (BlockDecision, ClassifierExample, ClassifierError,
-                               ClassifierResult, SYSTEM_PROMPT)
+from router_classifier import (BlockDecision, ClassifierExample, ClassifierError,
+                               ClassifierResult, expected_provenance)
 from commercial_policy import (ClassificationRange, ClassifierProvenance,
-    LearningProjection, SegmentPolicy, POLICY_VERSION, PROMPT_VERSION, LABELS,
+    LearningProjection, SegmentPolicy, POLICY_VERSION, LABELS, MAX_INTEGER,
     REASON_CODES, SIGNAL_CODES, MAX_BLOCKS_PER_REVISION, MAX_BLOCK_TEXT_CHARS,
     TARGET_SEGMENTS_PER_BLOCK, build_segment_policy, build_learning_projection)
 from commercial_signals import (CommercialSignalError, ExactRule, build_classifier_windows, collect_signals,
@@ -32,10 +32,13 @@ from s3_utils import (DEFAULT_MAX_BYTES, StorageError, StorageTransientError,
 from transcripts import canonical_json, parse_canonical_transcript, TranscriptValidationError
 
 
-RETRYABLE_CLASSIFICATION_ERRORS = frozenset({"claude_timeout", "claude_unavailable",
-    "claude_invalid_output", "storage_transient", "dispatch_pending", "worker_timeout"})
-PERMANENT_CLASSIFICATION_ERRORS = frozenset({"claude_auth", "claude_config", "model_mismatch",
+RETRYABLE_CLASSIFICATION_ERRORS = frozenset({"router_busy", "model_invalid_output",
+    "storage_transient", "dispatch_pending", "worker_timeout"})
+PERMANENT_CLASSIFICATION_ERRORS = frozenset({"model_auth", "model_config", "model_mismatch",
     "invalid_canonical", "invalid_policy", "revision_budget_exhausted"})
+# Claude-era rows keep these stored names; they are displayed, never produced.
+LEGACY_CLASSIFICATION_ERRORS = {"claude_timeout": "router_busy", "claude_unavailable": "router_busy",
+    "claude_invalid_output": "model_invalid_output", "claude_auth": "model_auth", "claude_config": "model_config"}
 SOURCE_SWEEP_RETRY_DELAY_SECONDS = 30
 SOURCE_SWEEP_RETRY_ERRORS = RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}
 _LOCK_NAMESPACE = 0x434C5346
@@ -278,9 +281,7 @@ class ClassificationService:
                 "rules": [_values(row, _RULE_FIELDS) for row in active], "origins": origins, "items": items}
 
     def _provenance(self):
-        return ClassifierProvenance(self.settings.CLAUDE_EXPECTED_VERSION,
-            self.settings.CLAUDE_CLASSIFIER_MODEL, self.settings.CLAUDE_CLASSIFIER_MODEL,
-            PROMPT_VERSION, sha256(SYSTEM_PROMPT.encode()).hexdigest())
+        return expected_provenance(self.settings)
 
     @staticmethod
     def _eligible(item, allow_precompletion=False):
@@ -905,10 +906,12 @@ class ClassificationService:
                     return BlockResult(revision_id, block_ordinal, "completed", total, self._dispatch(revision, blocks))
                 if block.state == "running" or any(b.ordinal < block_ordinal and b.state != "completed" for b in blocks):
                     _fail("worker_timeout", record=False)
-                elapsed = max(0, (utc_now() - revision.started_at).total_seconds())
+                # Only generation counts: a completed block's span is its successful call,
+                # because started_at is reset at every claim. Busy waits and queueing do not count.
+                generated = sum(max(0.0, (b.completed_at - b.started_at).total_seconds()) for b in blocks
+                                if b.state == "completed" and b.started_at and b.completed_at)
                 if (len(blocks) > MAX_BLOCKS_PER_REVISION
-                        or total + self.settings.CLAUDE_CLASSIFIER_MAX_BUDGET_USD * 1_000_000 > self.settings.CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD * 1_000_000
-                        or elapsed + self.settings.CLAUDE_CLASSIFIER_TIMEOUT_SECONDS > self.settings.CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS):
+                        or generated + self.settings.CLASSIFIER_TIMEOUT_SECONDS > self.settings.CLASSIFIER_MAX_REVISION_SECONDS):
                     _fail("revision_budget_exhausted")
                 block.state, block.started_at, block.heartbeat_at = "running", utc_now(), utc_now()
                 block.attempts += 1
@@ -916,14 +919,18 @@ class ClassificationService:
                 revision.state, revision.heartbeat_at, revision.error_category = "running", utc_now(), None
                 claim = (block.attempts, block.started_at)
                 ownership["token"] = claim
+                # The request body is built only from the prepared checkpoint (window and examples,
+                # verified against block.input_sha256 above) and deployment settings, so a reused
+                # key resends identical bytes. Nothing else that can change between retries is read.
                 window = inputs.windows[block_ordinal - 1]
                 input_hash = block.input_sha256
+                request_key = f"podcast.classification:rev-{revision_id}:block-{block_ordinal}:g{block.request_generation}"
             try:
-                result = self.classifier.classify(window, examples=inputs.examples)
+                result = self.classifier.classify(window, examples=inputs.examples, request_key=request_key)
             except (ClassifierError, StorageError):
                 raise
             except Exception:
-                _fail("claude_config")
+                _fail("model_config")
             payload = {"schema": _BLOCK_SCHEMA, "revision_id": revision_id, "block_ordinal": block_ordinal,
                 "input_sha256": input_hash, "decisions": [asdict(d) for d in result.decisions],
                 "classifier": asdict(result.provenance), "cost_microusd": result.total_cost_microusd}
@@ -959,7 +966,7 @@ class ClassificationService:
                 result[key] = value
             return result
         try:
-            if not isinstance(raw, bytes) or not 0 < len(raw) <= self.settings.CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES:
+            if not isinstance(raw, bytes) or not 0 < len(raw) <= self.settings.CLASSIFIER_MAX_OUTPUT_BYTES:
                 _fail()
             data = json.loads(raw, object_pairs_hook=unique, parse_constant=lambda _: _fail())
             if (not isinstance(data, dict) or set(data) != {"schema", "revision_id", "block_ordinal", "input_sha256", "decisions", "classifier", "cost_microusd"}
@@ -971,7 +978,7 @@ class ClassificationService:
             if provenance != self._provenance():
                 _fail()
             cost = data["cost_microusd"]
-            if type(cost) is not int or not 0 <= cost <= self.settings.CLAUDE_CLASSIFIER_MAX_BUDGET_USD * 1_000_000:
+            if type(cost) is not int or not 0 <= cost <= MAX_INTEGER:
                 _fail()
             rows = data["decisions"]
             if not isinstance(rows, list) or not 1 <= len(rows) <= TARGET_SEGMENTS_PER_BLOCK:
@@ -1026,7 +1033,7 @@ class ClassificationService:
             for checkpoint, window in zip(checkpoints, inputs.windows):
                 if checkpoint["decision_s3_key"] != _key(inputs.item, "classification", checkpoint["decision_sha256"]):
                     _fail()
-                raw = self.storage.get_bytes(checkpoint["decision_s3_key"], max_bytes=self.settings.CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES)
+                raw = self.storage.get_bytes(checkpoint["decision_s3_key"], max_bytes=self.settings.CLASSIFIER_MAX_OUTPUT_BYTES)
                 if sha256(raw).hexdigest() != checkpoint["decision_sha256"]:
                     _fail()
                 result = self._parse_decisions(raw, revision_id, checkpoint["ordinal"], checkpoint["input_sha256"], window)
@@ -1037,7 +1044,7 @@ class ClassificationService:
                     for segment in window.target_segments[positions[decision.first_segment_id]:positions[decision.last_segment_id] + 1]:
                         classifications.append(ClassificationRange(segment.id, segment.id, segment.start, segment.end,
                             decision.label, decision.label == "editorial", decision.confidence, decision.reason_codes,
-                            signal_map[segment.id], "claude", (), None))
+                            signal_map[segment.id], "model", (), None))
             positions = {segment.id: i for i, segment in enumerate(inputs.transcript.segments)}
             classifications.sort(key=lambda entry: positions[entry.first_segment_id])
             options = dict(transcript=inputs.transcript, classifier=self._provenance(), source_rule_set_sha256=inputs.rule_hash,
