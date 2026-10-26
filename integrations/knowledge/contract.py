@@ -10,6 +10,8 @@ from functools import cache
 import json
 from pathlib import Path
 
+# vendor/ and vendor/reference/ import as namespace packages: an __init__.py there
+# would be an unpinned file and fail the PIN exactness test.
 from integrations.knowledge.vendor.reference.knowledge_contract import (
     MAX_BATCH_BYTES, MAX_RECORDS, PLATFORMS, BatchSummary, ContractError, canonical_json,
     person_entity_id, record_hash, validate_batch, write_batch,

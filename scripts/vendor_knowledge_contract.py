@@ -16,8 +16,9 @@ import hashlib
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
-VENDOR = Path("integrations/knowledge/vendor")
+VENDOR = Path(__file__).resolve().parents[1] / "integrations/knowledge/vendor"
 SOURCES = (
     "reference/knowledge_contract.py",
     "schemas/knowledge-batch-manifest-v1.schema.json",
@@ -33,14 +34,22 @@ HEADER = (
 
 
 def _git(rfc, *args):
-    return subprocess.run(["git", "-C", str(rfc), *args], check=True, capture_output=True).stdout
+    try:
+        return subprocess.run(["git", "-C", str(rfc), *args], check=True, capture_output=True).stdout
+    except subprocess.CalledProcessError as error:
+        sys.stderr.write(error.stderr.decode(errors="replace"))
+        raise SystemExit(f"git {args[0]} failed in {rfc}")
 
 
 def vendor(rfc, ref, target=VENDOR):
     commit = _git(rfc, "rev-parse", "--verify", f"{ref}^{{commit}}").decode().strip()
-    paths = _git(rfc, "ls-tree", "-r", "--name-only", commit, "--", *SOURCES).decode().split()
+    paths = [path for path in _git(rfc, "ls-tree", "-r", "-z", "--name-only", commit, "--", *SOURCES)
+             .decode().split("\0") if path]
     if not any(path.startswith("tests/fixtures/knowledge/golden/") for path in paths):
         raise SystemExit("no golden batches found; is --rfc a bezalel-rfc checkout?")
+    missing = [source for source in SOURCES if source.endswith((".py", ".json")) and source not in paths]
+    if missing:
+        raise SystemExit(f"missing at {commit}: {', '.join(missing)}")
     shutil.rmtree(target, ignore_errors=True)
     lines = [HEADER, f"source_repository wdphillipsRT/bezalel-rfc\nsource_commit {commit}\n"]
     for path in sorted(paths):

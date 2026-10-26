@@ -93,12 +93,12 @@ def test_schema_validator_is_real(tmp_path):
 def test_vendored_negative_cases_pass_against_the_vendored_oracle(tmp_path):
     suite = VENDOR_ROOT / "tests/test_knowledge_contract.py"
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(suite)],
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--basetemp", str(tmp_path / "bt"), str(suite)],
         capture_output=True, text=True, cwd=tmp_path,
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
     summary = result.stdout.strip().splitlines()[-1]
-    assert result.returncode == 0, result.stdout[-2000:]
     assert re.search(r"\b\d+ passed\b", summary) and "failed" not in summary, summary
 
 
@@ -109,4 +109,5 @@ def test_default_collection_skips_the_vendored_suite():
         capture_output=True, text=True, cwd=root,
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
+    assert result.returncode == 5, result.stdout + result.stderr  # pytest: no tests collected
     assert "test_knowledge_contract.py" not in result.stdout
