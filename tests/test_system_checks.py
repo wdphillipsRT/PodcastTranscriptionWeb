@@ -334,8 +334,7 @@ def test_isolated_check_has_hard_deadline_and_no_credentials_in_argv(checks, mon
     assert kwargs["start_new_session"] is True
     payload = json.loads(process.communicate.call_args.kwargs["input"])
     assert payload == {"YOUTUBE_API_KEY": "synthetic-secret"}
-    # Beyond the router client's 10 s connect timeout, and still bounded.
-    assert 0 < process.communicate.call_args.kwargs["timeout"] <= 15
+    assert 0 < process.communicate.call_args.kwargs["timeout"] <= 10
 
 
 def test_timed_out_probe_kills_and_reaps_process_group(checks, monkeypatch):
@@ -410,10 +409,27 @@ def test_classifier_components_are_selectable_but_not_part_of_web_readiness(app,
     assert "router" not in checks.COMPONENTS and "claude_absent" not in checks.COMPONENTS
 
 
-def test_the_probe_child_outlives_the_router_client_connect_timeout():
+def test_only_the_router_probe_child_outlives_the_router_client_connect_timeout(monkeypatch):
+    """The web /readyz runs its probes serially, so only the router probe gets the longer limit."""
     import router_client
     import system_checks
-    assert system_checks.PROBE_TIMEOUT_SECONDS == 12 > router_client.CONNECT_TIMEOUT_SECONDS
+    assert system_checks.ROUTER_PROBE_TIMEOUT_SECONDS == 12 > router_client.CONNECT_TIMEOUT_SECONDS
+    assert system_checks.PROBE_TIMEOUT_SECONDS == 8
+    timeouts = {}
+
+    class Process:
+        pid, returncode = 0, 0
+
+        def __init__(self, arguments, **keywords):
+            self.component = arguments[-1]
+
+        def communicate(self, *, input, timeout):
+            timeouts[self.component] = timeout
+            return None, None
+    monkeypatch.setattr(system_checks.subprocess, "Popen", Process)
+    for component in ("router", "database"):
+        system_checks._run_isolated(component, {})
+    assert timeouts == {"router": 12, "database": 8}
 
 
 def test_router_probe_payload_carries_paths_never_secrets(checks, monkeypatch):

@@ -33,7 +33,10 @@ COMPONENTS = ("database", "redis", "s3", "transcribe", "youtube", "yt_dlp", "den
 # Selectable for the classifier's startup guard only; web readiness never probes the router.
 CLASSIFIER_COMPONENTS = ("claude_absent", "router")
 ALL_COMPONENTS = COMPONENTS + CLASSIFIER_COMPONENTS
-PROBE_TIMEOUT_SECONDS = 12  # Beyond the router client's 10 s connect timeout.
+PROBE_TIMEOUT_SECONDS = 8
+# Only the router probe: beyond the router client's 10 s connect timeout. The web /readyz
+# runs its probes serially, so the shared limit stays short.
+ROUTER_PROBE_TIMEOUT_SECONDS = 12
 CACHE_SECONDS = 15
 # Router entries are a URL and file paths; the probe child reads the files, never this process.
 _CONFIG_KEYS = ("SQLALCHEMY_DATABASE_URI", "REDIS_URL", "AWS_REGION", "AWS_S3_BUCKET_NAME", "YOUTUBE_API_KEY",
@@ -181,7 +184,8 @@ def _run_isolated(component, config):
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         text=True, start_new_session=True)
     try:
-        process.communicate(input=json.dumps(payload), timeout=PROBE_TIMEOUT_SECONDS)
+        process.communicate(input=json.dumps(payload),
+                            timeout=ROUTER_PROBE_TIMEOUT_SECONDS if component == "router" else PROBE_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         # Also terminate any credential helper/tool subprocess, then reap.
         try:

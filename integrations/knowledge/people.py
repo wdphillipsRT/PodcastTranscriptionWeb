@@ -19,6 +19,9 @@ from integrations.knowledge.contract import ContractError, canonical_json, perso
 GUEST_PROMPT_VERSION = "episode-guest-extraction/v1"
 INFERRED_GUEST_MIN_CONFIDENCE = 0.5
 MAX_PARTICIPANTS = 50
+# An input the router itself failed on (reason router_failure) is retried on later runs
+# and abandoned after this many recorded router failures.
+MAX_ROUTER_FAILURES = 3
 MAX_ADMIN_TEXT_CHARS = 10_000
 HOST_ROLES = ("host", "co_host")
 
@@ -102,6 +105,13 @@ def plain_text(value):
         warnings.simplefilter("ignore", MarkupResemblesLocatorWarning)
         text = BeautifulSoup(value, "html.parser").get_text(" ")
     return " ".join(text.split())
+
+
+def extraction_pending(extraction):
+    """Whether the guest extraction for an item's current input may still produce guests:
+    none recorded yet, or a router failure that later runs will retry."""
+    return extraction is None or (extraction.state == "failed" and extraction.error_category == "router_busy"
+                                  and extraction.router_failures < MAX_ROUTER_FAILURES)
 
 
 def guest_input_sha256(item):

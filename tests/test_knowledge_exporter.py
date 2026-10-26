@@ -160,6 +160,37 @@ def test_items_without_a_host_or_awaiting_guests_wait(ready):
     assert (guest["name"], guest["basis"], guest["role"]) == ("James Clear", "feed_declared", "guest")
 
 
+@pytest.mark.parametrize("state, category, failures, waits", [
+    ("failed", "router_busy", 1, True), ("failed", "router_busy", 2, True),
+    ("failed", "router_busy", 3, False), ("failed", "model_invalid_output", 0, False),
+    ("completed", None, 1, False)])
+def test_an_input_still_being_retried_waits_for_its_guests(ready, state, category, failures, waits):
+    from integrations.knowledge.people import guest_input_sha256
+    db.session.add(m.GuestExtraction(item_id=ready.item.id, input_sha256=guest_input_sha256(ready.item), state=state,
+        guests=[] if state == "completed" else None, error_category=category, model="bonsai2:27b-pq2_0",
+        cost_microusd=0, router_failures=failures))
+    db.session.commit()
+    report = export(ready, settings={"GUEST_EXTRACTION_ENABLED": True})
+    if waits:
+        assert report.skipped == {"awaiting_guests": 1} and report.batches == []
+    else:
+        assert report.batches == ["podcast-20261022-001"]
+
+
+def test_extraction_pending_follows_the_shared_retry_limit():
+    from types import SimpleNamespace
+    from integrations.knowledge import people
+    import guest_extractor
+    assert guest_extractor.MAX_ROUTER_FAILURES is people.MAX_ROUTER_FAILURES == 3
+    row = lambda **values: SimpleNamespace(**{"state": "failed", "error_category": "router_busy",  # noqa: E731
+                                              "router_failures": 1, **values})
+    assert people.extraction_pending(None) is True
+    assert people.extraction_pending(row()) is True
+    assert people.extraction_pending(row(router_failures=3)) is False
+    assert people.extraction_pending(row(error_category="model_invalid_output")) is False
+    assert people.extraction_pending(row(state="completed", error_category=None)) is False
+
+
 def test_unavailable_projection_skips_the_item_without_reading_raw_text(ready):
     newer = ready.service.ensure_revision(ready.item.id, "manual_retry", idempotency_key="pending-newer")
     assert db.session.get(m.ClassificationRevision, newer).state == "pending"

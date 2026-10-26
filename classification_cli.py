@@ -133,7 +133,7 @@ def router_smoke(wrong_client_cert):
     try:
         result = RouterClassifier(settings, client=client).classify(window)
     except ClassifierError as error:
-        raise click.ClickException(f"Router smoke failed: {error.category} reason={error.reason}") from None
+        raise click.ClickException(f"Router smoke failed: {error.category} reason={error.reason or 'unspecified'}") from None
     click.echo(f"ready=1 model={result.provenance.resolved_model} label={result.decisions[0].label} "
                f"seconds={time.monotonic() - started:.1f}")
 

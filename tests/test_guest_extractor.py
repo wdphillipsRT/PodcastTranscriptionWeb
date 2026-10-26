@@ -311,6 +311,30 @@ def test_router_failures_are_retried_after_fresh_items_and_abandoned_after_three
     assert extract(ready)["scanned"] == 0 and len(ready.extractor.calls) == 4
 
 
+def test_a_busy_router_neither_spends_nor_skips_a_retry(ready):
+    newer = newer_item(ready)
+    ready.extractor.errors = [router_failure()]
+    extract(ready)
+    ready.extractor.errors = [RouterError("router_busy", reason="rate_limited", advance_key=False)]
+    assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 0, "stopped": "router_busy"}
+    assert m.GuestExtraction.query.filter_by(item_id=newer.id).one().router_failures == 1
+    ready.extractor.errors = [None, router_failure()]
+    assert extract(ready) == {"scanned": 2, "extracted": 1, "failed": 1, "stopped": "router_busy"}
+    assert m.GuestExtraction.query.filter_by(item_id=newer.id).one().router_failures == 2
+
+
+def test_retries_count_against_the_items_per_run_limit(ready):
+    newer = newer_item(ready)
+    ready.extractor.errors = [router_failure()]
+    extract(ready, GUEST_EXTRACTION_MAX_ITEMS_PER_RUN=1)
+    assert extract(ready, GUEST_EXTRACTION_MAX_ITEMS_PER_RUN=1) == {
+        "scanned": 1, "extracted": 1, "failed": 0, "stopped": None}
+    assert ready.extractor.keys[-1].split(":")[1] == f"item-{ready.item.id}"
+    assert extract(ready, GUEST_EXTRACTION_MAX_ITEMS_PER_RUN=1) == {
+        "scanned": 1, "extracted": 1, "failed": 0, "stopped": None}
+    assert ready.extractor.keys[-1].split(":")[1] == f"item-{newer.id}"
+
+
 def test_a_retried_input_that_succeeds_completes_its_row(ready):
     later = datetime(2026, 10, 22, 13, 0, tzinfo=timezone.utc)
     ready.extractor.errors = [router_failure()]

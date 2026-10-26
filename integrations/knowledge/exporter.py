@@ -36,7 +36,8 @@ import sqlalchemy as sa
 from integrations.knowledge.contract import (
     ContractError, canonical_json, check_podcast_record, person_entity_id, write_podcast_batch,
 )
-from integrations.knowledge.people import guest_input_sha256, has_host, item_guests, participants, source_hosts
+from integrations.knowledge.people import (extraction_pending, guest_input_sha256, has_host, item_guests, participants,
+                                           source_hosts)
 from integrations.knowledge.records import (
     build_records, episode_facts, episode_native_id, payload_sha256, publisher_name, timestamp,
 )
@@ -169,7 +170,7 @@ def _plan(session, item_id, settings):
     extraction = session.scalar(sa.select(GuestExtraction).where(
         GuestExtraction.item_id == item.id, GuestExtraction.input_sha256 == guest_input_sha256(item)))
     if (settings.GUEST_EXTRACTION_ENABLED and item.admin_guests is None and not item.feed_guests
-            and extraction is None):
+            and extraction_pending(extraction)):
         return "awaiting_guests"
     guests = item_guests(item, extraction)
     people = participants(hosts, basis, guests)

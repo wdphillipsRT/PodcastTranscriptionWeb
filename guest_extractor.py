@@ -44,7 +44,8 @@ import uuid
 import sqlalchemy as sa
 
 from ingestion_types import person_names
-from integrations.knowledge.people import guest_input_sha256, has_host, participants, plain_text, source_hosts
+from integrations.knowledge.people import (MAX_ROUTER_FAILURES, guest_input_sha256, has_host, participants, plain_text,
+                                           source_hosts)
 from router_client import (CONNECT_TIMEOUT_SECONDS, GUEST_MAX_OUTPUT_TOKENS, GUEST_ROUTE, READ_MARGIN_SECONDS,
                            RouterClient, RouterError)
 from transcripts import canonical_json
@@ -73,9 +74,9 @@ ENVIRONMENTAL = frozenset({"model_auth", "model_config", "model_mismatch"})
 # client's connect timeout and read margin, at most 700 s) needs longer; well inside
 # the 1800 s soft time limit.
 RUN_DEADLINE_SECONDS = 600
-# An input the router itself failed on (reason router_failure) is retried on later runs,
-# after inputs never tried, and abandoned after this many recorded router failures.
-MAX_ROUTER_FAILURES = 3
+# MAX_ROUTER_FAILURES (shared with the exporter, which holds such an input's item as
+# awaiting_guests while it is retried): an input the router itself failed on is retried
+# on later runs, after inputs never tried, and abandoned after that many router failures.
 RUN_LOCK_KEY = 0x5047_5545_5354_0001
 
 

@@ -84,6 +84,21 @@ def test_cli_failure_suppresses_private_exception(worker, monkeypatch):
 from tests.router_fake import FakeRouter, fake_router  # noqa: E402,F401
 
 
+def test_router_smoke_names_an_unspecified_reason(worker, fake_router, monkeypatch):  # noqa: F811
+    import socket
+    import router_classifier
+    monkeypatch.delattr(socket.socket, "connect")
+    worker.app.config.update(ROUTER_URL=fake_router.url, ROUTER_TOKEN_FILE=fake_router.token_file,
+                             ROUTER_CA_FILE="", ROUTER_CLIENT_CERT_FILE="", ROUTER_CLIENT_KEY_FILE="")
+
+    def fail(self, window, **keywords):
+        raise router_classifier.ClassifierError("model_config")
+    monkeypatch.setattr(router_classifier.RouterClassifier, "classify", fail)
+    result = invoke(worker, "router-smoke")
+    assert result.exit_code != 0
+    assert "Router smoke failed: model_config reason=unspecified" in result.output
+
+
 @pytest.mark.parametrize("failure", [None, "auth", "model", "not_ready", "wrong_cert"])
 def test_router_smoke_sends_one_synthetic_request_through_the_production_adapter(worker, fake_router, monkeypatch,
                                                                                  failure):  # noqa: F811
