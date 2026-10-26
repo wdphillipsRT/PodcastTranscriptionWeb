@@ -1039,7 +1039,12 @@ def _classification_step(service, revision_id, phase, ordinal=None, *, handoff_s
     if result.next_dispatch is not None:
         return _prepare_classification_publication(result.next_dispatch), None, None
     if result.state == "superseded" and handoff_superseded:
-        if _active_revision_is_current(service, item_id):
+        try:
+            current = service.active_revision_matches_inputs(item_id)
+        except ClassificationServiceError:
+            db.session.rollback()
+            current = False  # Unknown: hand off as before; ensure_revision repeats the checks.
+        if current:
             # A newer revision from the current classifier already completed for
             # these inputs (for example while a reclassification was held).
             db.session.commit()
@@ -1052,27 +1057,17 @@ def _classification_step(service, revision_id, phase, ordinal=None, *, handoff_s
     return None, None, None
 
 
-def _active_revision_is_current(service, item_id):
-    """The item's active revision completed for its current transcript, inputs and classifier."""
-    from extensions import db
-    from models import ClassificationRevision, ContentItem
-    from router_classifier import expected_provenance
-    item = db.session.get(ContentItem, item_id, populate_existing=True)
-    active = (db.session.get(ClassificationRevision, item.active_classification_revision_id, populate_existing=True)
-              if item is not None and item.active_classification_revision_id else None)
-    provenance = expected_provenance(service.settings)
-    if (active is None or active.state != "completed" or active.transcript_sha256 != item.transcript_sha256
-            or (active.requested_model, active.classifier_cli_version, active.prompt_sha256)
-            != (provenance.requested_model, provenance.cli_version, provenance.prompt_sha256)):
-        db.session.commit()
-        return False
-    db.session.commit()
-    # Overrides or source rules changed since then still need a new revision.
-    return service.prepare_revision_request(item_id)._identity == active.input_identity_sha256
-
-
 RECLASSIFY_QUEUED = "reclassify_queued"
 _RECLASSIFY_RELEASE_LOCK = 0x5243_4C53_0000_0001
+
+
+def _reclassify_prefix(provenance):
+    """Idempotency key prefix naming the whole classifier provenance, so a new model pin,
+    router route or prompt makes every item a reclassification candidate again."""
+    from hashlib import sha256
+    digest = sha256(f"{provenance.requested_model}|{provenance.cli_version}|{provenance.prompt_sha256}"
+                    .encode("utf-8")).hexdigest()
+    return f"reclassify:{digest[:12]}:"
 
 
 def _not_held():
@@ -1100,7 +1095,7 @@ def queue_reclassification(*, limit=None):
     from router_classifier import expected_provenance
     service = get_classification_service()
     provenance = expected_provenance(service.settings)
-    prefix = f"reclassify:{provenance.prompt_sha256[:12]}:"
+    prefix = _reclassify_prefix(provenance)
     current = sa.exists().where(ClassificationRevision.item_id == ContentItem.id,
         ClassificationRevision.transcript_sha256 == ContentItem.transcript_sha256,
         ClassificationRevision.requested_model == provenance.requested_model,

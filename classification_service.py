@@ -471,6 +471,21 @@ class ClassificationService:
             request = replace(request, _seal=_request_seal(request))
         return request
 
+    def active_revision_matches_inputs(self, item_id) -> bool:
+        """The item's active revision completed for its current transcript and inputs with the current classifier."""
+        provenance = self._provenance()
+        with self._transaction():
+            item = self.session.get(ContentItem, item_id, populate_existing=True)
+            active = (self.session.get(ClassificationRevision, item.active_classification_revision_id, populate_existing=True)
+                      if item is not None and item.active_classification_revision_id else None)
+            if (active is None or active.state != "completed" or active.transcript_sha256 != item.transcript_sha256
+                    or (active.requested_model, active.classifier_cli_version, active.prompt_sha256)
+                    != (provenance.requested_model, provenance.cli_version, provenance.prompt_sha256)):
+                return False
+            identity = active.input_identity_sha256
+        # Overrides or source rules changed since then still need a new revision.
+        return self.prepare_revision_request(item_id)._identity == identity
+
     def ensure_revision(self, item_id, reason, *, idempotency_key=None,
                         prepared_request: PreparedRevisionRequest | None = None, commit: bool = True) -> int:
         if reason not in CLASSIFICATION_REASONS or idempotency_key is not None and (

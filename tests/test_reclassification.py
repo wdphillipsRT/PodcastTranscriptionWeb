@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 
 from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
 import sqlalchemy as sa
@@ -12,7 +13,7 @@ import models as m
 import tasks
 from commercial_policy import POLICY_VERSION
 from router_classifier import ClassifierError
-from tests.test_classification_service import add_item, finish
+from tests.test_classification_service import add_item, finish, override
 from tests.test_classification_tasks import env, reconcile, task, worker  # noqa: F401
 
 
@@ -257,3 +258,49 @@ def test_status_reports_revisions_in_flight(worker):  # noqa: F811
     invoke(worker, "reclassify-all")
     output = invoke(worker, "status").output
     assert "in_flight=1 oldest_in_flight_updated=20" in output and "reclassify_queued=1" in output
+
+
+def test_a_new_model_pin_makes_reclassified_items_candidates_again(worker):  # noqa: F811
+    env = worker.env
+    assert invoke(worker, "reclassify-all").output.strip() == (
+        "candidates=1 queued=1 existing=0 busy=0 failed=0 released=1")
+    run_chain(worker)
+    first = m.ClassificationRevision.query.one()
+    assert first.state == "completed" and first.idempotency_key.startswith("reclassify:")
+    assert invoke(worker, "reclassify-all").output.startswith("candidates=0 queued=0 ")
+    env.service.settings = env.classifier.settings = replace(env.settings, ROUTER_EXPECTED_MODEL="bonsai2:27b-q4_0")
+    assert invoke(worker, "reclassify-all").output.strip() == (
+        "candidates=1 queued=1 existing=0 busy=0 failed=0 released=1")
+    second = m.ClassificationRevision.query.filter(m.ClassificationRevision.id != first.id).one()
+    assert second.idempotency_key.startswith("reclassify:") and second.idempotency_key != first.idempotency_key
+    assert second.requested_model == "bonsai2:27b-q4_0"
+
+
+def test_a_superseded_revision_still_hands_off_when_the_inputs_changed(worker):  # noqa: F811
+    env = worker.env
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    task().run(revision_id, "prepare")
+    task().run(revision_id, "block", 1)
+    task().run(revision_id, "finalize")
+    assert db.session.get(m.ClassificationRevision, revision_id).state == "completed"
+    stale = env.service.ensure_revision(env.item.id, "manual_retry", idempotency_key="before-override")
+    override(env, 1)  # The active revision keeps the current provenance but no longer matches the inputs.
+    sent = len(worker.sent)
+    task().run(stale, "prepare")
+    assert db.session.get(m.ClassificationRevision, stale).state == "superseded"
+    handoff = m.ClassificationRevision.query.filter(m.ClassificationRevision.id > stale).one()
+    assert handoff.request_reason == "policy_upgrade" and worker.sent[sent][1] == [handoff.id, "prepare", None]
+
+
+def test_a_failing_input_check_falls_through_to_the_hand_off(worker, monkeypatch):  # noqa: F811
+    from classification_service import ClassificationServiceError
+    env = worker.env
+    stale = env.service.ensure_revision(env.item.id, "manual_retry", idempotency_key="stale")
+    complete_router_revision(env, env.item.id, "newer")
+
+    def failing(item_id):
+        raise ClassificationServiceError("storage_transient")
+    monkeypatch.setattr(env.service, "active_revision_matches_inputs", failing)
+    task().run(stale, "prepare")
+    assert db.session.get(m.ClassificationRevision, stale).state == "superseded"
+    assert m.ClassificationRevision.query.filter_by(request_reason="policy_upgrade").count() == 1

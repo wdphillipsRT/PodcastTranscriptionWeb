@@ -695,17 +695,32 @@ are skipped until their new revision completes. An export that runs before
 reclassification sends Claude-era revisions with their uncertain text, which
 earlier exports withheld, marked as uncertain.
 
-Rolling back the code after the router has classified anything is not a plain
-image rollback. The previous code does not know the decision source `model`,
-so it rejects every policy that contains it: those episodes fail validation on
-the review page and in the exporter. Either restore the
-pre-upgrade database backup (losing everything since), or after rolling back
-reclassify those episodes with the previous classifier. Downgrading the schema
-drops the three columns:
+Rolling back the code is not a plain image rollback. The previous code does not
+know the decision source `model`, so it rejects every policy that contains it:
+router-classified episodes fail validation on the review page and in the
+exporter. The previous code has no command that reclassifies an episode whose
+active revision the router produced. The documented rollback is therefore to
+restore the PostgreSQL backup taken before the upgrade (the upgrade script
+writes it to `~/PodcastTranscriptionWeb-backups/postgres-<stamp>-*.dump`),
+losing every change since. In this order:
+
+1. Stop the writers.
+2. Downgrade migration `0004` with the current image, which is the only one that
+   has it. This drops the three columns.
+3. Restore the pre-upgrade backup as described in
+   [PostgreSQL backup and restore](#postgresql-backup-and-restore).
+4. Check out the previous revision, rebuild the images, and start the services.
+5. Restore `.runtime/claude` from the archive the upgrade script suggested
+   (`~/PodcastTranscriptionWeb-backups/claude-runtime-<stamp>.tar.gz`), or
+   authenticate the Claude CLI again, because the previous classifier needs it.
 
 ```bash
 docker compose stop web worker beat classifier exporter
 docker compose run --rm --no-deps migrate flask --app app:create_app db downgrade 0003_knowledge_export
+# Restore the pre-upgrade backup, then:
+git checkout <previous revision>
+docker compose build
+(umask 077 && tar -C .runtime -xzf ~/PodcastTranscriptionWeb-backups/claude-runtime-<stamp>.tar.gz)
 ```
 
 Upgrading again recreates `request_generation` as 0 for every block, so keys
