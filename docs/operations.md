@@ -137,6 +137,13 @@ correction, or a new classification revision, emits a new record that
 supersedes the earlier one; record identifiers are never reused. Export state is
 kept in `knowledge_export_batches` and `knowledge_item_exports`.
 
+The contract requires `source.uri` on every record. It is the episode's own
+link; an episode without one uses its enclosure URL, else the source's feed
+URL. URLs whose query string carries a recognised credential parameter are
+never stored, but a token in the URL path is not detected, so do not enable the
+export while a private feed with a token in its path is subscribed: the token
+would reach the Platform catalog.
+
 Hosts come from the feed (`<podcast:person role="host">`, else
 `<itunes:author>`, else `<itunes:owner>`) or the YouTube channel owner, and
 podcast feeds refresh them on every discovery run. The administrator can name
@@ -158,9 +165,12 @@ a confidence; inferred guests below 0.5 are shown but not exported. The item
 page's guest form is prefilled only with declared guests (administrator or
 feed), never inferred ones, so saving it unchanged never turns a guess into an
 administrator guest; saving an empty list records that the episode has no
-guests. While extraction is enabled, an item without declared guests waits
-(`awaiting_guests`) until its current title and description have been
-extracted.
+guests. Saving the form does turn feed guests into administrator guests, even
+unchanged: their basis becomes administrator-set and the item is exported
+again. Saving the same administrator list again, or resetting an item that has
+no administrator list, changes nothing. While extraction is enabled, an item
+without declared guests waits (`awaiting_guests`) until its current title and
+description have been extracted.
 
 Extraction runs every `GUEST_EXTRACTION_INTERVAL_SECONDS` (default and minimum
 3600: configuration validation rejects less, and `celeryconfig` refuses to load
@@ -180,8 +190,33 @@ when that spend plus the per-call cap would exceed
 budget, plus one unrecorded call per run that ends in such an environmental
 stop, each capped by the per-call budget (only a call whose reported cost
 exceeds its cap can push recorded spend past the daily budget, and it is
-recorded at that cost). Enable it with `GUEST_EXTRACTION_ENABLED=true` and
-recreate `beat` and `classifier`.
+recorded at that cost). Extraction runs on the classifier's `classification`
+queue (concurrency 1), so each run can delay classification by up to about 10
+minutes (its run deadline). Only items whose source names a host the exporter
+can identify are extracted, newest first.
+
+Enable it with `GUEST_EXTRACTION_ENABLED=true`, then
+recreate `beat`, `classifier`, and `exporter` (if it is running); the exporter
+reads the same setting to decide whether items wait for guests. Once it is
+enabled, every item otherwise ready to export that has no administrator or
+feed guests waits in `awaiting_guests` until it has been extracted. Extraction
+works newest first, at most `GUEST_EXTRACTION_MAX_ITEMS_PER_RUN` items an hour,
+and the default daily budget allows only 20 calls a day when calls cost their
+full per-call cap, so an existing library would wait for days or weeks. Run the
+initial backfill (`knowledge export`, below) before setting `GUEST_EXTRACTION_ENABLED=true`,
+or leave extraction off. While extraction is enabled, a run stopped by an
+authentication, configuration, or model-mismatch error records nothing, so
+waiting items, including every new one, stay in `awaiting_guests` until the
+error is fixed; the hourly `knowledge_guest_extraction` log entry names the
+reason in `stopped`. Turning extraction off (and recreating `exporter`)
+releases waiting items on the next export run; those never extracted are
+exported without inferred guests.
+
+`knowledge status` does not count waiting items. Each export run reports them:
+the nightly run's `knowledge_export_completed` (or `knowledge_export_failed`)
+log entry has `skipped.awaiting_guests`, and `knowledge export` prints
+`awaiting_guests=` with the count when there are any (it exports the other
+eligible items as it does so).
 
 To enable the export after the Platform has created the spool, find the
 numeric GID of `intake-podcast`, set it and `KNOWLEDGE_EXPORT_ENABLED=true` in
@@ -214,10 +249,15 @@ report counts the items it passed over by reason: `unchanged`, `no_host`,
 `publisher_unnamed`, `awaiting_guests`, `projection_unavailable`,
 `changed_during_export`, `too_large`, and `invalid_record` (an item whose
 records fail the contract; it is logged as `knowledge_export_invalid_record`
-and the rest of the batch is still written). A write error marks its batch
-`failed` and the run `failed` (`knowledge_export_failed`), except that a batch
-already renamed into the inbox before the error stays `pending`. At the start
-of every run a `pending` batch found in the inbox becomes `written`; any other
+and the rest of the batch is still written). A failed run
+(`knowledge_export_failed`, `status=failed`) reports one of three reasons. A
+contract error from the batch writer (`contract_error`) or a filesystem error
+while writing (`write_failed`) marks its batch `failed`, except that a batch
+already renamed into the inbox before the error stays `pending`.
+`sequence_exhausted` means the next batch name for that UTC date would pass
+sequence 999 (sequences continue after the highest one recorded, skipping names
+present in the inbox); no batch is created, and the next UTC date starts again
+from 001. Batches the run already wrote stay written. At the start of every run a `pending` batch found in the inbox becomes `written`; any other
 becomes `abandoned` and its items are exported again. An unexpected error in the
 nightly task is logged as `knowledge_export_failed` with its `error_type`.
 

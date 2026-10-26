@@ -356,6 +356,11 @@ def test_operations_documents_the_knowledge_exporter():
                  "flask --app app:create_app knowledge export --since",
                  "flask --app app:create_app knowledge seed-hosts",
                  "flask --app app:create_app knowledge status",
-                 "GUEST_EXTRACTION_DAILY_BUDGET_USD", "load_active_learning_projection"):
+                 "GUEST_EXTRACTION_DAILY_BUDGET_USD", "load_active_learning_projection",
+                 # Enablement order and operator caveats.
+                 "before setting `GUEST_EXTRACTION_ENABLED=true`", "`awaiting_guests=`",
+                 "recreate `beat`, `classifier`, and `exporter` (if it is running)",
+                 "delay classification", "`sequence_exhausted`", "`write_failed`", "`contract_error`",
+                 "`source.uri`"):
         assert text in section, text
     assert "knowledge intake" in (ROOT / "README.md").read_text()
