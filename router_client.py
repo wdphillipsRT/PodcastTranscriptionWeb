@@ -118,6 +118,14 @@ def _fail(category, reason, *, advance_key=True):
     raise error
 
 
+def _unexpected(error, otherwise):
+    """Celery's SoftTimeLimitExceeded (an Exception raised inside the call) is a timeout: the request
+    may have been sent, so the router may still be generating under this key, which is kept."""
+    if type(error).__name__ == "SoftTimeLimitExceeded":
+        return ("router_busy", "timeout", False)
+    return otherwise
+
+
 @dataclass(frozen=True, slots=True)
 class RouterResult:
     parsed: object
@@ -299,8 +307,8 @@ class RouterClient:
                 failure = ("router_busy", "timeout", False)
             except requests.ConnectionError:
                 failure = ("router_busy", "transport", False)
-            except Exception:  # Any other requests or adapter failure: the request was not sent as built.
-                failure = ("model_config", "refused", True)
+            except Exception as error:  # Any other requests or adapter failure: the request was not sent as built.
+                failure = _unexpected(error, ("model_config", "refused", True))
             finally:
                 del headers  # The token leaves this frame as soon as the request is sent.
             if response is not None:
@@ -312,8 +320,8 @@ class RouterClient:
                     failure = ("router_busy", "transport", False)
                 except ValueError:  # Oversized response.
                     failure = ("model_invalid_output", "malformed_output", True)
-                except Exception:  # Anything else while reading the body.
-                    failure = ("router_busy", "transport", False)
+                except Exception as error:  # Anything else while reading the body.
+                    failure = _unexpected(error, ("router_busy", "transport", False))
                 finally:
                     response.close()
                     response.request = None  # The prepared request holds the Authorization header.

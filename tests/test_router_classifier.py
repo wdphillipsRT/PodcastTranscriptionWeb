@@ -100,7 +100,8 @@ def test_checks_the_subset_cannot_express_fail_as_invalid_output(fake_router, cl
     fake_router.output = output
     with pytest.raises(ClassifierError) as caught:
         classifier.classify(window())
-    assert (caught.value.category, caught.value.advance_key) == ("model_invalid_output", True)
+    assert (caught.value.category, caught.value.reason, caught.value.advance_key) == (
+        "model_invalid_output", "output_invalid", True)
 
 
 def test_examples_are_trimmed_until_the_request_fits():
@@ -175,7 +176,7 @@ def test_a_window_that_cannot_fit_is_a_configuration_error(fake_router, classifi
     monkeypatch.setattr(router_classifier, "CLASSIFICATION_CONTEXT_TOKENS", 9_000)
     with pytest.raises(ClassifierError) as caught:
         classifier.classify(window(targets=(2,), before=(), after=(), texts={2: "t" * 3_000}))
-    assert caught.value.category == "model_config" and not fake_router.requests
+    assert (caught.value.category, caught.value.reason) == ("model_config", "too_large") and not fake_router.requests
 
 
 @pytest.mark.parametrize("change", ["not_window", "too_many_targets", "gap", "unknown_example_label",
@@ -194,7 +195,7 @@ def test_invalid_inputs_are_configuration_errors_without_a_request(fake_router, 
         examples = (ClassifierExample("housekeeping", (segment(10),)),) * 2
     with pytest.raises(ClassifierError) as caught:
         classifier.classify(win, examples=examples)
-    assert caught.value.category == "model_config" and not fake_router.requests
+    assert (caught.value.category, caught.value.reason) == ("model_config", "refused") and not fake_router.requests
 
 
 @pytest.mark.parametrize("setup, category, advance", [

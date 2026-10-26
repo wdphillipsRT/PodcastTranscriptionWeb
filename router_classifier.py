@@ -80,8 +80,9 @@ class ClassifierResult:
     provenance: ClassifierProvenance
 
 
-def _fail(category="model_invalid_output"):
-    raise ClassifierError(category) from None
+def _fail(category="model_invalid_output", reason="output_invalid"):
+    """Raise a ClassifierError with a closed reason from router_client.REASONS."""
+    raise ClassifierError(category, reason=reason) from None
 
 
 def expected_provenance(settings) -> ClassifierProvenance:
@@ -93,64 +94,64 @@ def expected_provenance(settings) -> ClassifierProvenance:
 
 def _input(window, examples):
     if not isinstance(window, ClassifierWindow):
-        _fail("model_config")
+        _fail("model_config", "refused")
     if any(not isinstance(values, (tuple, list)) for values in
            (window.target_segments, window.context_before, window.context_after, window.signals)):
-        _fail("model_config")
+        _fail("model_config", "refused")
     if (not 1 <= len(window.target_segments) <= TARGET_SEGMENTS_PER_BLOCK
             or len(window.context_before) > CONTEXT_SEGMENTS_PER_SIDE
             or len(window.context_after) > CONTEXT_SEGMENTS_PER_SIDE):
-        _fail("model_config")
+        _fail("model_config", "refused")
     visible = (*window.context_before, *window.target_segments, *window.context_after)
     positions, previous_ordinal = {}, None
     for index, segment in enumerate(visible):
         if not isinstance(segment, TranscriptSegment):
-            _fail("model_config")
+            _fail("model_config", "refused")
         segment.__post_init__()
         ordinal = int(segment.id[4:10])
         if (segment.id in positions or ordinal <= 0
                 or previous_ordinal is not None and ordinal != previous_ordinal + 1):
-            _fail("model_config")
+            _fail("model_config", "refused")
         positions[segment.id] = index
         previous_ordinal = ordinal
     count = len(visible)
     if len(window.signals) > len(SIGNAL_CODES) * (count + max(count - 1, 0) + max(count - 2, 0)):
-        _fail("model_config")
+        _fail("model_config", "refused")
     seen_signals = set()
     for entry in window.signals:
         if not isinstance(entry, Signal):
-            _fail("model_config")
+            _fail("model_config", "refused")
         entry.__post_init__()
         first, last = positions.get(entry.first_segment_id), positions.get(entry.last_segment_id)
         if entry in seen_signals or first is None or last is None or not 0 <= last - first <= 2:
-            _fail("model_config")
+            _fail("model_config", "refused")
         seen_signals.add(entry)
     if sum(len(segment.text) for segment in window.target_segments) > MAX_BLOCK_TEXT_CHARS:
-        _fail("model_config")
+        _fail("model_config", "refused")
     if not isinstance(examples, tuple) or len(examples) > 20:
-        _fail("model_config")
+        _fail("model_config", "refused")
     source_examples, seen_examples = [], set()
     for example in examples:
         if (not isinstance(example, ClassifierExample)
                 or not isinstance(example.label, str) or example.label not in LABELS
                 or not isinstance(example.segments, tuple)
                 or not 1 <= len(example.segments) <= TARGET_SEGMENTS_PER_BLOCK):
-            _fail("model_config")
+            _fail("model_config", "refused")
         previous_ordinal, text_chars = None, 0
         for segment in example.segments:
             if not isinstance(segment, TranscriptSegment):
-                _fail("model_config")
+                _fail("model_config", "refused")
             segment.__post_init__()
             ordinal = int(segment.id[4:10])
             if ordinal <= 0 or previous_ordinal is not None and ordinal != previous_ordinal + 1:
-                _fail("model_config")
+                _fail("model_config", "refused")
             previous_ordinal = ordinal
             text_chars += len(segment.text)
             if text_chars > MAX_BLOCK_TEXT_CHARS:
-                _fail("model_config")
+                _fail("model_config", "refused")
         identity = (example.label, tuple(segment.id for segment in example.segments))
         if identity in seen_examples:
-            _fail("model_config")
+            _fail("model_config", "refused")
         seen_examples.add(identity)
         source_examples.append({"label": example.label, "segments": [
             {key: getattr(segment, key) for key in ("start", "end", "text")} for segment in example.segments]})
@@ -202,7 +203,7 @@ def fitted_messages(window, examples):
         messages = _messages(_input(window, ()))
         if _fits(messages):
             return messages
-    _fail("model_config")
+    _fail("model_config", "too_large")
 
 
 def _decisions(parsed, window):
@@ -265,4 +266,4 @@ class RouterClassifier:
         except ClassifierError:
             raise
         except (OSError, ValueError, TypeError, AttributeError, ArithmeticError):
-            _fail("model_config")
+            _fail("model_config", "refused")

@@ -253,12 +253,21 @@ def test_router_url_trailing_slash_is_dropped(valid_environment):
     assert load_settings(valid_environment).ROUTER_URL == "https://router.internal:8443"
 
 
+@pytest.mark.parametrize("value", ["https://router.internal", "https://192.168.68.200:18443",
+                                   "https://[::1]:8443", "https://[fd00::1]", "https://[::ffff:192.168.0.1]/"])
+def test_router_url_accepts_host_and_bracketed_ipv6_origins(valid_environment, value):
+    valid_environment["ROUTER_URL"] = value
+    assert load_settings(valid_environment).ROUTER_URL == value.rstrip("/")
+
+
 @pytest.mark.parametrize("name,value", [
     ("ROUTER_URL", "http://192.168.68.200:18443"), ("ROUTER_URL", "https://user:secret@192.168.68.200:18443"),
     ("ROUTER_URL", "https://192.168.68.200:18443/v1"), ("ROUTER_URL", "https://192.168.68.200:18443?x=1"),
     ("ROUTER_URL", "https://192.168.68.200:99999"), ("ROUTER_URL", ""),
     ("ROUTER_URL", "https://host?"), ("ROUTER_URL", "https://host#"), ("ROUTER_URL", "https://ho st"),
     ("ROUTER_URL", "https://[::1"), ("ROUTER_URL", "https://host\t:8443"), ("ROUTER_URL", "https://host;x"),
+    ("ROUTER_URL", "https://host:"), ("ROUTER_URL", "https://host:/"), ("ROUTER_URL", "https://host:8443:1"),
+    ("ROUTER_URL", "https://ho[st]"), ("ROUTER_URL", "https://[::1]x"), ("ROUTER_URL", "https://host:123456"),
     ("ROUTER_EXPECTED_MODEL", "bonsai2"), ("ROUTER_EXPECTED_MODEL", "bonsai2:latest"),
     ("ROUTER_EXPECTED_MODEL", "Bonsai2:27b"),
     ("ROUTER_TOKEN_FILE", "router/token"), ("ROUTER_CA_FILE", "/router/../etc/ca.crt"),

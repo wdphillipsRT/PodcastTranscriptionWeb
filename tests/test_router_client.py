@@ -1,10 +1,12 @@
 """The router client against an in-process fake router; never the real router."""
 
+import collections
 import gc
 import hashlib
 import logging
 import types
 import socket
+import threading
 import uuid
 
 import pytest
@@ -261,35 +263,40 @@ def _children(value):
     return children
 
 
-def token_reachable(error, depth=6):
+_WALK_LIMIT = 200_000  # nodes; reaching it fails the test rather than passing it unexamined
+_SKIPPED = (FakeRouter, threading.Thread, threading.Event, threading.Condition, threading.Semaphore,
+            type(threading.Lock()), type(threading.RLock()))
+
+
+def token_reachable(error, limit=_WALK_LIMIT):
     """Whether the token is reachable from any client frame of the traceback, following references.
 
-    Frames in this test module are skipped: they legitimately hold the fake router, which keeps the
-    requests it received. Object attributes count as one hop, so a response's request headers are
-    response -> request -> headers -> store -> (name, value) -> value.
+    The walk has no depth limit but a node cap. Frames in this test module are skipped: they
+    legitimately hold the fake router, which keeps the requests it received. FakeRouter instances
+    (reachable through the fake's server threads) and threading objects are skipped for the same
+    reason; nothing in the client stores the token in either.
     """
-    needle, roots, traceback = TOKEN, [], error.__traceback__
+    needle, pending, traceback = TOKEN, collections.deque(), error.__traceback__
     while traceback is not None:
         if traceback.tb_frame.f_code.co_filename != __file__:
-            roots.extend(traceback.tb_frame.f_locals.values())
+            pending.extend(traceback.tb_frame.f_locals.values())
         traceback = traceback.tb_next
-    roots.extend(vars(error).values())
-    seen, level = set(), roots
-    for _ in range(depth + 1):
-        following = []
-        for value in level:
-            if id(value) in seen or isinstance(value, _OPAQUE):
-                continue
-            seen.add(id(value))
-            if isinstance(value, str):
-                if needle in value:
-                    return True
-            elif isinstance(value, (bytes, bytearray)):
-                if needle.encode() in value:
-                    return True
-            elif not isinstance(value, (int, float, bool, type(None))):
-                following.extend(_children(value))
-        level = following
+    pending.extend(vars(error).values())
+    seen = set()
+    while pending:
+        value = pending.popleft()
+        if id(value) in seen or isinstance(value, _OPAQUE) or isinstance(value, _SKIPPED):
+            continue
+        seen.add(id(value))
+        assert len(seen) <= limit, "reference walk exceeded its node cap"
+        if isinstance(value, str):
+            if needle in value:
+                return True
+        elif isinstance(value, (bytes, bytearray)):
+            if needle.encode() in value:
+                return True
+        elif not isinstance(value, (int, float, bool, type(None))):
+            pending.extend(_children(value))
     return False
 
 
@@ -375,6 +382,25 @@ def test_the_reference_walk_finds_a_token_held_by_a_response(fake_router):  # no
     held.holder = holder
     assert token_reachable(held)
     session.close()
+
+
+@pytest.mark.parametrize("where", ["send", "read"])
+def test_a_soft_time_limit_is_a_busy_timeout_that_keeps_the_key(fake_router, monkeypatch, where):  # noqa: F811
+    # Celery raises SoftTimeLimitExceeded (an Exception) inside the call; the request may have been
+    # sent, so the router may be generating under this key: reuse it.
+    import requests
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    def soft_limit(*args, **kwargs):
+        raise SoftTimeLimitExceeded()
+    if where == "send":
+        monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", soft_limit)
+    else:
+        monkeypatch.setattr(requests.models.Response, "iter_content", soft_limit)
+    error = failure(fake_router)
+    assert (error.category, error.reason, error.advance_key) == ("router_busy", "timeout", False)
+    assert error.__context__ is None and error.__cause__ is None
+    assert not token_reachable(error)
 
 
 def test_environment_proxies_are_ignored(fake_router, monkeypatch):  # noqa: F811
