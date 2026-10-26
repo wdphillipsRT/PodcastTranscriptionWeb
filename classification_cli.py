@@ -135,6 +135,27 @@ def router_smoke(wrong_client_cert):
                f"seconds={time.monotonic() - started:.1f}")
 
 
+@classification_cli.command("compare")
+@click.option("--sample", default="20", metavar="1-100")
+@click.option("--seed", default="20261026", metavar="1-2147483647")
+@click.option("--max-blocks", default="4", metavar="1-50")
+@_safe
+def compare(sample, seed, max_blocks):
+    """Classify a fixed sample of Claude-classified items with the router model; stores nothing."""
+    import json
+    from classification_compare import compare_models
+    from extensions import db
+    from router_classifier import ClassifierError
+    from tasks import get_classification_service
+    sample, seed, max_blocks = _integer(sample, maximum=100), _integer(seed), _integer(max_blocks, maximum=50)
+    try:
+        report = compare_models(session=db.session, service=get_classification_service(), sample=sample,
+                                seed=seed, max_blocks=max_blocks)
+    except ClassifierError as error:
+        raise click.ClickException(f"Comparison stopped: {error.category}") from None
+    click.echo(json.dumps(report, sort_keys=True, indent=2))
+
+
 def _wrong_client_cert_smoke(settings, window):
     """The suite never exercises TLS, so this proves against the real router that a client certificate
     it did not issue is refused and mapped to model_auth. Prints only the category and reason."""
