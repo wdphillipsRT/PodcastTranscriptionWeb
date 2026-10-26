@@ -9,6 +9,7 @@ import pytest
 from integrations.knowledge.contract import validate_podcast_batch, write_podcast_batch
 from integrations.knowledge.records import (
     PASSAGE_MAX_CHARS, build_records, episode_facts, passages, payload_sha256, publisher_name,
+    timestamp,
 )
 from transcripts import TranscriptSegment
 
@@ -97,6 +98,27 @@ def test_passages_split_at_gaps_duration_and_size():
     assert groups[0].text == "a\nb"
 
 
+def test_passage_ends_never_move_backwards_and_bound_the_duration_check():
+    groups = passages((segment(1, 0.0, 50.0, "a"), segment(2, 10.0, 20.0, "b"), segment(3, 20.0, 30.0, "c"),
+                       segment(4, 100.0, 170.0, "d"), segment(5, 105.0, 110.0, "e")))
+    assert [(g.segment_ids[0][4:10], len(g.segment_ids), g.start_ms, g.end_ms) for g in groups] == [
+        ("000001", 3, 0, 50000), ("000004", 1, 100000, 170000), ("000005", 1, 105000, 110000)]
+
+
+def test_a_single_segment_is_never_split_even_beyond_both_limits():
+    text = "x" * (PASSAGE_MAX_CHARS + 500)
+    groups = passages((segment(1, 0.0, 90.0, text), segment(2, 90.0, 91.0, "y")))
+    assert [(len(g.segment_ids), g.start_ms, g.end_ms, len(g.text)) for g in groups] == [
+        (1, 0, 90000, PASSAGE_MAX_CHARS + 500), (1, 90000, 91000, 1)]
+
+
+def test_timestamps_require_an_aware_datetime():
+    assert timestamp(datetime(2026, 10, 22, 3, 15, 0, 500, tzinfo=UTC)) == "2026-10-22T03:15:00Z"
+    assert timestamp(None) is None
+    with pytest.raises(ValueError):
+        timestamp(datetime(2026, 10, 22, 3, 15))
+
+
 def test_payload_identity_tracks_only_exported_facts():
     base = payload_sha256(facts())
     assert base == payload_sha256(facts())
@@ -108,6 +130,8 @@ def test_payload_identity_tracks_only_exported_facts():
     ({}, "The Mel Robbins Podcast"),
     ({"platform": "youtube", "channel_name": "Channel"}, "Channel"),
     ({"platform": "youtube", "channel_name": None}, "The Mel Robbins Podcast"),
+    ({"platform": "youtube", "channel_name": " \t\n "}, "The Mel Robbins Podcast"),
+    ({"platform": "youtube", "channel_name": "  My \t Channel "}, "My Channel"),
 ])
 def test_publisher_is_the_show_or_youtube_channel(changes, expected):
     item = SimpleNamespace(platform="podcast", channel_name=None)

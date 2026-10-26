@@ -6,8 +6,11 @@ classification revision, export generation, and passage:
     podcast.episode  item-<item id>/rev-<classification revision id>/e<generation>
     podcast.segment  <episode native id>/<first projection segment id>
 
-A passage is a run of consecutive editorial projection segments, at most 60
-seconds and 6,000 characters, so caption-sized cues become citable passages.
+A passage is a run of consecutive editorial projection segments, so
+caption-sized cues become citable passages. A segment joins the current passage
+only while the passage stays within 60 seconds (measured to the latest segment
+end so far) and 6,000 characters; a single segment is never split, so a passage
+of one segment may exceed either limit.
 Every fact that can change an episode's record is in `episode_facts`, which is
 read from the database only; its hash detects changes without storage reads.
 """
@@ -38,6 +41,8 @@ class Passage:
 
 
 def timestamp(value):
+    if value is not None and value.tzinfo is None:
+        raise ValueError("knowledge timestamps require a timezone-aware datetime")
     return None if value is None else value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -58,8 +63,9 @@ def _clock(milliseconds):
 
 def publisher_name(item, source):
     """The show: the YouTube channel for videos, else the content source's name."""
-    if item.platform == "youtube" and item.channel_name:
-        return " ".join(item.channel_name.split())
+    channel = " ".join((item.channel_name or "").split()) if item.platform == "youtube" else ""
+    if channel:
+        return channel
     return " ".join(source.name.split())
 
 
@@ -95,12 +101,12 @@ def passages(segments):
     for segment in segments:
         ordinal = int(segment.id[4:10])
         start, end = round(segment.start * 1000), round(segment.end * 1000)
-        if (current is None or ordinal != previous + 1 or end - current["start"] > PASSAGE_MAX_MS
+        if (current is None or ordinal != previous + 1 or max(current["end"], end) - current["start"] > PASSAGE_MAX_MS
                 or len(current["text"]) + 1 + len(segment.text) > PASSAGE_MAX_CHARS):
             current = {"ids": [], "start": start, "end": end, "text": None}
             groups.append(current)
         current["ids"].append(segment.id)
-        current["end"] = end
+        current["end"] = max(current["end"], end)
         current["text"] = segment.text if current["text"] is None else current["text"] + "\n" + segment.text
         previous = ordinal
     return [Passage(tuple(group["ids"]), group["start"], group["end"], group["text"]) for group in groups]
