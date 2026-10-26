@@ -26,6 +26,16 @@ is False only when the router cannot have stored an outcome: 429, 202, a
 transport failure, or a 5xx without a router error body (Caddy). The caller then
 reuses the key, so a lost response is replayed rather than generated twice.
 After any other failure the caller must use a new key.
+
+`RouterError.reason` is a closed, payload-free detail (see REASONS). The caller
+uses it where the category alone is not enough: a key whose 202 `in_progress`
+persists past the call's own time bound is stuck (the router restarted
+mid-generation and never expires in-progress keys), so the caller advances it.
+
+No RouterError carries an exception chain: `__cause__` and `__context__` are
+None, because a requests exception holds the prepared request, whose headers
+include the bearer token. The token is also dropped from the call's frame as
+soon as the request has been sent.
 """
 
 from dataclasses import dataclass
@@ -49,13 +59,35 @@ ROUTE_LIMITS = {  # (context tokens, max output tokens) of each route's one cand
     GUEST_ROUTE: (CLASSIFICATION_CONTEXT_TOKENS, GUEST_MAX_OUTPUT_TOKENS),
 }
 MAX_MESSAGE_CHARS = 131_072        # the router's validate_messages limit
+MAX_MESSAGES = 64                  # the router's normalize_model_task limit
+ROLES = frozenset({"system", "user", "assistant"})
 MAX_REQUEST_BYTES = 1_048_576      # the router's default ROUTER_MAX_REQUEST_BYTES
 MAX_RESPONSE_BYTES = 4_194_304
 CONNECT_TIMEOUT_SECONDS = 10
-READ_MARGIN_SECONDS = 30
+READ_MARGIN_SECONDS = 90         # the router's worst case is about deadline + 65 s
 READINESS_TIMEOUT_SECONDS = 10
 CATEGORIES = {"router_busy": True, "model_invalid_output": True, "model_auth": False,
               "model_config": False, "model_mismatch": False}
+REASONS = frozenset({
+    "in_progress",       # 202: the same key is still running (or stuck after a router restart)
+    "rate_limited",      # 429
+    "timeout",           # connect or read timeout
+    "transport",         # refused or dropped connection
+    "proxy",             # 5xx without a router error body (Caddy)
+    "no_candidate",      # 503 MODEL_NO_ELIGIBLE_CANDIDATE
+    "router_failure",    # any other 5xx with a router error body
+    "output_invalid",    # 502 MODEL_OUTPUT_INVALID
+    "malformed_output",  # 200 without usable output, or an oversized response
+    "unauthorized",      # 401
+    "forbidden",         # 403
+    "tls",               # TLS handshake failure
+    "token",             # unusable token file
+    "refused",           # a request this client will not send
+    "too_large",         # too large for the route's context or output budget
+    "conflict",          # 409 idempotency conflict
+    "rejected",          # any other 4xx
+    "mismatch",          # selected_model is not the expected model
+})
 _TASK_NAMESPACE = uuid.UUID("6f1c3f0e-5b8e-4f43-9a51-7c1d2e0b9a10")
 _KEY = re.compile(r"[\x21-\x7e]{1,200}")
 _TOKEN = re.compile(r"[A-Za-z0-9+/=._~-]{16,512}")
@@ -67,15 +99,19 @@ _SCHEMA_CONTRACT = ("Return exactly one JSON value that validates against the fo
 class RouterError(RuntimeError):
     """Closed, payload-free error surface suitable for persistence."""
 
-    def __init__(self, category, *, advance_key=True):
+    def __init__(self, category, *, reason=None, advance_key=True):
         self.category = category if category in CATEGORIES else "model_config"
+        self.reason = reason if reason in REASONS else None  # None: unspecified (callers outside this client)
         self.retryable = CATEGORIES[self.category]
         self.advance_key = bool(advance_key)
         super().__init__(self.category)
 
 
-def _fail(category, *, advance_key=True):
-    raise RouterError(category, advance_key=advance_key) from None
+def _fail(category, reason, *, advance_key=True):
+    """Raise a chain-free RouterError. Never call it inside an `except` block (that sets __context__)."""
+    error = RouterError(category, reason=reason, advance_key=advance_key)
+    error.__cause__ = error.__context__ = None
+    raise error
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,13 +204,15 @@ class RouterClient:
                    cert_file=settings.ROUTER_CLIENT_CERT_FILE, key_file=settings.ROUTER_CLIENT_KEY_FILE)
 
     def _token(self):
+        token = None
         try:
             with open(self.token_file, encoding="ascii") as handle:
                 token = handle.read(1024).strip()
         except (OSError, UnicodeError, TypeError, ValueError):
-            _fail("model_auth")
-        if not _TOKEN.fullmatch(token):
-            _fail("model_auth")
+            pass
+        if token is None or not _TOKEN.fullmatch(token):
+            token = None
+            _fail("model_auth", "token")
         return token
 
     def token_available(self):
@@ -215,11 +253,13 @@ class RouterClient:
                 or not isinstance(prompt_version, str) or not 0 < len(prompt_version) <= 200
                 or type(max_output_tokens) is not int or not 16 <= max_output_tokens <= 8192
                 or type(deadline) is not int or not 5 <= deadline <= 900
-                or not isinstance(schema, dict) or not isinstance(messages, list) or not messages
+                or not isinstance(schema, dict) or not isinstance(messages, list)
+                or not 1 <= len(messages) <= MAX_MESSAGES
                 or any(not isinstance(message, dict) or set(message) != {"role", "content"}
-                       or not isinstance(message["content"], str) for message in messages)
+                       or message["role"] not in ROLES or not isinstance(message["content"], str)
+                       for message in messages)
                 or sum(len(message["content"]) for message in messages) > MAX_MESSAGE_CHARS):
-            _fail("model_config")
+            _fail("model_config", "refused")
         body = {"task_id": str(uuid.uuid5(_TASK_NAMESPACE, idempotency_key)),
                 "task_type": "structured_generation", "route": route, "principal": PRINCIPAL,
                 "messages": messages, "prompt_version": prompt_version,
@@ -228,60 +268,74 @@ class RouterClient:
                                  "data_classification": "internal"},
                 "generation": {"temperature": 0, "max_output_tokens": max_output_tokens},
                 "response_schema": schema}
+        data = None
         try:
             data = _canonical(body).encode("utf-8")
-        except (TypeError, ValueError, UnicodeError):
-            _fail("model_config")
-        if len(data) > MAX_REQUEST_BYTES:
-            _fail("model_config")
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            pass
+        if data is None or len(data) > MAX_REQUEST_BYTES:
+            _fail("model_config", "refused")
         context_limit, output_limit = ROUTE_LIMITS[route]
         if (max_output_tokens > output_limit
                 or estimated_context_tokens(messages, schema, max_output_tokens) > context_limit):
-            _fail("model_config")  # The router's _select would never find a candidate.
+            _fail("model_config", "too_large")  # The router's _select would never find a candidate.
         headers = {"Authorization": "Bearer " + self._token(), "Idempotency-Key": idempotency_key,
                    "Content-Type": "application/json", "Accept": "application/json"}
         timeout = (CONNECT_TIMEOUT_SECONDS, self.read_timeout or deadline + READ_MARGIN_SECONDS)
         session = self._session()
+        response, failure, status, raw = None, None, None, None
         try:
             try:
                 response = session.post(self.base_url + "/v1/model-tasks", data=data, headers=headers,
                                         timeout=timeout, verify=self.verify, cert=self.cert,
                                         allow_redirects=False, stream=True)
             except requests.exceptions.SSLError:
-                _fail("model_auth")
-            except (requests.Timeout, requests.ConnectionError):
-                _fail("router_busy", advance_key=False)
+                failure = ("model_auth", "tls", True)
+            except requests.Timeout:
+                failure = ("router_busy", "timeout", False)
+            except requests.ConnectionError:
+                failure = ("router_busy", "transport", False)
             except (requests.RequestException, OSError, ValueError):
-                _fail("model_config")
-            try:
-                status = response.status_code
-                raw = _read(response)
-            except (requests.RequestException, OSError):
-                _fail("router_busy", advance_key=False)
-            except ValueError:
-                _fail("model_invalid_output")
+                failure = ("model_config", "refused", True)
             finally:
-                response.close()
-            return self._outcome(status, _json_object(raw), response.headers)
+                del headers  # The token leaves this frame as soon as the request is sent.
+            if response is not None:
+                try:
+                    status = response.status_code
+                    raw = _read(response)
+                except (requests.RequestException, OSError):
+                    failure = ("router_busy", "transport", False)
+                except ValueError:
+                    failure = ("model_invalid_output", "malformed_output", True)
+                finally:
+                    response.close()
         finally:
             session.close()
+        if failure is not None:
+            category, reason, advance_key = failure
+            _fail(category, reason, advance_key=advance_key)
+        return self._outcome(status, _json_object(raw), response.headers)
 
     def _outcome(self, status, body, headers):
         if status == 200:
             if (not isinstance(body, dict) or body.get("status") != "succeeded"
                     or not isinstance(body.get("selected_model"), str) or "parsed_output" not in body):
-                _fail("model_invalid_output")
+                _fail("model_invalid_output", "malformed_output")
             if body["selected_model"] != self.expected_model:
-                _fail("model_mismatch")
+                _fail("model_mismatch", "mismatch")
             return RouterResult(body["parsed_output"], body["selected_model"], _usage(body.get("usage")),
                                 headers.get("Idempotent-Replayed") == "true")
         code = _error_code(body)
-        if status in (202, 429):
-            _fail("router_busy", advance_key=False)
+        if status == 202:
+            _fail("router_busy", "in_progress", advance_key=False)
+        if status == 429:
+            _fail("router_busy", "rate_limited", advance_key=False)
         if status in (401, 403):
-            _fail("model_auth")
+            _fail("model_auth", "unauthorized" if status == 401 else "forbidden")
         if status == 502 and code == "MODEL_OUTPUT_INVALID":
-            _fail("model_invalid_output")
+            _fail("model_invalid_output", "output_invalid")
         if 500 <= status <= 599:
-            _fail("router_busy", advance_key=code is not None)
-        _fail("model_config")
+            if code is None:
+                _fail("router_busy", "proxy", advance_key=False)
+            _fail("router_busy", "no_candidate" if code == "MODEL_NO_ELIGIBLE_CANDIDATE" else "router_failure")
+        _fail("model_config", "conflict" if status == 409 else "rejected")

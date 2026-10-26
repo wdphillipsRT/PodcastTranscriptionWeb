@@ -1,5 +1,6 @@
 """The router client against an in-process fake router; never the real router."""
 
+import hashlib
 import logging
 import socket
 import uuid
@@ -62,29 +63,59 @@ def test_a_repeated_key_replays_instead_of_generating_twice(fake_router):  # noq
     assert fake_router.generations == 1
 
 
-@pytest.mark.parametrize("status, payload, category, advance", [
-    (429, FakeRouter.error("MODEL_RATE_LIMITED"), "router_busy", False),
-    (202, {"status": "in_progress", "invocation_id": "inv-1", "trace_id": "t"}, "router_busy", False),
-    (503, FakeRouter.error("MODEL_NO_ELIGIBLE_CANDIDATE"), "router_busy", True),
-    (504, FakeRouter.error("MODEL_TIMEOUT"), "router_busy", True),
-    (500, FakeRouter.error("MODEL_ROUTER_INTERNAL"), "router_busy", True),
-    (502, FakeRouter.error("MODEL_PROVIDER_UNAVAILABLE"), "router_busy", True),
-    (502, b"", "router_busy", False),
-    (503, b"<html>proxy</html>", "router_busy", False),
-    (502, FakeRouter.error("MODEL_OUTPUT_INVALID"), "model_invalid_output", True),
-    (401, FakeRouter.error("MODEL_UNAUTHORIZED"), "model_auth", True),
-    (403, FakeRouter.error("MODEL_ROUTE_FORBIDDEN"), "model_auth", True),
-    (400, FakeRouter.error("MODEL_TASK_INVALID"), "model_config", True),
-    (404, FakeRouter.error("MODEL_ROUTE_NOT_FOUND"), "model_config", True),
-    (409, FakeRouter.error("LAMAD_IDEMPOTENCY_CONFLICT"), "model_config", True),
-    (413, FakeRouter.error("MODEL_CONTEXT_TOO_LARGE"), "model_config", True),
+@pytest.mark.parametrize("status, payload, category, reason, advance", [
+    (429, FakeRouter.error("MODEL_RATE_LIMITED"), "router_busy", "rate_limited", False),
+    (202, {"status": "in_progress", "invocation_id": "inv-1", "trace_id": "t"}, "router_busy", "in_progress", False),
+    (503, FakeRouter.error("MODEL_NO_ELIGIBLE_CANDIDATE"), "router_busy", "no_candidate", True),
+    (504, FakeRouter.error("MODEL_TIMEOUT"), "router_busy", "router_failure", True),
+    (500, FakeRouter.error("MODEL_ROUTER_INTERNAL"), "router_busy", "router_failure", True),
+    (502, FakeRouter.error("MODEL_PROVIDER_UNAVAILABLE"), "router_busy", "router_failure", True),
+    (502, b"", "router_busy", "proxy", False),
+    (503, b"<html>proxy</html>", "router_busy", "proxy", False),
+    (502, FakeRouter.error("MODEL_OUTPUT_INVALID"), "model_invalid_output", "output_invalid", True),
+    (401, FakeRouter.error("MODEL_UNAUTHORIZED"), "model_auth", "unauthorized", True),
+    (403, FakeRouter.error("MODEL_ROUTE_FORBIDDEN"), "model_auth", "forbidden", True),
+    (400, FakeRouter.error("MODEL_TASK_INVALID"), "model_config", "rejected", True),
+    (404, FakeRouter.error("MODEL_ROUTE_NOT_FOUND"), "model_config", "rejected", True),
+    (409, FakeRouter.error("LAMAD_IDEMPOTENCY_CONFLICT"), "model_config", "conflict", True),
+    (413, FakeRouter.error("MODEL_CONTEXT_TOO_LARGE"), "model_config", "rejected", True),
 ])
-def test_router_responses_map_to_closed_categories(fake_router, status, payload, category, advance):  # noqa: F811
+def test_router_responses_map_to_closed_categories(fake_router, status, payload, category, reason,  # noqa: F811
+                                                   advance):
     fake_router.reply(status, payload)
     error = failure(fake_router)
     retryable = category in {"router_busy", "model_invalid_output"}
-    assert (error.category, error.retryable, error.advance_key) == (category, retryable, advance)
+    assert (error.category, error.reason, error.retryable, error.advance_key) == (category, reason, retryable,
+                                                                                  advance)
+    assert error.reason in router_client.REASONS
     assert str(error) == category and "sanitized" not in repr(error)
+
+
+def test_a_key_still_running_on_the_router_replays_in_progress(fake_router):  # noqa: F811
+    # A generation the router never finished (it restarted mid-call): its store keeps the key in progress.
+    sent = router_client._canonical(fake_router_body("podcast.test:1")).encode("utf-8")
+    with fake_router._lock:
+        fake_router._stored["podcast.test:1"] = (hashlib.sha256(sent).hexdigest(), None, "inv-stuck")
+    error = failure(fake_router)
+    assert (error.category, error.reason, error.advance_key) == ("router_busy", "in_progress", False)
+    assert fake_router.generations == 0
+
+
+def fake_router_body(key):
+    return {"task_id": str(uuid.uuid5(router_client._TASK_NAMESPACE, key)), "task_type": "structured_generation",
+            "route": CLASSIFICATION_ROUTE, "principal": "intelligence:podcast", "messages": MESSAGES,
+            "prompt_version": "test-prompt/v1",
+            "requirements": {"local_only": True, "max_latency_ms": 30_000, "max_cost_usd": 0,
+                             "minimum_context_tokens": 2048, "required_modalities": ["text"],
+                             "data_classification": "internal"},
+            "generation": {"temperature": 0, "max_output_tokens": 64}, "response_schema": SCHEMA}
+
+
+def test_reasons_are_closed_and_optional():
+    assert RouterError("router_busy").reason is None
+    assert RouterError("router_busy", reason="in_progress", advance_key=False).reason == "in_progress"
+    assert RouterError("router_busy", reason="free text from a response").reason is None
+    assert RouterError("not a category").category == "model_config"
 
 
 def test_a_stored_busy_outcome_replays_until_the_key_advances(fake_router):  # noqa: F811
@@ -103,8 +134,16 @@ def test_a_task_too_large_for_the_route_is_refused_before_sending(fake_router, r
     with pytest.raises(RouterError) as caught:
         client(fake_router).run(route, [{"role": "user", "content": content}], SCHEMA, idempotency_key="k",
                                 prompt_version="v", max_output_tokens=max_output_tokens, deadline=30)
-    assert (caught.value.category, caught.value.retryable) == ("model_config", False)
+    assert (caught.value.category, caught.value.reason, caught.value.retryable) == ("model_config", "too_large",
+                                                                                    False)
     assert not fake_router.requests  # never a stored 503 MODEL_NO_ELIGIBLE_CANDIDATE that loops as busy
+
+
+def test_sixty_four_messages_in_known_roles_are_sent(fake_router):  # noqa: F811
+    messages = [{"role": ("system", "user", "assistant")[min(index, 1 + index % 2)], "content": "x"}
+                for index in range(64)]
+    assert client(fake_router).run(CLASSIFICATION_ROUTE, messages, SCHEMA, idempotency_key="k", prompt_version="v",
+                                   max_output_tokens=64, deadline=30).parsed == {"ok": True}
 
 
 def test_a_task_that_exactly_fits_the_route_is_sent(fake_router):  # noqa: F811
@@ -140,19 +179,20 @@ def test_malformed_success_bodies_are_invalid_output(fake_router, payload):  # n
 def test_a_different_model_is_a_permanent_mismatch(fake_router):  # noqa: F811
     fake_router.model = "qwen3:8b"
     error = failure(fake_router)
-    assert (error.category, error.retryable) == ("model_mismatch", False)
+    assert (error.category, error.reason, error.retryable) == ("model_mismatch", "mismatch", False)
 
 
 def test_timeouts_and_refused_connections_are_busy_without_advancing(fake_router):  # noqa: F811
     fake_router.delay = 1.0
     error = failure(fake_router, read_timeout=0.2)
-    assert (error.category, error.advance_key) == ("router_busy", False)
+    assert (error.category, error.reason, error.advance_key) == ("router_busy", "timeout", False)
     refused = RouterClient(f"http://127.0.0.1:{closed_port()}", token_file=fake_router.token_file,
                            expected_model=MODEL)
     with pytest.raises(RouterError) as caught:
         refused.run(GUEST_ROUTE, MESSAGES, SCHEMA, idempotency_key="k", prompt_version="v",
                     max_output_tokens=64, deadline=5)
-    assert (caught.value.category, caught.value.advance_key) == ("router_busy", False)
+    assert (caught.value.category, caught.value.reason, caught.value.advance_key) == ("router_busy", "transport",
+                                                                                      False)
 
 
 @pytest.mark.parametrize("content", ["", "short", "bad token with spaces " * 2, "x" * 513])
@@ -163,7 +203,8 @@ def test_an_unusable_token_fails_as_auth_before_any_request(fake_router, tmp_pat
     with pytest.raises(RouterError) as caught:
         bad.run(CLASSIFICATION_ROUTE, MESSAGES, SCHEMA, idempotency_key="k", prompt_version="v",
                 max_output_tokens=64, deadline=30)
-    assert caught.value.category == "model_auth" and not fake_router.requests
+    assert (caught.value.category, caught.value.reason) == ("model_auth", "token") and not fake_router.requests
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
     assert bad.token_available() is False
 
 
@@ -181,6 +222,9 @@ def test_a_missing_token_file_fails_as_auth(fake_router, tmp_path):  # noqa: F81
     dict(deadline=4), dict(deadline=901), dict(max_output_tokens=8193), dict(max_output_tokens=15),
     dict(prompt_version=""), dict(messages=[]),
     dict(messages=[{"role": "user", "content": "x" * 131_073}]),
+    dict(messages=[{"role": "user", "content": "x"}] * 65),
+    dict(messages=[{"role": "tool", "content": "x"}]),
+    dict(messages=[{"role": "developer", "content": "x"}]),
 ])
 def test_requests_the_router_would_refuse_are_never_sent(fake_router, change):  # noqa: F811
     arguments = dict(route=CLASSIFICATION_ROUTE, messages=MESSAGES, schema=SCHEMA, idempotency_key="k",
@@ -189,7 +233,7 @@ def test_requests_the_router_would_refuse_are_never_sent(fake_router, change):  
     route, messages, schema = (arguments.pop(name) for name in ("route", "messages", "schema"))
     with pytest.raises(RouterError) as caught:
         client(fake_router).run(route, messages, schema, **arguments)
-    assert caught.value.category == "model_config" and not fake_router.requests
+    assert (caught.value.category, caught.value.reason) == ("model_config", "refused") and not fake_router.requests
 
 
 def test_an_oversized_body_is_refused_before_sending(fake_router, monkeypatch):  # noqa: F811
@@ -197,12 +241,40 @@ def test_an_oversized_body_is_refused_before_sending(fake_router, monkeypatch): 
     assert failure(fake_router).category == "model_config" and not fake_router.requests
 
 
+def frame_values(error):
+    values, traceback = [], error.__traceback__
+    while traceback is not None:
+        values.extend(repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+    return " ".join(values)
+
+
 def test_the_token_never_reaches_errors_or_logs(fake_router, caplog):  # noqa: F811
     caplog.set_level(logging.DEBUG)
     fake_router.reply(503, FakeRouter.error("MODEL_NO_ELIGIBLE_CANDIDATE"))
     error = failure(fake_router)
     call(fake_router, key="podcast.test:3")
-    assert TOKEN not in repr(error) + repr(vars(error)) + caplog.text
+    assert TOKEN not in repr(error) + repr(vars(error)) + caplog.text + frame_values(error)
+    assert error.__context__ is None and error.__cause__ is None
+
+
+@pytest.mark.parametrize("scenario", ["timeout", "refused", "bad_body"])
+def test_transport_failures_carry_no_exception_chain_or_token(fake_router, scenario):  # noqa: F811
+    if scenario == "timeout":  # requests' ReadTimeout holds the prepared request and its Authorization header
+        fake_router.delay = 1.0
+        error = failure(fake_router, read_timeout=0.2)
+    elif scenario == "refused":
+        refused = RouterClient(f"http://127.0.0.1:{closed_port()}", token_file=fake_router.token_file,
+                               expected_model=MODEL)
+        with pytest.raises(RouterError) as caught:
+            refused.run(GUEST_ROUTE, MESSAGES, SCHEMA, idempotency_key="k", prompt_version="v",
+                        max_output_tokens=64, deadline=5)
+        error = caught.value
+    else:
+        fake_router.reply(200, b"not json")
+        error = failure(fake_router)
+    assert error.__context__ is None and error.__cause__ is None
+    assert TOKEN not in frame_values(error)
 
 
 def test_environment_proxies_are_ignored(fake_router, monkeypatch):  # noqa: F811
@@ -220,6 +292,10 @@ def test_readiness_needs_a_ready_router_and_fails_fast(fake_router):  # noqa: F8
     assert client(fake_router).ready() is False
     assert RouterClient(f"http://127.0.0.1:{closed_port()}", token_file="unused",
                         expected_model=MODEL).ready() is False
+
+
+def test_the_read_timeout_leaves_room_for_the_router_worst_case():
+    assert router_client.READ_MARGIN_SECONDS == 90  # the router answers by about deadline + 65 s
 
 
 def test_the_context_estimate_matches_the_pinned_router_formula():
