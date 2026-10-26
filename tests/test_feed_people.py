@@ -103,3 +103,59 @@ def test_youtube_sources_name_the_channel_owner_as_host():
     assert playlist.resolve_source(f"https://youtube.com/playlist?list={PLAYLIST}").hosts == ("Teacher",)
     video, _ = client_with(response(fixture("public_video")))
     assert video.resolve_source(f"https://youtu.be/{VIDEO}").hosts == ("Teacher",)
+
+
+GBK_FEED = ('<?xml version="1.0" encoding="GBK"?><rss version="2.0"><channel><title>节目</title>'
+            '<item><title>一</title><guid>g</guid><enclosure url="https://cdn.example/a.mp3" type="audio/mpeg"/></item>'
+            '</channel></rss>').encode("gbk")
+
+
+@pytest.mark.parametrize("body", [
+    GBK_FEED,
+    b'<?xml version="1.0" encoding="x-nope"?><rss version="2.0"><channel><title>Show</title></channel></rss>',
+])
+def test_encodings_expat_cannot_read_declare_nobody(body):
+    assert parse_feed_people(body) == FeedPeople()
+
+
+def test_gbk_feed_discovery_still_yields_its_items(source, settings):
+    page = discover_podcast_items(source, settings, Session(Response(GBK_FEED)))
+    assert [item.title for item in page.items] == ["一"]
+
+
+@pytest.mark.parametrize("role", ["host", "Co-Host", "cohost", " COHOST "])
+def test_co_hosts_count_as_hosts(role):
+    body = feed(b'<podcast:person xmlns:podcast="https://podcastindex.org/namespace/1.0" role="'
+                + role.encode() + b'">Pat Partner</podcast:person>')
+    assert parse_feed_people(body).hosts == ("Pat Partner",)
+
+
+@pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf"])
+def test_leading_whitespace_before_the_declaration_is_ignored(prefix):
+    people = parse_feed_people(prefix + b" \r\n\t" + PEOPLE_FEED)
+    assert people.hosts == ("Ada Host", "Grace Cohost")
+    assert parse_feed_people(prefix + PEOPLE_FEED).hosts == ("Ada Host", "Grace Cohost")
+
+
+def test_duplicate_guids_keep_the_first_items_guests():
+    body = feed(b'<item xmlns:podcast="https://podcastindex.org/namespace/1.0"><guid>same</guid>'
+                b'<podcast:person role="guest">First Guest</podcast:person></item>'
+                b'<item xmlns:podcast="https://podcastindex.org/namespace/1.0"><guid>same</guid>'
+                b'<podcast:person role="guest">Second Guest</podcast:person></item>')
+    assert dict(parse_feed_people(body).guests_by_guid) == {"same": ("First Guest",)}
+
+
+def test_person_names_rejects_a_bare_string():
+    with pytest.raises(TypeError):
+        person_names("Ada Lovelace", limit=5)
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_person_names_rejects_a_non_positive_limit(limit):
+    with pytest.raises(ValueError):
+        person_names(["Ada Lovelace"], limit=limit)
+
+
+@pytest.mark.parametrize("name", ["Bad\x80Name", "Bad\u202eName", "Bad\u200bName", "Bad\x9bName"])
+def test_person_names_drop_format_and_c1_control_characters(name):
+    assert person_names([name, "Kept"], limit=5) == ("Kept",)

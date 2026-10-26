@@ -7,6 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 import re
 from types import MappingProxyType
+import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -85,15 +86,20 @@ MAX_PERSON_NAME_CHARS = 300
 
 
 def person_names(values, *, limit: int) -> tuple[str, ...]:
-    """Display names: whitespace collapsed, empty/oversized/control-character
-    names dropped, case-insensitive duplicates removed, order kept, bounded."""
+    """Display names: whitespace collapsed, empty/oversized/control- or
+    format-character names dropped, case-insensitive duplicates removed, order
+    kept, bounded by a positive limit."""
+    if isinstance(values, (str, bytes)):
+        raise TypeError("person names must be an iterable of strings, not a string")
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("limit must be a positive integer")
     result, seen = [], set()
     for value in values or ():
         if not isinstance(value, str):
             raise TypeError("person names must be strings")
         name = " ".join(value.split())
         if (not name or len(name) > MAX_PERSON_NAME_CHARS
-                or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+                or any(unicodedata.category(char) in ("Cc", "Cf") for char in name)):
             continue
         if name.casefold() not in seen:
             seen.add(name.casefold())

@@ -2,8 +2,11 @@
 
 feedparser drops <podcast:person> attributes and merges <itunes:author> into
 <itunes:owner>, so these few elements are read from the same bounded feed body
-with the standard XML parser. A document with a DTD is never parsed, which
-rules out entity expansion; any parse failure simply declares nobody.
+with the standard XML parser. A document with a DTD or entity declaration is
+refused before parsing when it is in an ASCII-compatible encoding; any other
+encoding (UTF-16/32) is contained by expat's own entity-amplification limits.
+Any parse or decoding failure simply declares nobody: this lookup must never
+break discovery, which feedparser handles on its own.
 """
 
 from collections.abc import Mapping
@@ -16,6 +19,8 @@ from ingestion_types import person_names
 
 ITUNES = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
 PODCAST = "{https://podcastindex.org/namespace/1.0}"
+HOST_ROLES = frozenset({"host", "co-host", "cohost"})
+UTF8_BOM = b"\xef\xbb\xbf"
 MAX_HOSTS = 10
 MAX_GUESTS = 20
 
@@ -34,23 +39,28 @@ def _text(element):
     return element.text or "" if element is not None else ""
 
 
-def _people(parent, role):
+def _people(parent, roles):
     # The podcast namespace defines "host" as the default person role.
     return [_text(person) for person in parent.findall(PODCAST + "person")
-            if (person.get("role") or "host").strip().lower() == role]
+            if (person.get("role") or "host").strip().lower() in roles]
 
 
 def parse_feed_people(body: bytes) -> FeedPeople:
     if b"<!DOCTYPE" in body or b"<!ENTITY" in body:
         return FeedPeople()
+    # expat rejects anything before the XML declaration; feedparser does not.
+    bom = UTF8_BOM if body.startswith(UTF8_BOM) else b""
+    body = bom + body[len(bom):].lstrip(b" \t\r\n")
     try:
         root = ElementTree.fromstring(body)
-    except ElementTree.ParseError:
+    except (ElementTree.ParseError, ValueError, LookupError):
+        # ValueError: multi-byte encodings (GBK, Big5, Shift_JIS, EUC-KR);
+        # LookupError: an unknown encoding label.
         return FeedPeople()
     channel = root.find("channel")
     if channel is None:
         return FeedPeople()
-    hosts = person_names(_people(channel, "host"), limit=MAX_HOSTS)
+    hosts = person_names(_people(channel, HOST_ROLES), limit=MAX_HOSTS)
     if not hosts:
         # A single author/owner name is a seed for the administrator to confirm.
         candidates = (_text(channel.find(ITUNES + "author")),
@@ -59,7 +69,8 @@ def parse_feed_people(body: bytes) -> FeedPeople:
     guests = {}
     for item in channel.findall("item"):
         guid = _text(item.find("guid")).strip()
-        names = person_names(_people(item, "guest"), limit=MAX_GUESTS)
+        names = person_names(_people(item, {"guest"}), limit=MAX_GUESTS)
         if guid and names:
-            guests[guid] = names
+            # Discovery keeps the first item with a given guid; so do its guests.
+            guests.setdefault(guid, names)
     return FeedPeople(hosts, MappingProxyType(guests))
