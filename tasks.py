@@ -842,6 +842,24 @@ def get_classification_service():
         classifier=ClaudeClassifier(settings), settings=settings)
 
 
+@celery_app.task(name="tasks.export_knowledge", queue="knowledge")
+def export_knowledge():
+    """Nightly knowledge export; consumed only by the exporter service."""
+    with application_context():
+        from extensions import db
+        from integrations.knowledge import exporter
+        from models import utc_now
+        settings = SimpleNamespace(**dict(current_app.config))
+        try:
+            return exporter.export_knowledge(session=db.session, storage=get_processing_storage(),
+                settings=settings, inbox=settings.KNOWLEDGE_EXPORT_INBOX, now=utc_now()).as_dict()
+        except Exception:
+            db.session.rollback()
+            result = {"status": "failed", "reason": "unexpected_error"}
+            logging.getLogger(__name__).warning("knowledge_export_failed", extra={"knowledge_export": result})
+            return result
+
+
 def get_guest_extractor():
     """Construct lazily; only the classifier container holds Claude credentials."""
     from guest_extractor import ClaudeGuestExtractor

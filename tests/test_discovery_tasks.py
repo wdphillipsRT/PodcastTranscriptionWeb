@@ -21,7 +21,8 @@ def test_celery_configuration_is_json_utc_bounded_and_routes_named_queues():
     assert config.worker_prefetch_multiplier == 1 and config.broker_connection_retry_on_startup
     assert 0 < config.task_soft_time_limit < config.task_time_limit
     assert config.result_expires > 0
-    assert {q.name for q in config.task_queues} == {"default", "discovery", "downloads", "transcription", "classification"}
+    assert {q.name for q in config.task_queues} == {"default", "discovery", "downloads", "transcription",
+                                                    "classification", "knowledge"}
     for name in ("classify_item", "reconcile_classifications", "scan_source_rule"):
         assert config.task_routes["tasks." + name]["queue"] == "classification"
     assert config.beat_schedule["classification-reconciliation"]["task"] == "tasks.reconcile_classifications"

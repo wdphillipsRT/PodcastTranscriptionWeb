@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVICE_NAMES = {"postgres", "redis", "migrate", "web", "worker", "beat", "classifier"}
+SERVICE_NAMES = {"postgres", "redis", "migrate", "web", "worker", "beat", "classifier", "exporter"}
 
 
 @pytest.fixture
@@ -48,12 +48,12 @@ def test_one_shot_migration_and_app_dependency_order(compose):
     assert migrate.get("command") == ["flask", "--app", "app:create_app", "db", "upgrade"]
     assert migrate["restart"] == "no"
     assert migrate["depends_on"] == {"postgres": {"condition": "service_healthy"}, "redis": {"condition": "service_healthy"}}
-    for name in ("web", "worker", "beat", "classifier"):
+    for name in ("web", "worker", "beat", "classifier", "exporter"):
         assert services[name]["depends_on"] == {**migrate["depends_on"], "migrate": {"condition": "service_completed_successfully"}}
         assert services[name]["restart"] == "unless-stopped"
         assert services[name]["cap_drop"] == ["ALL"]
         assert services[name]["env_file"] == [".env"]
-        if name != "classifier":
+        if name not in {"classifier", "exporter"}:
             assert not services[name].get("volumes")
 
 
@@ -156,6 +156,7 @@ def test_direct_python_runtime_and_dev_requirements_are_pinned():
     ("start-web.sh", "database,redis,s3,transcribe,youtube,yt_dlp,deno"),
     ("start-worker.sh", "database,redis,s3,transcribe,youtube,yt_dlp,deno"),
     ("start-beat.sh", "database,redis,beat"),
+    ("start-exporter.sh", "database,redis,s3"),
 ])
 def test_startup_scripts_fail_closed_and_preserve_exec_arguments(script, selection, tmp_path):
     path = ROOT / "scripts" / script
@@ -315,3 +316,21 @@ def test_dockerignore_excludes_sensitive_and_local_material_but_ships_app_assets
         assert excluded(name), name
     for name in ("migrations/env.py", "migrations/versions/0001_media_foundation.py", "templates/index.html", "static/app.css", "scripts/start-web.sh", "scripts/start-worker.sh", "scripts/start-beat.sh", "scripts/start-classifier.sh"):
         assert not excluded(name), name
+
+
+def test_exporter_is_an_optional_profile_with_only_the_spool_inbox(compose):
+    exporter = compose["services"]["exporter"]
+    assert exporter["profiles"] == ["knowledge"]
+    assert exporter["entrypoint"] == ["/app/scripts/start-exporter.sh"]
+    assert exporter["command"] == ["celery", "-A", "tasks.celery_app", "worker", "--loglevel=info",
+                                   "--queues", "knowledge", "--concurrency", "1", "--hostname", "exporter@%h"]
+    assert exporter["environment"] == {"KNOWLEDGE_EXPORT_INBOX": "/spool/podcast/inbox"}
+    assert exporter["group_add"] == ["${PODCAST_INTAKE_GID:-65534}"]
+    assert exporter["volumes"] == [{"type": "bind", "target": "/spool/podcast/inbox",
+        "source": "${PODCAST_INTAKE_INBOX_HOST_PATH:-/srv/bezalel/intake/podcast/inbox}",
+        "bind": {"create_host_path": False}}]
+    assert exporter["cap_drop"] == ["ALL"] and not exporter.get("tmpfs") and not exporter.get("ports")
+    for name, service in compose["services"].items():
+        if name != "exporter":
+            assert "knowledge" not in repr(service.get("command", []))
+            assert "/spool" not in repr(service.get("volumes", [])) and not service.get("group_add")
