@@ -1,11 +1,13 @@
 """Information-only comparison: fixed sample across sources, per-segment agreement, nothing stored."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import sqlalchemy as sa
 
-from classification_compare import compare_models, select_sample
+import classification_compare
+from classification_compare import compare_item, compare_models, select_sample
 from extensions import db
 import models as m
 from router_classifier import ClassifierError
@@ -13,9 +15,12 @@ from tests.test_classification_service import add_item, finish
 from tests.test_classification_tasks import env, worker  # noqa: F401
 
 
-def classified(env, external_id, source=None):  # noqa: F811
+def classified(env, external_id, source=None, claude=None):  # noqa: F811
     env.item, env.transcript = add_item(env, external_id=external_id, source=source)
+    if claude is not None:
+        env.classifier.labels = claude(env.transcript)
     revision_id, _ = finish(env)
+    env.classifier.labels = {}
     db.session.execute(sa.update(m.ClassificationRevision).where(m.ClassificationRevision.id == revision_id)
                        .values(requested_model="claude-sonnet-5-5"))
     db.session.commit()
@@ -144,3 +149,53 @@ def test_the_command_prints_json_and_stops_on_a_permanent_router_error(worker): 
 def test_bounds_are_validated(worker, arguments):  # noqa: F811
     result = invoke(worker, "compare", *arguments)
     assert result.exit_code != 0 and not worker.env.classifier.calls
+
+
+def test_excluded_content_the_model_calls_editorial_is_counted(worker):  # noqa: F811
+    env = worker.env
+    classified(env, "claude-advert", claude=lambda transcript: {transcript.segments[1].id: ("paid_commercial", 0.99)})
+    total = compare(env)["total"]
+    assert (total["excluded_to_editorial"], total["raw_excluded_to_editorial"], total["editorial_to_excluded"]) == (1, 1, 0)
+    assert total["agreement"]["paid_commercial"] == {"agree": 0, "total": 1}
+    assert total["agreement"]["editorial"] == {"agree": 2, "total": 2}
+
+
+def test_a_sample_larger_than_the_eligible_items_takes_them_all(worker):  # noqa: F811
+    env = worker.env
+    items = {classified(env, "one"), classified(env, "two", source=env.other)}
+    report = compare(env, sample=20)
+    assert (report["selected"], report["total"]["items"]) == (2, 2)
+    assert {episode["item_id"] for episode in report["episodes"]} == items
+
+
+def test_items_whose_revision_no_longer_matches_are_not_sampled_or_are_unavailable(worker):  # noqa: F811
+    env = worker.env
+    stale = classified(env, "stale-transcript")
+    db.session.execute(sa.update(m.ContentItem).where(m.ContentItem.id == stale).values(transcript_sha256="f" * 64))
+    mismatched = classified(env, "policy-mismatch")
+    db.session.execute(sa.update(m.ClassificationRevision)
+                       .where(m.ClassificationRevision.item_id == mismatched).values(policy_sha256="0" * 64))
+    db.session.commit()
+    assert select_sample(db.session, sample=20, seed=1) == [mismatched]
+    calls = len(env.classifier.calls)
+    report = compare(env, sample=20)
+    assert report["episodes"] == [{"item_id": mismatched, "error": "unavailable"}]
+    assert report["total"]["items"] == 0 and len(env.classifier.calls) == calls
+    env.item, env.transcript = add_item(env, external_id="router-era")
+    finish(env)  # Not a Claude revision: refused even if it reaches compare_item.
+    with pytest.raises(ValueError, match="no longer a completed Claude revision"):
+        compare_item(db.session, env.service, env.item.id, max_blocks=1, run="t")
+
+
+def test_three_busy_episodes_in_a_row_stop_the_run(worker, monkeypatch):  # noqa: F811
+    env = worker.env
+    for n in range(4):
+        classified(env, f"busy-{n}")
+    waits = []
+    monkeypatch.setattr(classification_compare, "time", SimpleNamespace(sleep=waits.append, monotonic=lambda: 0.0))
+    env.classifier.error = ClassifierError("router_busy", advance_key=False)
+    env.classifier.calls.clear()
+    result = invoke(worker, "compare", "--sample", "4")
+    assert result.exit_code == 1 and "Comparison stopped: router_busy" in result.output
+    assert len(env.classifier.calls) == 3 * classification_compare.BUSY_ATTEMPTS
+    assert waits == [30, 60, 120, 240, 480] * 3

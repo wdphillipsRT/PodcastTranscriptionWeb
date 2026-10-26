@@ -3,9 +3,13 @@
 `compare_models` takes a fixed-seed sample of completed items whose active
 revision Claude produced, spread round-robin across sources. It classifies at
 most `max_blocks` windows of each with the current classifier and compares
-every target segment with the stored Claude policy, on the model's raw labels
-and again after the confidence threshold (so a near-miss advert that the
-threshold turns into `uncertain` is visible).
+every target segment with the stored Claude policy. Claude's side is always
+the label stored in its policy, which was already thresholded. The router side
+is counted twice: `raw_*` fields use the router's raw label as returned, before
+the confidence threshold; the other fields use the label after the threshold,
+as a real revision would store it. A near-miss advert that the threshold turns
+into `uncertain` therefore shows as agreement-changing in `raw_*` only and in
+`threshold_to_uncertain`.
 
 Nothing is written to the database or storage (the router keeps its own
 invocation records). Each item's inputs are read once and frozen for every
@@ -17,9 +21,12 @@ Like a block, a key is reused after a busy answer the router did not store and
 advances only after one it may have stored.
 
 A busy router is retried with the worker's back-off for a bounded number of
-attempts; the episode is then reported as skipped. Invalid model output is
-counted and the window skipped. Any other router error stops the run. The
-report holds only integer identifiers, counts and timings, never text.
+attempts; the episode is then reported as skipped, and after
+`MAX_CONSECUTIVE_BUSY` skipped episodes in a row the run stops as
+`router_busy`. Invalid model output is counted and the window skipped. Any
+other router error stops the run. An item whose revision, transcript or policy
+no longer matches is reported as unavailable. The report holds only integer
+identifiers, counts and timings, never text.
 """
 
 from collections import defaultdict
@@ -29,12 +36,14 @@ import uuid
 
 import sqlalchemy as sa
 
+from classification_service import ClassificationServiceError
 from commercial_policy import ELIGIBLE_LABELS, LABELS, SegmentPolicy, apply_confidence_threshold
 from models import ClassificationRevision, ContentItem
 from router_classifier import ClassifierError
 from s3_utils import DEFAULT_MAX_BYTES
 
 BUSY_ATTEMPTS = 6  # Waits 30, 60, 120, 240, 480 s between them: at most 15.5 minutes per window.
+MAX_CONSECUTIVE_BUSY = 3  # Busy-skipped episodes in a row before the whole run stops.
 _COUNTS = ("blocks", "segments", "editorial_to_excluded", "excluded_to_editorial", "raw_editorial_to_excluded",
            "raw_excluded_to_editorial", "model_uncertain", "raw_model_uncertain", "threshold_to_uncertain",
            "invalid_output", "busy_skipped")
@@ -58,6 +67,7 @@ def select_sample(session, *, sample, seed):
     rows = session.execute(sa.select(ContentItem.id, ClassificationRevision.source_id).join(
         ClassificationRevision, ClassificationRevision.id == ContentItem.active_classification_revision_id).where(
         ContentItem.status == "completed", ClassificationRevision.state == "completed",
+        ClassificationRevision.transcript_sha256 == ContentItem.transcript_sha256,
         ClassificationRevision.requested_model.like("claude-%")).order_by(ContentItem.id)).all()
     session.commit()
     by_source = defaultdict(list)
@@ -113,8 +123,10 @@ def compare_item(session, service, item_id, *, max_blocks, run, sleep=time.sleep
     item = session.get(ContentItem, item_id)
     revision = session.get(ClassificationRevision, item.active_classification_revision_id)
     policy_key, policy_sha256, source_id = revision.policy_s3_key, revision.policy_sha256, revision.source_id
-    transcript_sha256 = revision.transcript_sha256
+    transcript_sha256, state, requested_model = revision.transcript_sha256, revision.state, revision.requested_model
     session.commit()
+    if state != "completed" or not (requested_model or "").startswith("claude-"):
+        raise ValueError("active revision is no longer a completed Claude revision")
     if transcript_sha256 != inputs.transcript.transcript_sha256:
         raise ValueError("revision is not for the current transcript")
     policy = SegmentPolicy.from_json(service.storage.get_bytes(policy_key, max_bytes=DEFAULT_MAX_BYTES),
@@ -158,10 +170,11 @@ def _summary(report):
     return report
 
 
-def compare_models(*, session, service, sample, seed, max_blocks, sleep=time.sleep, monotonic=time.monotonic):
+def compare_models(*, session, service, sample, seed, max_blocks, sleep=None, monotonic=None):
+    sleep, monotonic = sleep or time.sleep, monotonic or time.monotonic
     run = uuid.uuid4().hex[:12]
     items = select_sample(session, sample=sample, seed=seed)
-    episodes, total = [], {"items": 0, **_empty()}
+    episodes, total, busy_in_a_row = [], {"items": 0, **_empty()}, 0
     for item_id in items:
         try:
             report = compare_item(session, service, item_id, max_blocks=max_blocks, run=run, sleep=sleep,
@@ -170,13 +183,18 @@ def compare_models(*, session, service, sample, seed, max_blocks, sleep=time.sle
             session.rollback()
             total["busy_skipped"] += 1
             episodes.append({"item_id": item_id, "skipped": "router_busy"})
+            busy_in_a_row += 1
+            if busy_in_a_row >= MAX_CONSECUTIVE_BUSY:
+                raise ClassifierError("router_busy", advance_key=False) from None
             continue
         except ClassifierError:
             raise
-        except Exception:
+        except (ValueError, ClassificationServiceError):
+            # Policy, transcript and storage errors are ValueErrors; anything else is a bug and surfaces.
             session.rollback()
             episodes.append({"item_id": item_id, "error": "unavailable"})
             continue
+        busy_in_a_row = 0
         total["items"] += 1
         for name in _COUNTS:
             total[name] += report[name]
