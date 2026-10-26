@@ -245,7 +245,7 @@ def test_environmental_failures_stop_the_run_unrecorded(ready, category):
     assert m.GuestExtraction.query.count() == 0 and len(ready.extractor.calls) == 1
 
 
-@pytest.mark.parametrize("category", ["claude_timeout", "claude_unavailable", "claude_invalid_output"])
+@pytest.mark.parametrize("category", ["claude_timeout", "claude_invalid_output"])
 def test_item_failures_after_start_are_recorded_at_the_cap_and_the_run_continues(ready, category):
     newer = newer_item(ready)
     ready.extractor.errors = [ClassifierError(category)]
@@ -254,6 +254,18 @@ def test_item_failures_after_start_are_recorded_at_the_cap_and_the_run_continues
     assert (failed.state, failed.error_category, failed.cost_microusd) == ("failed", category, 50_000)
     assert m.GuestExtraction.query.filter_by(item_id=ready.item.id).one().state == "completed"
     assert extract(ready)["scanned"] == 0 and len(ready.extractor.calls) == 2
+
+
+def test_an_unavailable_claude_records_that_item_and_stops_the_run(ready):
+    newer = newer_item(ready)
+    ready.extractor.errors = [ClassifierError("claude_unavailable")]
+    assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 1, "stopped": "claude_unavailable"}
+    failed = m.GuestExtraction.query.one()
+    assert (failed.item_id, failed.state, failed.error_category, failed.cost_microusd) == (
+        newer.id, "failed", "claude_unavailable", 50_000)
+    assert len(ready.extractor.calls) == 1
+    assert extract(ready) == {"scanned": 1, "extracted": 1, "failed": 0, "stopped": None}
+    assert m.GuestExtraction.query.filter_by(item_id=ready.item.id).one().state == "completed"
 
 
 def test_failures_still_respect_the_daily_budget(ready):

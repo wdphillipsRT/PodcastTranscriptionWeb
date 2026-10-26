@@ -13,7 +13,10 @@ stops when that spend plus the per-call cap would exceed the daily budget. A
 call that started and then timed out, exited unsuccessfully, or returned
 unusable output is recorded as failed, charged at the per-call cap (or at the
 reported cost when that is higher), and never retried for the same input; the
-run then moves on to the next item. Only environmental failures, where the call
+run then moves on to the next item, except after claude_unavailable (an
+outage or rate limit that would fail every later item too), which still
+records that one item, so a genuinely stuck item cannot block the queue, and
+then stops the run. Only environmental failures, where the call
 never ran or could not have succeeded for any item (authentication,
 configuration, a missing or unstartable CLI, a model other than the pinned
 one), stop the run without a record, so daily spend is at most the daily budget
@@ -63,6 +66,9 @@ MAX_OUTPUT_BYTES = 65_536
 # claude_unavailable, and claude_invalid_output happen only after the CLI has
 # started and may be caused by the item, so they are recorded and not retried.
 ENVIRONMENTAL = frozenset({"claude_auth", "claude_config", "model_mismatch"})
+# Recorded like any started call, but likely to fail every later call too
+# (an outage or rate limit), so the run stops after recording it.
+STOPS_AFTER_RECORDING = frozenset({"claude_unavailable"})
 RUN_DEADLINE_SECONDS = 600
 RUN_LOCK_KEY = 0x5047_5545_5354_0001
 
@@ -249,7 +255,8 @@ def extract_pending_guests(*, session, extractor, settings, clock=None, monotoni
     per-call cap still fits and the call cannot outlast RUN_DEADLINE_SECONDS.
     A failure after the CLI started is recorded as failed at the per-call cap
     (or the higher reported cost) and is not retried for the same input; the
-    run continues. Environmental failures stop the run without a record.
+    run continues, except after claude_unavailable, which stops it once that
+    item is recorded. Environmental failures stop the run without a record.
     """
     from models import utc_now
     clock = clock or utc_now
@@ -299,6 +306,9 @@ def _extract(session, extractor, settings, clock, monotonic, counts):
                 cost_microusd=max(ceiling, getattr(error, "cost_microusd", 0)), created_at=clock()))
             session.commit()
             counts["failed"] += 1
+            if error.category in STOPS_AFTER_RECORDING:
+                counts["stopped"] = error.category
+                break
             continue
         session.add(GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], state="completed",
             guests=[{"name": name, "confidence": confidence} for name, confidence in result.guests],
