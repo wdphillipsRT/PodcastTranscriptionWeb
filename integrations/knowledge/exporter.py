@@ -12,7 +12,11 @@ A batch is reserved (state `pending`, with its item rows) and committed before
 `write_podcast_batch` publishes it, then marked `written`. A `pending` batch
 left by a crash is reconciled on the next run: present in the inbox means
 `written`; otherwise `abandoned` (its own staging directory is removed), and
-its items are exported again under a new generation.
+its items are exported again under a new generation. A write that fails after
+the batch is already in the inbox (the inbox fsync) also leaves it `pending`.
+Each item's records are checked against the contract before they join a
+batch, so one invalid item is skipped (`invalid_record`) instead of failing
+every batch it would join.
 """
 
 from collections import Counter
@@ -28,7 +32,9 @@ import stat
 
 import sqlalchemy as sa
 
-from integrations.knowledge.contract import ContractError, canonical_json, person_entity_id, write_podcast_batch
+from integrations.knowledge.contract import (
+    ContractError, canonical_json, check_podcast_record, person_entity_id, write_podcast_batch,
+)
 from integrations.knowledge.people import guest_input_sha256, has_host, item_guests, participants, source_hosts
 from integrations.knowledge.records import (
     build_records, episode_facts, episode_native_id, payload_sha256, publisher_name, timestamp,
@@ -93,9 +99,17 @@ def _preflight(inbox):
     return None
 
 
+def _open_lock(inbox):
+    """Open (creating 0660) the run lock; never through a symlink."""
+    previous = os.umask(0o007)
+    try:
+        return os.open(inbox / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o660)
+    finally:
+        os.umask(previous)
+
+
 @contextmanager
-def _locked(inbox):
-    descriptor = os.open(inbox / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o660)
+def _locked(descriptor):
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -111,7 +125,7 @@ def _reconcile(session, inbox):
     counts = {"written": 0, "abandoned": 0}
     for batch in session.scalars(sa.select(KnowledgeExportBatch).where(KnowledgeExportBatch.state == "pending")
                                  .order_by(KnowledgeExportBatch.id)):
-        if (inbox / batch.batch_id).is_dir():
+        if _is_real_dir(inbox / batch.batch_id):
             batch.state, batch.written_at = "written", utc_now()
             counts["written"] += 1
         else:
@@ -120,6 +134,10 @@ def _reconcile(session, inbox):
             counts["abandoned"] += 1
     session.commit()
     return counts
+
+
+def _is_real_dir(path):
+    return path.is_dir() and not path.is_symlink()
 
 
 def _candidates(session, since, until):
@@ -178,8 +196,8 @@ def _batch_id(session, inbox, now):
     sequence = 1 + (session.scalar(sa.select(sa.func.max(KnowledgeExportBatch.sequence)).where(
         KnowledgeExportBatch.run_date == run_date)) or 0)
     # Never reuse a name that is already present in the inbox for any reason.
-    while (inbox / f"podcast-{run_date}-{sequence:03d}").exists() or (
-            inbox / f".tmp-podcast-{run_date}-{sequence:03d}").exists():
+    while os.path.lexists(inbox / f"podcast-{run_date}-{sequence:03d}") or os.path.lexists(
+            inbox / f".tmp-podcast-{run_date}-{sequence:03d}"):
         sequence += 1
     if sequence > 999:
         raise ExportFailed("sequence_exhausted")
@@ -206,10 +224,16 @@ def _flush(session, inbox, now, pending):
         write_podcast_batch(inbox, batch_id=batch_id, producer_version=PRODUCER_VERSION,
                             created_at=timestamp(now), records=records, blobs=blobs)
     except (ContractError, OSError) as error:
-        batch.state = "failed"
-        batch.error_category = "contract_error" if isinstance(error, ContractError) else "write_failed"
-        session.commit()
-        raise ExportFailed(batch.error_category) from None
+        category = "contract_error" if isinstance(error, ContractError) else "write_failed"
+        if isinstance(error, OSError) and _is_real_dir(inbox / batch_id):
+            # Renamed into the inbox, then a later step (the inbox fsync) failed: the
+            # intake may already see it. Leave it pending so the next run's reconcile
+            # confirms it from the inbox once more, after the filesystem has settled.
+            session.rollback()
+        else:
+            batch.state, batch.error_category = "failed", category
+            session.commit()
+        raise ExportFailed(category) from None
     finally:
         os.umask(previous)
     batch.state, batch.written_at = "written", utc_now()
@@ -224,19 +248,29 @@ def export_knowledge(*, session, storage, settings, inbox, now, since=None, unti
     those return a `skipped` report and log a warning, so transcription and
     classification are never blocked by the knowledge intake.
     """
+    if max_batches is None:
+        max_batches = settings.KNOWLEDGE_EXPORT_MAX_BATCHES_PER_RUN
+    if isinstance(max_batches, bool) or not isinstance(max_batches, int) or max_batches < 1:
+        raise ValueError("max_batches must be a positive integer")
     report = ExportReport()
     inbox = Path(inbox)
     reason = "disabled" if not settings.KNOWLEDGE_EXPORT_ENABLED else _preflight(inbox)
     if reason is None:
-        with _locked(inbox) as acquired:
+        try:
+            descriptor = _open_lock(inbox)
+        except OSError:
+            reason = "inbox_unwritable"
+    if reason is None:
+        with _locked(descriptor) as acquired:
             if acquired:
-                _export(session, storage, settings, inbox, now, since, until,
-                        max_batches or settings.KNOWLEDGE_EXPORT_MAX_BATCHES_PER_RUN, report)
+                _export(session, storage, settings, inbox, now, since, until, max_batches, report)
             else:
                 reason = "busy"
     if reason is not None:
         report.status, report.reason = "skipped", reason
         log.warning("knowledge_export_skipped", extra={"knowledge_export": report.as_dict()})
+    elif report.status == "failed":
+        log.warning("knowledge_export_failed", extra={"knowledge_export": report.as_dict()})
     else:
         log.info("knowledge_export_" + report.status, extra={"knowledge_export": report.as_dict()})
     return report
@@ -266,6 +300,14 @@ def _export(session, storage, settings, inbox, now, since, until, max_batches, r
                 continue
             records, blobs = build_records(plan.facts, generation=plan.generation, supersedes=plan.supersedes,
                                            segments=projection.segments)
+            try:
+                for record in records:
+                    check_podcast_record(record)
+            except ContractError as error:
+                # One bad item must not fail every batch it would join, night after night.
+                skipped["invalid_record"] += 1
+                log.warning("knowledge_export_invalid_record", extra={"item_id": item_id, "error": str(error)})
+                continue
             size = sum(len(canonical_json(record)) + 1 for record in records) + sum(map(len, blobs.values()))
             if len(records) > limit or size > MAX_BATCH_PAYLOAD_BYTES:
                 skipped["too_large"] += 1

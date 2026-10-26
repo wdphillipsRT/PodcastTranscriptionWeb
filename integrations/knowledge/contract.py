@@ -13,13 +13,13 @@ from pathlib import Path
 # vendor/ and vendor/reference/ import as namespace packages: an __init__.py there
 # would be an unpinned file and fail the PIN exactness test.
 from integrations.knowledge.vendor.reference.knowledge_contract import (
-    MAX_BATCH_BYTES, MAX_RECORDS, PLATFORMS, BatchSummary, ContractError, canonical_json,
+    MAX_BATCH_BYTES, MAX_RECORDS, PLATFORMS, BatchSummary, ContractError, canonical_json, check_record,
     person_entity_id, record_hash, validate_batch, write_batch,
 )
 
 __all__ = [
     "MAX_BATCH_BYTES", "MAX_RECORDS", "PLATFORMS", "PRODUCER", "VENDOR_ROOT", "BatchSummary",
-    "ContractError", "canonical_json", "person_entity_id", "record_hash", "schema_validator",
+    "ContractError", "canonical_json", "check_podcast_record", "person_entity_id", "record_hash", "schema_validator",
     "validate_podcast_batch", "write_podcast_batch",
 ]
 
@@ -46,6 +46,24 @@ def schema_validator():
         validators[name].validate(document)
 
     return validate
+
+
+def check_podcast_record(record: Mapping) -> None:
+    """Validate one podcast record alone: the real schema, then the oracle's semantic checks.
+
+    Raises only ContractError, naming where a violation is but never its value.
+    """
+    from jsonschema import ValidationError
+
+    try:
+        schema_validator()("record", record)
+    except ValidationError as error:
+        where = "/".join(str(part) for part in error.absolute_path)
+        raise ContractError(f"record schema violation{f' at {where}' if where else ''}") from None
+    try:
+        check_record(record, PRODUCER)
+    except (KeyError, TypeError, AttributeError):
+        raise ContractError("malformed record") from None
 
 
 def validate_podcast_batch(path: Path) -> BatchSummary:
