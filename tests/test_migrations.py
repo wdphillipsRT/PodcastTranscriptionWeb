@@ -217,6 +217,9 @@ def test_router_classification_migration_adds_and_removes_the_block_key_generati
         assert columns["request_generation"]["nullable"] is False
         assert str(columns["request_generation"]["default"]).strip("'\"") == "0"
         assert columns["request_generation_started_at"]["nullable"] is True
+        guest = {column["name"]: column for column in sa.inspect(connection).get_columns("guest_extractions")}
+        assert guest["router_failures"]["nullable"] is False
+        assert str(guest["router_failures"]["default"]).strip("'\"") == "0"
         assert connection.scalar(sa.text("select version_num from alembic_version")) == "0004_router_classification"
         context = MigrationContext.configure(connection, opts={"compare_type": True, "compare_server_default": True})
         assert compare_metadata(context, db.metadata) == []
@@ -225,6 +228,7 @@ def test_router_classification_migration_adds_and_removes_the_block_key_generati
     with app.app_context(), db.engine.connect() as connection:
         names = {c["name"] for c in sa.inspect(connection).get_columns("classification_blocks")}
         assert not {"request_generation", "request_generation_started_at"} & names
+        assert "router_failures" not in {c["name"] for c in sa.inspect(connection).get_columns("guest_extractions")}
 
 
 def test_router_classification_migration_renders_postgresql():
@@ -243,3 +247,5 @@ def test_router_classification_migration_renders_postgresql():
     assert "ALTER TABLE classification_blocks ADD COLUMN request_generation_started_at TIMESTAMP WITH TIME ZONE" in statements
     assert "ALTER TABLE classification_blocks DROP COLUMN request_generation" in statements
     assert "ALTER TABLE classification_blocks DROP COLUMN request_generation_started_at" in statements
+    assert "ALTER TABLE guest_extractions ADD COLUMN router_failures INTEGER DEFAULT '0' NOT NULL" in statements
+    assert "ALTER TABLE guest_extractions DROP COLUMN router_failures" in statements

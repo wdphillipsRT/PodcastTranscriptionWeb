@@ -334,7 +334,8 @@ def test_isolated_check_has_hard_deadline_and_no_credentials_in_argv(checks, mon
     assert kwargs["start_new_session"] is True
     payload = json.loads(process.communicate.call_args.kwargs["input"])
     assert payload == {"YOUTUBE_API_KEY": "synthetic-secret"}
-    assert 0 < process.communicate.call_args.kwargs["timeout"] <= 10
+    # Beyond the router client's 10 s connect timeout, and still bounded.
+    assert 0 < process.communicate.call_args.kwargs["timeout"] <= 15
 
 
 def test_timed_out_probe_kills_and_reaps_process_group(checks, monkeypatch):
@@ -407,6 +408,12 @@ def test_classifier_components_are_selectable_but_not_part_of_web_readiness(app,
     assert result.exit_code == 0, result.output
     assert calls == ["database", "redis", "s3", "claude_absent", "router"]
     assert "router" not in checks.COMPONENTS and "claude_absent" not in checks.COMPONENTS
+
+
+def test_the_probe_child_outlives_the_router_client_connect_timeout():
+    import router_client
+    import system_checks
+    assert system_checks.PROBE_TIMEOUT_SECONDS == 12 > router_client.CONNECT_TIMEOUT_SECONDS
 
 
 def test_router_probe_payload_carries_paths_never_secrets(checks, monkeypatch):

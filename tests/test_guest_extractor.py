@@ -277,16 +277,57 @@ def test_a_busy_router_stops_the_run_unrecorded_and_the_item_waits_for_the_next_
     assert extract(ready) == {"scanned": 2, "extracted": 2, "failed": 0, "stopped": None}
 
 
+def router_failure():
+    return RouterError("router_busy", reason="router_failure")
+
+
 def test_a_router_failure_is_recorded_and_stops_the_run_so_the_next_run_moves_on(ready):
     """A provider timeout (504 MODEL_TIMEOUT) would recur for the newest item and block every run."""
     newer = newer_item(ready)
-    ready.extractor.errors = [RouterError("router_busy", reason="router_failure")]
+    ready.extractor.errors = [router_failure()]
     assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 1, "stopped": "router_busy"}
     failed = m.GuestExtraction.query.one()
-    assert (failed.item_id, failed.state, failed.error_category, failed.cost_microusd, failed.model) == (
-        newer.id, "failed", "router_busy", 0, MODEL)
-    assert extract(ready) == {"scanned": 1, "extracted": 1, "failed": 0, "stopped": None}
+    assert (failed.item_id, failed.state, failed.error_category, failed.cost_microusd, failed.model,
+            failed.router_failures) == (newer.id, "failed", "router_busy", 0, MODEL, 1)
+    ready.extractor.errors = [None, router_failure()]
+    assert extract(ready) == {"scanned": 2, "extracted": 1, "failed": 1, "stopped": "router_busy"}
     assert m.GuestExtraction.query.filter_by(item_id=ready.item.id).one().state == "completed"
+
+
+def test_router_failures_are_retried_after_fresh_items_and_abandoned_after_three(ready):
+    newer = newer_item(ready)
+    ready.extractor.errors = [router_failure()]
+    extract(ready)
+    # The fresh (older) item goes first; the input that failed is retried after it.
+    ready.extractor.errors = [None, router_failure()]
+    assert extract(ready) == {"scanned": 2, "extracted": 1, "failed": 1, "stopped": "router_busy"}
+    assert [key.split(":")[1] for key in ready.extractor.keys] == [
+        f"item-{newer.id}", f"item-{ready.item.id}", f"item-{newer.id}"]
+    ready.extractor.errors = [router_failure()]
+    assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 1, "stopped": "router_busy"}
+    row = m.GuestExtraction.query.filter_by(item_id=newer.id).one()
+    assert (row.state, row.error_category, row.router_failures) == (
+        "failed", "router_busy", guest_extractor.MAX_ROUTER_FAILURES)
+    assert extract(ready)["scanned"] == 0 and len(ready.extractor.calls) == 4
+
+
+def test_a_retried_input_that_succeeds_completes_its_row(ready):
+    later = datetime(2026, 10, 22, 13, 0, tzinfo=timezone.utc)
+    ready.extractor.errors = [router_failure()]
+    extract(ready)
+    assert extract(ready, clock=lambda: later)["extracted"] == 1
+    row = m.GuestExtraction.query.one()
+    assert (row.state, row.error_category, row.guests, row.router_failures, row.created_at) == (
+        "completed", None, [{"name": "James Clear", "confidence": 0.92}], 1, later)
+
+
+def test_a_retried_input_with_invalid_output_is_abandoned(ready):
+    ready.extractor.errors = [router_failure(), RouterError("model_invalid_output")]
+    extract(ready)
+    assert extract(ready)["failed"] == 1
+    row = m.GuestExtraction.query.one()
+    assert (row.state, row.error_category, row.router_failures) == ("failed", "model_invalid_output", 1)
+    assert extract(ready)["scanned"] == 0
 
 
 @pytest.mark.parametrize("reason", ["in_progress", "rate_limited", "timeout", "transport", "proxy", "no_candidate"])
@@ -320,19 +361,22 @@ def test_todays_calls_are_reread_per_call_and_rows_are_stamped_when_recorded(rea
 
 
 def test_no_call_starts_that_could_outlast_the_run_deadline(ready):
-    """A call can take its deadline plus the client's connect timeout and read margin."""
+    """A call can take its deadline plus the client's connect timeout and read margin; a run lasts
+    at most RUN_DEADLINE_SECONDS (10 minutes) unless one call alone needs longer."""
     newer_item(ready)
-    worst = 60 + CONNECT_TIMEOUT_SECONDS + READ_MARGIN_SECONDS
-    last_start = guest_extractor.RUN_DEADLINE_SECONDS - worst
+    assert guest_extractor.RUN_DEADLINE_SECONDS == 600
+    last_start = 600 - (60 + CONNECT_TIMEOUT_SECONDS + READ_MARGIN_SECONDS)
     monotonic = lambda: 0.0 if not ready.extractor.calls else last_start + 1.0  # noqa: E731
     assert extract(ready, monotonic=monotonic, GUEST_EXTRACTION_TIMEOUT_SECONDS=60) == {
         "scanned": 1, "extracted": 1, "failed": 0, "stopped": "run_deadline"}
     assert extract(ready, monotonic=lambda: float(last_start), GUEST_EXTRACTION_TIMEOUT_SECONDS=60)["extracted"] == 1
 
 
-def test_the_longest_allowed_call_still_fits_one_run(ready):
-    assert 600 + CONNECT_TIMEOUT_SECONDS + READ_MARGIN_SECONDS <= guest_extractor.RUN_DEADLINE_SECONDS
-    assert extract(ready, GUEST_EXTRACTION_TIMEOUT_SECONDS=600)["extracted"] == 1
+def test_the_longest_allowed_call_still_runs_once_per_run(ready):
+    newer_item(ready)
+    monotonic = lambda: 0.0 if not ready.extractor.calls else 1.0  # noqa: E731
+    assert extract(ready, monotonic=monotonic, GUEST_EXTRACTION_TIMEOUT_SECONDS=600) == {
+        "scanned": 1, "extracted": 1, "failed": 0, "stopped": "run_deadline"}
 
 
 class _Connection:

@@ -47,6 +47,8 @@ LEGACY_CLASSIFICATION_ERRORS = {"claude_timeout": "router_busy", "claude_unavail
 def current_error_category(category):
     """A stored error category in router-era terms (Claude-era names mapped, others unchanged)."""
     return LEGACY_CLASSIFICATION_ERRORS.get(category, category)
+
+
 # A 202 in_progress this long after the key's first send (beyond the call's own
 # deadline + read margin) means the router lost the generation: it restarted and
 # never expires in-progress keys. The key then advances.

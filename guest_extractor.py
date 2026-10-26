@@ -11,19 +11,23 @@ Limits: before each call the run re-reads today's (UTC) recorded calls and stops
 at GUEST_EXTRACTION_MAX_CALLS_PER_DAY (`daily_limit`). Only recorded calls count:
 the unrecorded call that stops a run (busy or environmental, below) is not
 counted, and there is at most one per run. At most
-GUEST_EXTRACTION_MAX_ITEMS_PER_RUN items run per hourly run, and no call starts
-that could outlast RUN_DEADLINE_SECONDS, counting the call's deadline plus the
-client's connect timeout and read margin. Each input is extracted once: an
-invalid result is recorded as failed and never retried for that input, and the
-run moves on. A busy router (`router_busy`: in progress, rate limited, a timeout,
-a dropped connection, the proxy, no eligible candidate) stops the run without a
-record, so the item is tried again next run. A router failure with the router's
-own error body (`router_busy` with reason `router_failure`, such as 504
-MODEL_TIMEOUT for an input the model never finishes) is recorded as failed and
-then stops the run: items run newest first under a new key each run, so leaving
-it unrecorded would retry that input first in every run and block every other
-item. Environmental failures (authentication, configuration, a model other than
-the pinned one) stop the run unrecorded. Router calls cost nothing;
+GUEST_EXTRACTION_MAX_ITEMS_PER_RUN items run per hourly run. No call starts that
+could outlast the run deadline, counting the call's deadline plus the client's
+connect timeout and read margin; the deadline is RUN_DEADLINE_SECONDS, or one
+call's worst case when that is longer, so a run always has room for one call.
+
+Each input is extracted once: an invalid result is recorded as failed and never
+retried for that input, and the run moves on. A busy router (`router_busy`: in
+progress, rate limited, a timeout, a dropped connection, the proxy, no eligible
+candidate) stops the run without a record, so the item is tried again next run.
+A router failure with the router's own error body (`router_busy` with reason
+`router_failure`: 504 MODEL_TIMEOUT for an input the model never finishes, 502
+for an unavailable provider, 500) is recorded as failed (`router_busy`) and
+then stops the run. Such an input is retried on later runs, after every input
+never tried, so it cannot block them, and is abandoned after
+MAX_ROUTER_FAILURES recorded router failures; its one row is updated in place.
+Environmental failures (authentication, configuration, a model other than the
+pinned one) stop the run unrecorded. Router calls cost nothing;
 `cost_microusd` is recorded as 0. Runs never overlap (a PostgreSQL session
 advisory lock).
 """
@@ -65,9 +69,13 @@ OUTPUT_SCHEMA = {
 MAX_DESCRIPTION_CHARS = 6_000
 # Failures no item can fix: they stop the run unrecorded.
 ENVIRONMENTAL = frozenset({"model_auth", "model_config", "model_mismatch"})
-# Room for one call at the longest GUEST_EXTRACTION_TIMEOUT_SECONDS (600) plus the
-# client's connect timeout and read margin; well inside the 1800 s soft time limit.
-RUN_DEADLINE_SECONDS = 900
+# A run lasts at most 10 minutes, or one call when a single call (its deadline plus the
+# client's connect timeout and read margin, at most 700 s) needs longer; well inside
+# the 1800 s soft time limit.
+RUN_DEADLINE_SECONDS = 600
+# An input the router itself failed on (reason router_failure) is retried on later runs,
+# after inputs never tried, and abandoned after this many recorded router failures.
+MAX_ROUTER_FAILURES = 3
 RUN_LOCK_KEY = 0x5047_5545_5354_0001
 
 
@@ -235,23 +243,49 @@ def extract_pending_guests(*, session, extractor, settings, clock=None, monotoni
         return _extract(session, extractor, settings, clock, monotonic, counts)
 
 
+def _record(session, entry, clock, *, router_failure=False, **outcome):
+    """Write the input's one row: a new row, or the retried row after a recorded router failure.
+
+    Each recorded call stamps `created_at`, so the daily call limit counts a row on the day
+    of its latest call (a retried input's earlier calls that day go uncounted: at most
+    MAX_ROUTER_FAILURES - 1 per input)."""
+    from models import GuestExtraction
+    row = session.get(GuestExtraction, entry["row_id"]) if entry["row_id"] is not None else None
+    if row is None:
+        row = GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], router_failures=0)
+        session.add(row)
+    row.state, row.guests, row.error_category = outcome["state"], outcome.get("guests"), outcome.get("error_category")
+    row.model, row.cost_microusd, row.created_at = outcome["model"], 0, clock()
+    if router_failure:
+        row.router_failures = (row.router_failures or 0) + 1
+    session.commit()
+
+
 def _extract(session, extractor, settings, clock, monotonic, counts):
     from models import GuestExtraction
     started = monotonic()
+    longest_call = settings.GUEST_EXTRACTION_TIMEOUT_SECONDS + CONNECT_TIMEOUT_SECONDS + READ_MARGIN_SECONDS
+    deadline = max(RUN_DEADLINE_SECONDS, longest_call)  # Room for one call even at the longest timeout.
     run = clock().strftime("%Y%m%dT%H%M%SZ")
-    done = {tuple(row) for row in session.execute(sa.select(GuestExtraction.item_id, GuestExtraction.input_sha256))}
-    work = []
+    rows = {(item_id, digest): (row_id, retryable) for row_id, item_id, digest, retryable in session.execute(
+        sa.select(GuestExtraction.id, GuestExtraction.item_id, GuestExtraction.input_sha256,
+                  (GuestExtraction.state == "failed") & (GuestExtraction.error_category == "router_busy")
+                  & (GuestExtraction.router_failures < MAX_ROUTER_FAILURES)))}
+    fresh, retries = [], []
     for item, source in _candidates(session):
         digest = guest_input_sha256(item)
-        if (item.id, digest) not in done:
-            work.append(dict(item_id=item.id, digest=digest, show=source.name, hosts=source_hosts(source)[0],
-                             title=item.title, description=item.description or ""))
-        if len(work) == settings.GUEST_EXTRACTION_MAX_ITEMS_PER_RUN:
+        row_id, retryable = rows.get((item.id, digest), (None, True))
+        if retryable:  # Inputs never tried come first; inputs the router failed on are retried after them.
+            (fresh if row_id is None else retries).append(dict(
+                item_id=item.id, digest=digest, row_id=row_id, show=source.name, hosts=source_hosts(source)[0],
+                title=item.title, description=item.description or ""))
+        if len(fresh) == settings.GUEST_EXTRACTION_MAX_ITEMS_PER_RUN:
             break
+    work = (fresh + retries)[:settings.GUEST_EXTRACTION_MAX_ITEMS_PER_RUN]
     session.commit()  # No database transaction is held across a router call.
+    model = settings.ROUTER_EXPECTED_MODEL
     for entry in work:
-        longest_call = settings.GUEST_EXTRACTION_TIMEOUT_SECONDS + CONNECT_TIMEOUT_SECONDS + READ_MARGIN_SECONDS
-        if monotonic() - started + longest_call > RUN_DEADLINE_SECONDS:
+        if monotonic() - started + longest_call > deadline:
             counts["stopped"] = "run_deadline"
             break
         if _calls_today(session, clock()) >= settings.GUEST_EXTRACTION_MAX_CALLS_PER_DAY:
@@ -263,22 +297,18 @@ def _extract(session, extractor, settings, clock, monotonic, counts):
             result = extractor.extract(show=entry["show"], hosts=entry["hosts"], title=entry["title"],
                                        description=entry["description"], request_key=key)
         except RouterError as error:
-            recorded_busy = error.category == "router_busy" and error.reason == "router_failure"
-            if error.category in ENVIRONMENTAL or (error.category == "router_busy" and not recorded_busy):
+            router_failure = error.category == "router_busy" and error.reason == "router_failure"
+            if error.category in ENVIRONMENTAL or (error.category == "router_busy" and not router_failure):
                 counts["stopped"] = error.category
                 break
-            session.add(GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], state="failed",
-                error_category=error.category, model=settings.ROUTER_EXPECTED_MODEL, cost_microusd=0,
-                created_at=clock()))
-            session.commit()
+            _record(session, entry, clock, router_failure=router_failure, state="failed",
+                    error_category=error.category, model=model)
             counts["failed"] += 1
-            if recorded_busy:  # The router itself is failing: record this input, then stop until next run.
+            if router_failure:  # The router itself is failing: record this input, then stop until next run.
                 counts["stopped"] = error.category
                 break
             continue
-        session.add(GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], state="completed",
-            guests=[{"name": name, "confidence": confidence} for name, confidence in result.guests],
-            model=settings.ROUTER_EXPECTED_MODEL, cost_microusd=0, created_at=clock()))
-        session.commit()
+        _record(session, entry, clock, state="completed", model=model,
+                guests=[{"name": name, "confidence": confidence} for name, confidence in result.guests])
         counts["extracted"] += 1
     return counts

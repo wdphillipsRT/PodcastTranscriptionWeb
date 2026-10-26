@@ -10,7 +10,9 @@ so a retried block replays a lost response instead of generating twice, and a
 stored failure is never replayed forever. Adds
 `classification_blocks.request_generation_started_at`: when the current key
 generation was first sent, so a key the router left in progress forever (it
-restarted mid-generation) can be advanced. The `model` decision source and the
+restarted mid-generation) can be advanced. Adds `guest_extractions.router_failures`:
+how many router failures were recorded for a guest-extraction input, which is
+retried on later runs until the limit. The `model` decision source and the
 `model_*`/`router_busy` error categories live in policy artifacts and in
 unconstrained string columns, so they need no schema change.
 
@@ -32,8 +34,11 @@ def upgrade():
                   sa.Column("request_generation", sa.Integer, nullable=False, server_default="0"))
     op.add_column("classification_blocks",
                   sa.Column("request_generation_started_at", sa.DateTime(timezone=True), nullable=True))
+    op.add_column("guest_extractions",
+                  sa.Column("router_failures", sa.Integer, nullable=False, server_default="0"))
 
 
 def downgrade():
+    op.drop_column("guest_extractions", "router_failures")
     op.drop_column("classification_blocks", "request_generation_started_at")
     op.drop_column("classification_blocks", "request_generation")

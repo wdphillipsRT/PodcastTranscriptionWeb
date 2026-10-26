@@ -125,7 +125,8 @@ def test_router_smoke_sends_one_synthetic_request_through_the_production_adapter
         assert len(used) == 1 and used[0] is not None and not any(os.path.exists(path) for path in used[0])
     elif failure:
         assert result.exit_code != 0
-        assert ("model_auth" if failure == "auth" else "model_mismatch") in result.output
+        assert ("Router smoke failed: model_auth reason=unauthorized" if failure == "auth"
+                else "Router smoke failed: model_mismatch reason=mismatch") in result.output
     else:
         assert result.exit_code == 0, result.output
         assert result.output.startswith("ready=1 model=bonsai2:27b-pq2_0 label=editorial seconds=")

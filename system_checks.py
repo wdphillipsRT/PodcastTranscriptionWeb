@@ -33,7 +33,7 @@ COMPONENTS = ("database", "redis", "s3", "transcribe", "youtube", "yt_dlp", "den
 # Selectable for the classifier's startup guard only; web readiness never probes the router.
 CLASSIFIER_COMPONENTS = ("claude_absent", "router")
 ALL_COMPONENTS = COMPONENTS + CLASSIFIER_COMPONENTS
-PROBE_TIMEOUT_SECONDS = 8
+PROBE_TIMEOUT_SECONDS = 12  # Beyond the router client's 10 s connect timeout.
 CACHE_SECONDS = 15
 # Router entries are a URL and file paths; the probe child reads the files, never this process.
 _CONFIG_KEYS = ("SQLALCHEMY_DATABASE_URI", "REDIS_URL", "AWS_REGION", "AWS_S3_BUCKET_NAME", "YOUTUBE_API_KEY",
