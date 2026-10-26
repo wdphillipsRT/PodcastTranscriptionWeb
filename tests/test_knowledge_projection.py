@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from commercial_policy import (KnowledgeProjection, LearningProjection, PolicyValidationError,
+from commercial_policy import (KnowledgeProjection, LearningProjection, PolicyValidationError, build_segment_policy,
                                build_knowledge_projection)
 from extensions import db
 from learning_projection import (LearningProjectionUnavailable, assert_citable, load_active_knowledge_projection,
@@ -89,3 +89,59 @@ def test_the_build_is_deterministic_and_hashes_its_content(ready):  # noqa: F811
     assert first == second and first.to_json() == second.to_json()
     assert first.policy_sha256 == policy.policy_sha256 and len(first.projection_sha256) == 64
     assert isinstance(learning, LearningProjection) and learning.segments == first.segments[:1]
+
+
+def rebuilt(ready, policy, change):  # noqa: F811
+    """The fixture policy rebuilt through build_segment_policy, so its totals stay consistent."""
+    positions = {segment.id: index for index, segment in enumerate(ready.transcript.segments)}
+    ranges = tuple(change(positions[entry.first_segment_id], entry) for entry in policy.ranges)
+    return build_segment_policy(transcript=ready.transcript, classifications=ranges, classifier=policy.classifier,
+        source_rule_set_sha256=policy.source_rule_set_sha256, override_set_sha256=policy.override_set_sha256,
+        previous_policy_sha256=policy.previous_policy_sha256, processing_milliseconds=policy.processing_milliseconds)
+
+
+@pytest.mark.parametrize("binding", ["revision_row", "stored_learning_projection"])
+def test_a_consistently_rebuilt_relabelled_policy_fails_closed(ready, binding):  # noqa: F811
+    _, policy, _ = artifacts(ready, ready.revision_id)
+    relabelled = rebuilt(ready, policy, lambda index, entry: replace(entry, label="uncertain", eligible=False)
+                         if entry.label == "paid_commercial" else entry)
+    assert relabelled.uncertain_segments == policy.uncertain_segments + 1
+    replace_artifact(ready, "policy", json.loads(relabelled.to_json()))
+    assert ready.keys["policy"].endswith(relabelled.policy_sha256 + ".json")
+    if binding == "stored_learning_projection":
+        corrupt_row(m.ClassificationRevision, ready.revision_id,
+                    **{name: getattr(relabelled, name) for name in (
+                        "included_segments", "excluded_segments", "uncertain_segments", "included_milliseconds",
+                        "excluded_milliseconds", "uncertain_milliseconds", "review_required")})
+    ready.storage.reads.clear()
+    with pytest.raises(LearningProjectionUnavailable):
+        load(ready)
+    reads = {key for key, _ in ready.storage.reads}
+    assert (ready.keys["projection"] in reads) is (binding == "stored_learning_projection")
+
+
+def test_the_claude_decision_source_projects_like_the_model_one(ready):  # noqa: F811
+    _, policy, _ = artifacts(ready, ready.revision_id)
+    assert any(entry.decision_source == "model" for entry in policy.ranges)
+    claude = rebuilt(ready, policy, lambda index, entry: replace(entry, decision_source="claude")
+                     if entry.decision_source == "model" else entry)
+    assert {entry.decision_source for entry in claude.ranges} == {"claude"}
+    baseline, result = build_knowledge_projection(ready.transcript, policy), build_knowledge_projection(ready.transcript, claude)
+    assert (result.segments, result.uncertain_segment_ids) == (baseline.segments, baseline.uncertain_segment_ids)
+
+
+def test_exact_overrides_decide_the_knowledge_projection(ready):  # noqa: F811
+    _, policy, _ = artifacts(ready, ready.revision_id)
+    overrides = {1: ("paid_commercial", False, 0.1), 5: ("editorial", True, 1.0)}
+
+    def change(index, entry):
+        if index not in overrides:
+            return entry
+        label, eligible, confidence = overrides[index]
+        return replace(entry, label=label, eligible=eligible, confidence=confidence,
+                       decision_source="exact_override", override_id=index)
+
+    result = build_knowledge_projection(ready.transcript, rebuilt(ready, policy, change))
+    segments = ready.transcript.segments
+    assert result.segments == (segments[0], segments[5]) and result.uncertain_segment_ids == ()
+    assert segments[1].id not in result.to_json() and segments[1].text not in result.to_json()

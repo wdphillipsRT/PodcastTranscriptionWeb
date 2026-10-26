@@ -186,7 +186,6 @@ def load_active_learning_projection(*, session, storage, item_id, require_latest
         _unavailable()
 
 
-
 def load_active_knowledge_projection(*, session, storage, item_id, require_latest=True) -> KnowledgeProjection:
     """Editorial and uncertain segments of the current completed revision, uncertain ones marked.
 
@@ -211,6 +210,7 @@ def load_active_knowledge_projection(*, session, storage, item_id, require_lates
         return result
     except _VALIDATION_ERRORS:
         _unavailable()
+
 
 def load_promotional_projection(*, session, storage, item_id, labels, purpose) -> PromotionalProjection:
     """Reconstruct explicitly purposed self/cross promotion research on demand.
