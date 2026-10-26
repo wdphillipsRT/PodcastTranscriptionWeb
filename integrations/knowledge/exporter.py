@@ -302,7 +302,11 @@ def _export(session, storage, settings, inbox, now, since, until, max_batches, r
                 continue
             records, blobs = build_records(plan.facts, generation=plan.generation, supersedes=plan.supersedes,
                                            segments=projection.segments,
-                                           uncertain_segment_ids=projection.uncertain_segment_ids)
+                                           uncertain_segment_ids=projection.uncertain_segment_ids,
+                                           uncertain_segment_labels={
+                                               identity: label for identity, label in zip(
+                                                   projection.uncertain_segment_ids, projection.uncertain_model_labels)
+                                               if label is not None})
             try:
                 for record in records:
                     check_podcast_record(record)

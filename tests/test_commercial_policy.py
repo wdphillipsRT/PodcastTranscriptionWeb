@@ -319,3 +319,83 @@ def test_model_is_a_decision_source_and_claude_era_artifacts_stay_valid():
     with pytest.raises(PolicyValidationError):
         ClassificationRange(identity, identity, 0.0, 1.0, "editorial", True, 0.9, ("substantive_content",), (),
                             "router", (), None)
+
+
+def thresholded(sample, source="model"):
+    """Segment 0 is editorial at .79 and segments 1-2 are paid at .94: all three fall to uncertain."""
+    ranges = sample[1]
+    ranges[0] = replace(ranges[0], confidence=.79, decision_source=source)
+    ranges[1] = replace(ranges[1], confidence=.94, decision_source=source)
+    ranges[2] = replace(ranges[2], confidence=.94, decision_source=source)
+    return policy_for(sample)
+
+
+@pytest.mark.parametrize("source", ["model", "claude"])
+def test_thresholding_keeps_the_model_label_it_overrode(sample, source):
+    policy = thresholded(sample, source)
+    assert [(r.label, r.decision_source, r.model_label) for r in policy.ranges[:3]] == [
+        ("uncertain", "uncertain_threshold", "editorial"),
+        ("uncertain", "uncertain_threshold", "paid_commercial"),
+        ("uncertain", "uncertain_threshold", "paid_commercial")]
+    assert all(r.model_label is None for r in policy.ranges[3:])
+    assert policy.ranges[8].label == "uncertain" and policy.ranges[8].decision_source == "claude"
+    assert SegmentPolicy.from_json(policy.to_json(), transcript=sample[0]) == policy
+    assert policy.to_json().count('"model_label"') == 3
+
+
+def test_policies_without_thresholded_ranges_serialize_exactly_as_before(sample):
+    policy = policy_for(sample)
+    assert '"model_label"' not in policy.to_json()
+    data = policy.to_dict()
+    assert all(set(row) == set(ClassificationRange.__dataclass_fields__) - {"model_label"} for row in data["ranges"])
+    assert data["policy_sha256"] == sha256(canonical_json({k: v for k, v in data.items() if k != "policy_sha256"})
+                                           .encode()).hexdigest()
+
+
+def test_exact_decisions_never_carry_a_model_label(sample):
+    ranges = sample[1]
+    ranges[0] = replace(ranges[0], confidence=0, decision_source="exact_override", override_id=1)
+    ranges[1] = replace(ranges[1], confidence=0, decision_source="source_rule", matched_rule_ids=(2,))
+    policy = policy_for(sample)
+    assert [(r.label, r.model_label) for r in policy.ranges[:2]] == [("editorial", None), ("paid_commercial", None)]
+
+
+def test_a_stored_policy_from_before_model_labels_still_loads_without_inventing_them(sample):
+    data = thresholded(sample).to_dict()
+    for row in data["ranges"]:
+        row.pop("model_label", None)
+    raw = canonical_json(rehash(data, "policy_sha256"))
+    legacy = SegmentPolicy.from_json(raw, transcript=sample[0])
+    assert legacy.to_json() == raw
+    assert [r.label for r in legacy.ranges[:3]] == ["uncertain"] * 3
+    assert all(r.model_label is None for r in legacy.ranges)
+
+
+@pytest.mark.parametrize("damage", ["null", "editorial_above_threshold", "uncertain", "invented", "not_thresholded",
+                                    "in_place"])
+def test_a_tampered_model_label_fails_closed(sample, damage):
+    data = thresholded(sample).to_dict()
+    row = data["ranges"][1]
+    if damage == "null": row["model_label"] = None
+    elif damage == "editorial_above_threshold": row["model_label"] = "editorial"
+    elif damage == "uncertain": row["model_label"] = "uncertain"
+    elif damage == "invented": row["model_label"] = "advertisement"
+    elif damage == "not_thresholded": data["ranges"][3]["model_label"] = "paid_commercial"
+    else: row["model_label"] = "self_promotion"
+    if damage != "in_place":
+        data = rehash(data, "policy_sha256")
+    with pytest.raises(ValueError):
+        SegmentPolicy.from_json(canonical_json(data), transcript=sample[0])
+
+
+@pytest.mark.parametrize("updates", [
+    {"model_label": "paid_commercial"},
+    {"label": "uncertain", "eligible": False, "decision_source": "uncertain_threshold", "model_label": "editorial"},
+    {"label": "uncertain", "eligible": False, "decision_source": "uncertain_threshold", "model_label": "uncertain",
+     "confidence": .5},
+    {"label": "uncertain", "eligible": False, "decision_source": "uncertain_threshold", "model_label": 1,
+     "confidence": .5},
+])
+def test_range_constructor_rejects_inconsistent_model_labels(sample, updates):
+    with pytest.raises(ValueError):
+        replace(sample[1][0], **updates)

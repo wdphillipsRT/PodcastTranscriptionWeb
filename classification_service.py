@@ -1137,7 +1137,9 @@ class ClassificationService:
                 override_set_sha256=inputs.override_hash, previous_policy_sha256=previous_hash, processing_milliseconds=processing_ms)
             policy = build_segment_policy(classifications=classifications, **options)
             coalesced = []
-            metadata_fields = ("label", "eligible", "confidence", "reason_codes", "signal_codes", "decision_source", "matched_rule_ids", "override_id")
+            # model_label keeps adjacent thresholded segments with different model labels apart.
+            metadata_fields = ("label", "eligible", "confidence", "reason_codes", "signal_codes", "decision_source",
+                               "matched_rule_ids", "override_id", "model_label")
             for entry in policy.ranges:
                 if coalesced and _values(coalesced[-1], metadata_fields) == _values(entry, metadata_fields):
                     coalesced[-1] = replace(coalesced[-1], last_segment_id=entry.last_segment_id, end=entry.end)

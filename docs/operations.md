@@ -144,8 +144,26 @@ housekeeping never leave the application. Uncertain segments are exported
 inside their passages and marked: each passage lists them in
 `attributes.uncertain_segment_ids` (empty when none) and is labelled
 `editorial`, `uncertain` or `mixed`, and each episode carries
-`attributes.uncertain_segments`, the revision's count. Release check: exported
-content holds no excluded segment, and every uncertain segment in it is marked
+`attributes.uncertain_segments`, the revision's count. When the confidence
+threshold (editorial below 0.80, any other label below 0.95) made a segment
+uncertain, the policy keeps the model's own label as the range's optional
+`model_label`, and the passage maps that segment to it in
+`attributes.uncertain_segment_labels`, for example
+`{"seg-…": "paid_commercial", "seg-…": "editorial"}`, so a probable advert can be
+told from a borderline editorial segment. Its keys are always a subset of
+`uncertain_segment_ids`. The attribute is omitted when no uncertain segment in
+the passage has a recorded label: one the model itself called `uncertain`, a
+conflict between source rules, an override, or any policy stored before model
+labels were kept (Claude-era and earlier router revisions; their labels are never
+inferred, and a later reclassification records them). `model_label` is optional
+under the unchanged `commercial-segment-policy/v1`, omitted from the stored JSON
+when absent, so existing policies keep their bytes and hashes and no revision
+becomes non-current; it is covered by the policy hash and the revision row like
+every other range field, and one inconsistent with the range's confidence fails
+closed. Code from before `model_label` rejects a policy that has one, so rolling
+back past it fails those episodes' validation like the `model` rollback below.
+Release check: exported content holds no excluded segment, every
+uncertain segment in it is marked, and model labels name only marked segments
 (`tests/test_knowledge_exporter.py::test_release_check_no_excluded_segment_leaves_and_every_uncertain_one_is_marked`). A newer
 pending or failed revision postpones the item. Records name the show as
 `source.publisher` (the YouTube channel for videos), set
@@ -628,7 +646,8 @@ side is the label stored in its policy, which was already thresholded (a Claude
 near-miss is stored as `uncertain`). The `raw_*` figures compare that with the
 router's raw label; the other figures compare both after the confidence
 threshold, as a revision would store them, and `threshold_to_uncertain` counts
-the router labels the threshold turned into `uncertain`. A busy router is
+the router labels the threshold turned into `uncertain`
+(`threshold_to_uncertain_by_label` splits them by the router's raw label). A busy router is
 retried with the worker's back-off (at most about 15.5 minutes per window), then
 the episode is reported as skipped (`busy_skipped`); after three skipped
 episodes in a row the whole run stops with `Comparison stopped: router_busy`

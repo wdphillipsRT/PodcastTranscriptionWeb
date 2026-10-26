@@ -10,7 +10,10 @@ A passage is a run of consecutive knowledge-projection segments, editorial or
 uncertain alike, so caption-sized cues become citable passages and an uncertain
 stretch joins the content around it. Each passage lists its uncertain segments
 in `attributes.uncertain_segment_ids` and is labelled `editorial`, `uncertain`
-(all uncertain) or `mixed`. A segment joins the current passage only while the
+(all uncertain) or `mixed`. Where the confidence threshold made a segment
+uncertain and the policy recorded the model's own label, the passage maps that
+segment to it in `attributes.uncertain_segment_labels` (e.g. `paid_commercial`
+or `editorial`); the attribute is omitted when no segment in the passage has one. A segment joins the current passage only while the
 passage stays within 60 seconds (measured to the latest segment end so far)
 and 6,000 characters; a single segment is never split, so a passage of one
 segment may exceed either limit.
@@ -42,6 +45,7 @@ class Passage:
     end_ms: int
     text: str
     uncertain_segment_ids: tuple[str, ...] = ()
+    uncertain_segment_labels: tuple[tuple[str, str], ...] = ()
 
     @property
     def label(self):
@@ -106,9 +110,15 @@ def episode_native_id(item_id, revision_id, generation):
     return f"item-{item_id}/rev-{revision_id}/e{generation}"
 
 
-def passages(segments, uncertain_segment_ids=()):
-    """Group consecutive projection segments, whatever their label, into bounded passages."""
+def passages(segments, uncertain_segment_ids=(), uncertain_segment_labels=None):
+    """Group consecutive projection segments, whatever their label, into bounded passages.
+
+    `uncertain_segment_labels` maps uncertain segment IDs to the model's own label.
+    """
     uncertain = frozenset(uncertain_segment_ids)
+    labels = dict(uncertain_segment_labels or {})
+    if not labels.keys() <= uncertain or not labels.keys() <= {segment.id for segment in segments}:
+        raise ValueError("model labels are only for exported uncertain segments")
     groups, current, previous = [], None, None
     for segment in segments:
         ordinal = int(segment.id[4:10])
@@ -122,16 +132,18 @@ def passages(segments, uncertain_segment_ids=()):
         current["text"] = segment.text if current["text"] is None else current["text"] + "\n" + segment.text
         previous = ordinal
     return [Passage(tuple(group["ids"]), group["start"], group["end"], group["text"],
-                    tuple(identity for identity in group["ids"] if identity in uncertain)) for group in groups]
+                    tuple(identity for identity in group["ids"] if identity in uncertain),
+                    tuple((identity, labels[identity]) for identity in group["ids"] if identity in labels))
+            for group in groups]
 
 
-def build_records(facts, *, generation, supersedes, segments, uncertain_segment_ids=()):
+def build_records(facts, *, generation, supersedes, segments, uncertain_segment_ids=(), uncertain_segment_labels=None):
     """Return (records, blobs) for one item: the episode first, then its passages."""
     native = episode_native_id(facts["item_id"], facts["classification_revision_id"], generation)
     episode_id = f"podcast:podcast.episode:{native}"
     common = {"schema_version": "knowledge-record/v1", "source": facts["source"], "observed_at": facts["observed_at"],
               "participants": facts["participants"], "rights": RIGHTS, "sensitivity": "internal"}
-    groups = passages(segments, uncertain_segment_ids)
+    groups = passages(segments, uncertain_segment_ids, uncertain_segment_labels)
     records = [{
         **common, "record_id": episode_id, "kind": "podcast.episode", "title": facts["title"],
         "summary": facts["summary"], "content": None,
@@ -153,7 +165,9 @@ def build_records(facts, *, generation, supersedes, segments, uncertain_segment_
             "content": {"sha256": digest, "media_type": TEXT_MEDIA_TYPE, "bytes": len(data)},
             "attributes": {"platform": facts["platform"], "start_ms": group.start_ms, "end_ms": group.end_ms,
                            "label": group.label, "segment_ids": list(group.segment_ids),
-                           "uncertain_segment_ids": list(group.uncertain_segment_ids)},
+                           "uncertain_segment_ids": list(group.uncertain_segment_ids),
+                           **({"uncertain_segment_labels": dict(group.uncertain_segment_labels)}
+                              if group.uncertain_segment_labels else {})},
             "relations": [{"type": "part_of", "target_record_id": episode_id}], "supersedes": None,
         })
     return records, blobs

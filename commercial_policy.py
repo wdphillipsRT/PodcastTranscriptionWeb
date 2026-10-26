@@ -40,6 +40,10 @@ SIGNAL_CODES = ("sponsor_transition", "return_to_program", "purchase_instruction
                 "other_show_promo", "routine_housekeeping", "repeated_block")
 # "claude" stays valid for artifacts written before the Platform Model Router.
 DECISION_SOURCES = ("claude", "model", "exact_override", "source_rule", "uncertain_threshold")
+MODEL_DECISION_SOURCES = frozenset({"claude", "model"})
+# Optional range fields: omitted from canonical JSON when None, so policies stored
+# before a field existed keep their exact bytes and hash under the same version.
+OPTIONAL_RANGE_FIELDS = frozenset({"model_label"})
 MAX_INTEGER = 2**63 - 1
 MAX_RULE_IDS = 100
 
@@ -132,6 +136,9 @@ class ClassificationRange:
     decision_source: str
     matched_rule_ids: tuple[int, ...]
     override_id: int | None
+    # The model's own label when the confidence threshold rewrote it to uncertain.
+    # Absent from policies stored before it was recorded; never inferred for them.
+    model_label: str | None = None
 
     def __post_init__(self):
         for value in (self.first_segment_id, self.last_segment_id):
@@ -159,6 +166,11 @@ class ClassificationRange:
                 or self.decision_source == "source_rule" and not rules
                 or self.decision_source == "uncertain_threshold" and self.label != "uncertain"):
             _invalid()
+        if self.model_label is not None and (
+                not isinstance(self.model_label, str) or self.model_label not in LABELS
+                or self.model_label == "uncertain" or self.decision_source != "uncertain_threshold"
+                or apply_confidence_threshold(self.model_label, self.confidence) != "uncertain"):
+            _invalid()
         for name, value in (("start", float(self.start)), ("end", float(self.end)),
                             ("confidence", float(self.confidence)), ("reason_codes", reasons),
                             ("signal_codes", signals), ("matched_rule_ids", rules)):
@@ -177,10 +189,13 @@ class _Artifact:
         return json.loads(self.to_json())
 
     def to_json(self):
-        return canonical_json(asdict(self))
+        return canonical_json(self._payload())
+
+    def _payload(self):
+        return asdict(self)
 
     def _finish_hash(self):
-        expected = _hash_payload(asdict(self), self._hash_field)
+        expected = _hash_payload(self._payload(), self._hash_field)
         supplied = getattr(self, self._hash_field)
         if supplied != "" and supplied != expected:
             _invalid()
@@ -211,6 +226,12 @@ class SegmentPolicy(_Artifact):
     policy_sha256: str = ""
 
     _hash_field = "policy_sha256"
+
+    def _payload(self):
+        data = asdict(self)
+        data["ranges"] = [{key: value for key, value in row.items()
+                           if key not in OPTIONAL_RANGE_FIELDS or value is not None} for row in data["ranges"]]
+        return data
 
     def __post_init__(self):
         _identity(self, POLICY_SCHEMA)
@@ -251,7 +272,8 @@ class SegmentPolicy(_Artifact):
         data = _load(raw, cls)
         try:
             classifier = _construct(ClassifierProvenance, data["classifier"])
-            ranges = tuple(_construct(ClassificationRange, row) for row in _sequence(data["ranges"], maximum=MAX_SEGMENTS))
+            ranges = tuple(_construct(ClassificationRange, row, optional=OPTIONAL_RANGE_FIELDS)
+                           for row in _sequence(data["ranges"], maximum=MAX_SEGMENTS))
             candidate = cls(**{**data, "classifier": classifier, "ranges": ranges})
             rebuilt = build_segment_policy(transcript=transcript, classifications=ranges,
                 classifier=classifier, source_rule_set_sha256=candidate.source_rule_set_sha256,
@@ -306,13 +328,15 @@ def build_segment_policy(*, transcript, classifications, classifier, source_rule
     totals = {key: [0, 0] for key in ("included", "excluded", "uncertain")}
     for entry in classifications:
         if isinstance(entry, dict):
-            entry = _construct(ClassificationRange, entry)
+            entry = _construct(ClassificationRange, entry, optional=OPTIONAL_RANGE_FIELDS)
         if not isinstance(entry, ClassificationRange):
             _invalid()
         entry.__post_init__()
         label = entry.label if entry.decision_source in {"exact_override", "source_rule"} else apply_confidence_threshold(entry.label, entry.confidence)
         if label != entry.label:
-            entry = replace(entry, label=label, eligible=False, decision_source="uncertain_threshold")
+            # Only model decisions are thresholded; keep what the model said.
+            entry = replace(entry, label=label, eligible=False, decision_source="uncertain_threshold",
+                            model_label=entry.label if entry.decision_source in MODEL_DECISION_SOURCES else None)
         ranges.append(entry)
     for entry, segments in _coverage(transcript, ranges):
         bucket = "included" if entry.eligible else "uncertain" if entry.label == "uncertain" else "excluded"
@@ -329,8 +353,11 @@ def build_segment_policy(*, transcript, classifications, classifier, source_rule
         bool(totals["uncertain"][0]), processing_milliseconds)
 
 
-def _construct(cls, data):
-    if not isinstance(data, dict) or set(data) != set(cls.__dataclass_fields__):
+def _construct(cls, data, *, optional=frozenset()):
+    """Exact keys, except that an optional field may be absent; present, it must not be null."""
+    fields = set(cls.__dataclass_fields__)
+    if (not isinstance(data, dict) or not fields - optional <= set(data) <= fields
+            or any(data.get(name, 0) is None for name in optional)):
         _invalid()
     try:
         return cls(**data)
@@ -466,6 +493,11 @@ def build_promotional_projection(transcript, policy, *, labels, purpose) -> Prom
 class KnowledgeProjection(_Artifact):
     """Editorial and uncertain segments in transcript order; uncertain ones are listed by ID.
 
+    `uncertain_model_labels` runs in step with `uncertain_segment_ids`: the model's
+    own label where the confidence threshold made the segment uncertain and the
+    policy recorded it, else None (the model said uncertain, a source-rule conflict,
+    an override, or a policy stored before model labels were kept).
+
     For the knowledge export only. Never stored, and rejected by `assert_citable`.
     Excluded labels (paid, self or cross promotion, housekeeping) never appear.
     """
@@ -477,6 +509,7 @@ class KnowledgeProjection(_Artifact):
     policy_sha256: str
     segments: tuple[TranscriptSegment, ...]
     uncertain_segment_ids: tuple[str, ...]
+    uncertain_model_labels: tuple[str | None, ...]
     projection_sha256: str = ""
 
     def __post_init__(self):
@@ -486,7 +519,12 @@ class KnowledgeProjection(_Artifact):
         if (any(not isinstance(value, str) or value not in order for value in ids) or len(set(ids)) != len(ids)
                 or list(ids) != sorted(ids, key=order.__getitem__)):
             _invalid()
+        labels = _sequence(self.uncertain_model_labels, maximum=MAX_SEGMENTS)
+        if len(labels) != len(ids) or any(value is not None and (not isinstance(value, str) or value not in LABELS
+                                                                 or value == "uncertain") for value in labels):
+            _invalid()
         object.__setattr__(self, "uncertain_segment_ids", ids)
+        object.__setattr__(self, "uncertain_model_labels", labels)
         self._finish_hash()
 
     def label(self, segment_id):
@@ -494,17 +532,24 @@ class KnowledgeProjection(_Artifact):
             _invalid()
         return "uncertain" if segment_id in self.uncertain_segment_ids else "editorial"
 
+    def model_label(self, segment_id):
+        """The model's label for a thresholded uncertain segment, when recorded; else None."""
+        if self.label(segment_id) == "editorial":
+            return None
+        return self.uncertain_model_labels[self.uncertain_segment_ids.index(segment_id)]
+
 
 def build_knowledge_projection(transcript, policy) -> KnowledgeProjection:
     transcript = _transcript(transcript)
     if not isinstance(policy, SegmentPolicy):
         _invalid()
     policy = SegmentPolicy.from_json(policy.to_json(), transcript=transcript)
-    segments, uncertain = [], []
+    segments, uncertain, labels = [], [], []
     for entry, covered in _coverage(transcript, policy.ranges):
         if entry.label in KNOWLEDGE_LABELS:
             segments.extend(covered)
             if entry.label == "uncertain":
                 uncertain.extend(segment.id for segment in covered)
+                labels.extend(entry.model_label for _ in covered)
     return KnowledgeProjection(KNOWLEDGE_SCHEMA, transcript.item_id, transcript.source_id,
-        transcript.transcript_sha256, policy.policy_sha256, tuple(segments), tuple(uncertain))
+        transcript.transcript_sha256, policy.policy_sha256, tuple(segments), tuple(uncertain), tuple(labels))

@@ -9,7 +9,8 @@ is counted twice: `raw_*` fields use the router's raw label as returned, before
 the confidence threshold; the other fields use the label after the threshold,
 as a real revision would store it. A near-miss advert that the threshold turns
 into `uncertain` therefore shows as agreement-changing in `raw_*` only and in
-`threshold_to_uncertain`.
+`threshold_to_uncertain`, which `threshold_to_uncertain_by_label` splits by the
+router's raw label (a probable advert versus a borderline editorial segment).
 
 Nothing is written to the database or storage (the router keeps its own
 invocation records). Each item's inputs are read once and frozen for every
@@ -58,8 +59,12 @@ def _bucket(label):
     return "editorial" if label in ELIGIBLE_LABELS else "uncertain" if label == "uncertain" else "excluded"
 
 
+_THRESHOLDED = tuple(label for label in LABELS if label != "uncertain")
+
+
 def _empty():
     return {**dict.fromkeys(_COUNTS, 0), "call_seconds": [],
+            "threshold_to_uncertain_by_label": dict.fromkeys(_THRESHOLDED, 0),
             **{name: {label: {"agree": 0, "total": 0} for label in LABELS} for name in _AGREEMENTS}}
 
 
@@ -155,7 +160,9 @@ def compare_item(session, service, item_id, *, max_blocks, run, sleep=time.sleep
                 report["segments"] += 1
                 _count(report, before, decision.label, prefix="raw_")
                 _count(report, before, label)
-                report["threshold_to_uncertain"] += int(label == "uncertain" and decision.label != "uncertain")
+                if label == "uncertain" and decision.label != "uncertain":
+                    report["threshold_to_uncertain"] += 1
+                    report["threshold_to_uncertain_by_label"][decision.label] += 1
     return report
 
 
@@ -198,6 +205,8 @@ def compare_models(*, session, service, sample, seed, max_blocks, sleep=None, mo
         total["items"] += 1
         for name in _COUNTS:
             total[name] += report[name]
+        for label in _THRESHOLDED:
+            total["threshold_to_uncertain_by_label"][label] += report["threshold_to_uncertain_by_label"][label]
         for name in _AGREEMENTS:
             for label in LABELS:
                 for part in ("agree", "total"):

@@ -175,3 +175,36 @@ def test_the_episode_counts_its_uncertain_segments_and_the_count_is_a_fact():
     records, _ = build_records(built, generation=1, supersedes=None, segments=SEGMENTS)
     assert records[0]["attributes"]["uncertain_segments"] == 2
     assert payload_sha256(built) != payload_sha256(facts())
+
+
+def test_passages_record_the_model_label_of_their_thresholded_uncertain_segments():
+    segments = (segment(1, 0.0, 5.0, "Editorial opening"), segment(2, 5.0, 9.0, "Probable advert"),
+                segment(3, 9.0, 14.0, "Borderline lesson"), segment(4, 14.0, 18.0, "Model said uncertain"),
+                segment(9, 50.0, 55.0, "Editorial close"))
+    uncertain = (segments[1].id, segments[2].id, segments[3].id)
+    labels = {segments[1].id: "paid_commercial", segments[2].id: "editorial"}
+    groups = passages(segments, uncertain, labels)
+    assert [g.uncertain_segment_labels for g in groups] == [
+        ((segments[1].id, "paid_commercial"), (segments[2].id, "editorial")), ()]
+    records, _ = build_records(facts(), generation=1, supersedes=None, segments=segments,
+                               uncertain_segment_ids=uncertain, uncertain_segment_labels=labels)
+    assert records[1]["attributes"]["uncertain_segment_labels"] == labels
+    assert set(records[1]["attributes"]["uncertain_segment_labels"]) < set(records[1]["attributes"]["uncertain_segment_ids"])
+    assert "uncertain_segment_labels" not in records[2]["attributes"]
+    assert all("uncertain_segment_labels" not in record["attributes"] for record in records[:1])
+
+
+def test_passages_without_model_labels_omit_the_attribute():
+    segments = (segment(1, 0.0, 5.0, "Editorial opening"), segment(2, 5.0, 9.0, "Uncertain bridge"))
+    records, _ = build_records(facts(), generation=1, supersedes=None, segments=segments,
+                               uncertain_segment_ids=(segments[1].id,))
+    assert records[1]["attributes"]["uncertain_segment_ids"] == [segments[1].id]
+    assert "uncertain_segment_labels" not in records[1]["attributes"]
+
+
+@pytest.mark.parametrize("labels", ["editorial_segment", "unknown_segment"])
+def test_model_labels_are_only_for_uncertain_segments(labels):
+    segments = (segment(1, 0.0, 5.0, "Editorial opening"), segment(2, 5.0, 9.0, "Uncertain bridge"))
+    key = segments[0].id if labels == "editorial_segment" else segment(7, 0.0, 1.0, "x").id
+    with pytest.raises(ValueError):
+        passages(segments, (segments[1].id,), {key: "paid_commercial"})

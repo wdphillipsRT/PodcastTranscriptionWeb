@@ -92,6 +92,8 @@ def test_agreement_is_reported_before_and_after_the_confidence_threshold(worker)
     assert total["agreement"]["editorial"] == {"agree": 2, "total": 3}
     assert (total["raw_editorial_to_excluded"], total["editorial_to_excluded"]) == (1, 0)
     assert (total["raw_model_uncertain"], total["model_uncertain"], total["threshold_to_uncertain"]) == (0, 1, 1)
+    assert total["threshold_to_uncertain_by_label"] == {"editorial": 0, "paid_commercial": 1, "self_promotion": 0,
+                                                        "cross_promotion": 0, "housekeeping": 0}
     assert total["model_uncertain_share"] == round(1 / 3, 4)
 
 

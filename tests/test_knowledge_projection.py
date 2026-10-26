@@ -145,3 +145,27 @@ def test_exact_overrides_decide_the_knowledge_projection(ready):  # noqa: F811
     segments = ready.transcript.segments
     assert result.segments == (segments[0], segments[5]) and result.uncertain_segment_ids == ()
     assert segments[1].id not in result.to_json() and segments[1].text not in result.to_json()
+
+
+def test_thresholded_uncertain_segments_carry_the_model_label_in_step_with_their_ids(ready):  # noqa: F811
+    _, policy, _ = artifacts(ready, ready.revision_id)
+    lowered = {1: .9, 4: .9}  # paid_commercial and housekeeping, below the .95 exclusion threshold
+    policy = rebuilt(ready, policy, lambda index, entry: replace(entry, confidence=lowered[index])
+                     if index in lowered else entry)
+    result = build_knowledge_projection(ready.transcript, policy)
+    segments = ready.transcript.segments
+    assert result.uncertain_segment_ids == (segments[1].id, segments[4].id, segments[5].id)
+    assert result.uncertain_model_labels == ("paid_commercial", "housekeeping", None)
+    assert result.model_label(segments[1].id) == "paid_commercial" and result.model_label(segments[5].id) is None
+    assert result.model_label(segments[0].id) is None
+
+
+def test_the_loaded_projection_has_no_model_labels_for_a_policy_that_recorded_none(ready):  # noqa: F811
+    result = load(ready)
+    assert result.uncertain_model_labels == (None,)
+
+
+@pytest.mark.parametrize("labels", [(), ("paid_commercial", None), ("uncertain",), ("advertisement",), (1,)])
+def test_model_labels_must_align_with_the_uncertain_ids(ready, labels):  # noqa: F811
+    with pytest.raises(PolicyValidationError):
+        replace(load(ready), uncertain_model_labels=labels, projection_sha256="")
