@@ -20,6 +20,7 @@ POLICY_VERSION = "commercial-segment-policy/v1"
 POLICY_SCHEMA = "commercial-segment-policy-artifact/v1"
 PROJECTION_SCHEMA = "learning-transcript-projection/v1"
 PROMOTIONAL_SCHEMA = "promotional-analysis-projection/v1"
+KNOWLEDGE_SCHEMA = "knowledge-transcript-projection/v1"
 PROMPT_VERSION = "commercial-segment-classifier/v1"
 TARGET_SEGMENTS_PER_BLOCK = 80
 CONTEXT_SEGMENTS_PER_SIDE = 3
@@ -29,6 +30,7 @@ EDITORIAL_AUTO_THRESHOLD = 0.80
 EXCLUSION_AUTO_THRESHOLD = 0.95
 LABELS = ("editorial", "paid_commercial", "self_promotion", "cross_promotion", "housekeeping", "uncertain")
 ELIGIBLE_LABELS = frozenset({"editorial"})
+KNOWLEDGE_LABELS = frozenset({"editorial", "uncertain"})
 REASON_CODES = ("substantive_content", "sponsor_transition", "return_to_program",
                 "purchase_instruction", "discount_or_affiliate", "promotional_url",
                 "creator_offer", "other_show_promo", "routine_housekeeping",
@@ -458,3 +460,51 @@ def build_promotional_projection(transcript, policy, *, labels, purpose) -> Prom
     segments = _selected_segments(transcript, policy, labels)
     return PromotionalProjection(PROMOTIONAL_SCHEMA, transcript.item_id, transcript.source_id,
         transcript.transcript_sha256, policy.policy_sha256, purpose, labels, segments)
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeProjection(_Artifact):
+    """Editorial and uncertain segments in transcript order; uncertain ones are listed by ID.
+
+    For the knowledge export only. Never stored, and rejected by `assert_citable`.
+    Excluded labels (paid, self or cross promotion, housekeeping) never appear.
+    """
+
+    schema: str
+    item_id: int
+    source_id: int
+    transcript_sha256: str
+    policy_sha256: str
+    segments: tuple[TranscriptSegment, ...]
+    uncertain_segment_ids: tuple[str, ...]
+    projection_sha256: str = ""
+
+    def __post_init__(self):
+        _projection_segments(self, KNOWLEDGE_SCHEMA)
+        ids = _sequence(self.uncertain_segment_ids, maximum=MAX_SEGMENTS)
+        order = {segment.id: index for index, segment in enumerate(self.segments)}
+        if (any(not isinstance(value, str) or value not in order for value in ids) or len(set(ids)) != len(ids)
+                or list(ids) != sorted(ids, key=order.__getitem__)):
+            _invalid()
+        object.__setattr__(self, "uncertain_segment_ids", ids)
+        self._finish_hash()
+
+    def label(self, segment_id):
+        if not any(segment.id == segment_id for segment in self.segments):
+            _invalid()
+        return "uncertain" if segment_id in self.uncertain_segment_ids else "editorial"
+
+
+def build_knowledge_projection(transcript, policy) -> KnowledgeProjection:
+    transcript = _transcript(transcript)
+    if not isinstance(policy, SegmentPolicy):
+        _invalid()
+    policy = SegmentPolicy.from_json(policy.to_json(), transcript=transcript)
+    segments, uncertain = [], []
+    for entry, covered in _coverage(transcript, policy.ranges):
+        if entry.label in KNOWLEDGE_LABELS:
+            segments.extend(covered)
+            if entry.label == "uncertain":
+                uncertain.extend(segment.id for segment in covered)
+    return KnowledgeProjection(KNOWLEDGE_SCHEMA, transcript.item_id, transcript.source_id,
+        transcript.transcript_sha256, policy.policy_sha256, tuple(segments), tuple(uncertain))

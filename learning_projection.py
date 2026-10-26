@@ -1,8 +1,10 @@
 """Sole fail-closed transcript gateway for future learning and delivery code.
 
-Only canonical editorial segments leave the general gateway. Promotional
-research uses a separately typed, explicitly purposed reconstruction. Neither
-API publishes anything or exposes storage, canonical transcripts, or policies.
+Only canonical editorial segments leave the general gateway; the knowledge
+export alone also receives uncertain segments, marked, through a separate
+non-citable type. Promotional research uses a separately typed, explicitly
+purposed reconstruction. Neither API publishes anything or exposes storage,
+canonical transcripts, or policies.
 """
 
 from dataclasses import dataclass, fields
@@ -13,8 +15,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from commercial_policy import (
-    LearningProjection, PromotionalProjection, SegmentPolicy, PolicyValidationError,
-    build_promotional_projection, _promotional_labels, _purpose,
+    KnowledgeProjection, LearningProjection, PromotionalProjection, SegmentPolicy, PolicyValidationError,
+    build_knowledge_projection, build_promotional_projection, _promotional_labels, _purpose,
 )
 from models import ContentItem, ContentSource, SourceItem, ClassificationRevision
 from s3_utils import DEFAULT_MAX_BYTES, StorageError, validate_artifact_key
@@ -183,6 +185,32 @@ def load_active_learning_projection(*, session, storage, item_id, require_latest
     except _VALIDATION_ERRORS:
         _unavailable()
 
+
+
+def load_active_knowledge_projection(*, session, storage, item_id, require_latest=True) -> KnowledgeProjection:
+    """Editorial and uncertain segments of the current completed revision, uncertain ones marked.
+
+    For the knowledge export only. The projection is rebuilt from the hash-validated
+    canonical transcript and active policy with the same checks as
+    `load_active_learning_projection`. The stored editorial projection is also read
+    byte for byte, and its segments must equal this projection without its uncertain
+    segments. Excluded labels never appear. The result is not citable.
+    """
+    try:
+        snapshot, transcript, policy = _inputs(session, storage, item_id, require_latest)
+        revision = snapshot[1]
+        raw = _bytes(storage, revision["projection_s3_key"])
+        learning = LearningProjection.from_json(raw, transcript=transcript, policy=policy)
+        if raw != learning.to_json().encode("utf-8") or learning.projection_sha256 != revision["projection_sha256"]:
+            _unavailable()
+        result = build_knowledge_projection(transcript, policy)
+        uncertain = set(result.uncertain_segment_ids)
+        if tuple(segment for segment in result.segments if segment.id not in uncertain) != learning.segments:
+            _unavailable()
+        _still_active(session, item_id, require_latest, snapshot)
+        return result
+    except _VALIDATION_ERRORS:
+        _unavailable()
 
 def load_promotional_projection(*, session, storage, item_id, labels, purpose) -> PromotionalProjection:
     """Reconstruct explicitly purposed self/cross promotion research on demand.
