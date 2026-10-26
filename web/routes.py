@@ -400,7 +400,9 @@ def update_source_hosts(source_id):
         names = parse_admin_names(data.get("hosts"), limit=10)
     except ValueError:
         return failure("Enter up to 10 host names, one per line, each with letters or digits.")
-    row.admin_hosts, row.hosts_updated_at = list(names) or None, utc_now()
+    # observed_at feeds the export facts hash: only a real change moves the timestamp.
+    if row.admin_hosts != (list(names) or None):
+        row.admin_hosts, row.hosts_updated_at = list(names) or None, utc_now()
     db.session.commit()
     hosts, basis = source_hosts(row)
     return result(dict(id=row.id, hosts=list(hosts), basis=basis),
@@ -419,7 +421,8 @@ def update_item_guests(item_id):
         names = parse_admin_names(data.get("guests"), limit=20)
     except ValueError:
         return failure("Enter up to 20 guest names, one per line, each with letters or digits.")
-    row.admin_guests, row.guests_updated_at = list(names), utc_now()
+    if row.admin_guests != list(names):
+        row.admin_guests, row.guests_updated_at = list(names), utc_now()
     db.session.commit()
     return result(dict(id=row.id, guests=list(names)),
                   location=url_for("workspace.item", item_id=row.id), message="Guests saved.")
@@ -432,7 +435,8 @@ def reset_item_guests(item_id):
     """Drop the administrator guest list so feed, then inferred, guests apply."""
     row = item_owned(item_id)
     classification_payload(set())
-    row.admin_guests, row.guests_updated_at = None, utc_now()
+    if row.admin_guests is not None:
+        row.admin_guests, row.guests_updated_at = None, utc_now()
     db.session.commit()
     guests = item_people(row)[0]
     return result(dict(id=row.id, guests=[name for name, _, _ in guests]),

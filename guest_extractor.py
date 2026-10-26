@@ -41,7 +41,7 @@ import sqlalchemy as sa
 
 from claude_classifier import ClassifierError, _environment, _exchange, _fail, _kill_and_reap, _unique_object
 from ingestion_types import person_names
-from integrations.knowledge.people import guest_input_sha256, plain_text, source_hosts
+from integrations.knowledge.people import guest_input_sha256, has_host, participants, plain_text, source_hosts
 from transcripts import canonical_json
 
 
@@ -202,7 +202,11 @@ class ClaudeGuestExtractor:
 
 
 def _candidates(session):
-    """Classified items with a hosted source and no administrator or feed guests."""
+    """Classified items with a hosted source and no administrator or feed guests.
+
+    The source must name a host the exporter can identify (the same check the
+    exporter applies), or the extraction would be paid for an unexportable item.
+    """
     from models import ClassificationRevision, ContentItem, ContentSource
     rows = session.execute(sa.select(ContentItem, ContentSource).join(
         ClassificationRevision, ClassificationRevision.id == ContentItem.active_classification_revision_id).join(
@@ -211,7 +215,7 @@ def _candidates(session):
         ContentItem.admin_guests.is_(None), ContentItem.feed_guests.is_(None),
         sa.or_(ContentSource.admin_hosts.is_not(None), ContentSource.feed_hosts.is_not(None)))
         .order_by(ContentItem.id.desc())).all()
-    return [(item, source) for item, source in rows if source_hosts(source)[0]]
+    return [(item, source) for item, source in rows if has_host(participants(*source_hosts(source), ()))]
 
 
 @contextmanager

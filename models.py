@@ -11,7 +11,7 @@ from sqlalchemy.orm import validates
 from sqlalchemy.types import TypeDecorator
 
 from extensions import db
-from ingestion_types import normalize_public_url
+from ingestion_types import normalize_public_url, person_names
 
 
 SOURCE_TYPES = ("podcast_rss", "youtube_channel", "youtube_playlist", "youtube_video")
@@ -104,6 +104,8 @@ DESCRIPTOR_STRINGS = {
     "thumbnail_url", "published_at", "language",
 }
 
+MAX_DESCRIPTOR_GUESTS = 20
+
 
 def normalized_descriptor(value):
     """Allow only the small, typed projection needed for item finalization.
@@ -114,7 +116,8 @@ def normalized_descriptor(value):
     """
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) - DESCRIPTOR_STRINGS - {"duration_seconds", "requires_reacquisition"}:
+    if not isinstance(value, dict) or set(value) - DESCRIPTOR_STRINGS - {"duration_seconds", "requires_reacquisition",
+                                                                       "guests"}:
         raise ValueError("descriptor must contain normalized fields only")
     result = dict(value)
     for key, entry in result.items():
@@ -126,6 +129,10 @@ def normalized_descriptor(value):
         elif key == "duration_seconds":
             if type(entry) is not int or entry < 0:
                 raise ValueError("descriptor duration_seconds must be a nonnegative integer")
+        elif key == "guests":
+            if (not isinstance(entry, list) or not entry or not all(isinstance(name, str) for name in entry)
+                    or list(person_names(entry, limit=MAX_DESCRIPTOR_GUESTS)) != entry):
+                raise ValueError("descriptor guests must be a non-empty list of normalized names")
         elif not isinstance(entry, str):
             raise ValueError("descriptor text fields must be strings")
         elif key.endswith("_url"):

@@ -37,6 +37,9 @@ def item_projection(item):
     value = {name: getattr(item, name) for name in names}
     value.update(canonical_url=item.canonical_url, remote_media_url=item.remote_media_url,
                  published_at=item.published_at.isoformat() if item.published_at else None)
+    if item.platform == "podcast" and item.guests:
+        # Carried to _accept so a newly created item has its feed guests at once.
+        value["guests"] = list(item.guests)
     return normalized_descriptor(value)
 
 
@@ -135,7 +138,11 @@ class DiscoveryService:
                 source.hosts_updated_at = utc_now()
 
     def _record_feed_guests(self, items):
-        """Refresh <podcast:person> guests of already-created podcast items."""
+        """Refresh <podcast:person> guests of already-created podcast items.
+
+        Items created by this run take their guests from the candidate
+        descriptor in _accept.
+        """
         guests = {item.external_id: list(item.guests) or None for item in items if item.platform == "podcast"}
         if not guests:
             return
@@ -394,6 +401,10 @@ class DiscoveryService:
     def _accept(self, source, candidate):
         values = dict(candidate.descriptor)
         values.pop("requires_reacquisition", None)
+        guests = values.pop("guests", None)
+        if guests and values["platform"] == "podcast":
+            # Existing items are refreshed while staging; this applies only on creation.
+            values.update(feed_guests=list(guests), guests_updated_at=utc_now())
         if values.get("published_at"):
             values["published_at"] = datetime.fromisoformat(values["published_at"])
         values["canonical_url"] = values.get("canonical_url") or source.canonical_url

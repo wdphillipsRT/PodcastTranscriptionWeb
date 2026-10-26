@@ -22,12 +22,16 @@ def test_discovery_records_feed_hosts_and_guests(store):
                                    source_hosts=["Ada Host"]))
     assert source.feed_hosts == ["Ada Host"] and source.hosts_updated_at is not None
     items = {row.external_id: row for row in ContentItem.query.all()}
-    # Items are created after staging, so the next fetch records their guests.
-    assert items["1"].feed_guests is None
-    discover(source, DiscoveryPage(items=[descriptor(1, guests=["James Clear"]), descriptor(2)],
-                                   source_hosts=["Ada Host"]))
+    # A newly created item carries its feed guests from the first discovery.
     assert items["1"].feed_guests == ["James Clear"] and items["1"].guests_updated_at is not None
     assert items["2"].feed_guests is None and items["2"].guests_updated_at is None
+    first = items["1"].guests_updated_at
+    discover(source, DiscoveryPage(items=[descriptor(1, guests=["James Clear"]), descriptor(2)],
+                                   source_hosts=["Ada Host"]))
+    assert items["1"].feed_guests == ["James Clear"] and items["1"].guests_updated_at == first
+    discover(source, DiscoveryPage(items=[descriptor(1, guests=["James Clear", "Ada Guest"]), descriptor(2)],
+                                   source_hosts=["Ada Host"]))
+    assert items["1"].feed_guests == ["James Clear", "Ada Guest"] and items["1"].guests_updated_at > first
 
 
 def test_unchanged_hosts_and_guests_keep_their_timestamps(store):
@@ -103,3 +107,11 @@ def test_seed_hosts_fills_only_missing_youtube_hosts(workspace):  # noqa: F811
         assert hosts == {"youtube_channel": ["Example channel"], "youtube_playlist": ["Teacher"],
                          "youtube_video": ["Kept"], "podcast_rss": None}
         assert ContentSource.query.filter_by(source_type="youtube_playlist").one().hosts_updated_at is not None
+
+
+@pytest.mark.parametrize("guests", [[], "James Clear", [" James  Clear"], [1], ["A", "a"]])
+def test_staged_descriptor_guests_must_be_normalized_names(guests):
+    from models import normalized_descriptor
+    with pytest.raises(ValueError):
+        normalized_descriptor({"platform": "podcast", "guests": guests})
+    assert normalized_descriptor({"platform": "podcast", "guests": ["James Clear"]})["guests"] == ["James Clear"]

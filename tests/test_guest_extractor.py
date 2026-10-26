@@ -228,6 +228,17 @@ def test_disabled_or_unneeded_items_make_no_call(ready):
     assert not ready.extractor.calls
 
 
+def test_sources_whose_hosts_cannot_be_exported_make_no_call(ready):
+    # The exporter needs a host with an identifier; extraction would be paid for nothing.
+    ready.source.feed_hosts = ["!!!", "—"]
+    db.session.commit()
+    assert extract(ready)["scanned"] == 0 and not ready.extractor.calls
+    ready.source.admin_hosts = ["Ada Host"]
+    db.session.commit()
+    assert extract(ready)["extracted"] == 1
+    assert ready.extractor.calls == [("Feed", ("Ada Host",), TITLE, DESCRIPTION)]
+
+
 def test_daily_budget_counts_todays_spend_and_stops_before_the_call(ready):
     other, _ = add_item(ready, external_id="other")
     db.session.add(m.GuestExtraction(item_id=other.id, input_sha256="f" * 64, state="completed", guests=[],

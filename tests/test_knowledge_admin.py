@@ -88,3 +88,66 @@ def test_invalid_guest_input_is_rejected(workspace):  # noqa: F811
     assert workspace.client.post("/api/items/999/guests", json={"guests": "Ada"}).status_code == 404
     with workspace.app.app_context():
         assert rows(workspace)[1].admin_guests is None
+
+
+def test_resaving_unchanged_hosts_keeps_the_timestamp(workspace):  # noqa: F811
+    with workspace.app.app_context():
+        source_id = rows(workspace)[0].id
+    assert workspace.client.post(f"/api/sources/{source_id}/hosts", json={"hosts": ""}).status_code == 200
+    with workspace.app.app_context():
+        assert rows(workspace)[0].hosts_updated_at is None
+    workspace.client.post(f"/api/sources/{source_id}/hosts", json={"hosts": "Ada Host\nGrace Cohost"})
+    with workspace.app.app_context():
+        first = rows(workspace)[0].hosts_updated_at
+        assert first is not None
+    response = workspace.client.post(f"/sources/{source_id}/hosts", data={"hosts": " Ada  Host \n\nGrace Cohost\n"})
+    assert response.status_code == 303
+    with workspace.app.app_context():
+        assert rows(workspace)[0].hosts_updated_at == first
+    response = workspace.client.post(f"/api/sources/{source_id}/hosts", json={"hosts": "Grace Cohost\nAda Host"})
+    assert response.json["hosts"] == ["Grace Cohost", "Ada Host"]
+    with workspace.app.app_context():
+        assert rows(workspace)[0].hosts_updated_at > first
+
+
+def test_resaving_unchanged_guests_or_resetting_twice_keeps_the_timestamp(workspace):  # noqa: F811
+    with workspace.app.app_context():
+        item_id = rows(workspace)[1].id
+    response = workspace.client.post(f"/api/items/{item_id}/guests/reset", json={})
+    assert response.json == {"id": item_id, "guests": []}
+    with workspace.app.app_context():
+        assert rows(workspace)[1].guests_updated_at is None
+    workspace.client.post(f"/api/items/{item_id}/guests", json={"guests": "Grace Hopper"})
+    with workspace.app.app_context():
+        first = rows(workspace)[1].guests_updated_at
+        assert first is not None
+    response = workspace.client.post(f"/items/{item_id}/guests", data={"guests": "Grace  Hopper\n"})
+    assert response.status_code == 303
+    with workspace.app.app_context():
+        assert rows(workspace)[1].guests_updated_at == first
+    response = workspace.client.post(f"/api/items/{item_id}/guests", json={"guests": ""})
+    assert response.json == {"id": item_id, "guests": []}
+    with workspace.app.app_context():
+        second = rows(workspace)[1].guests_updated_at
+        assert rows(workspace)[1].admin_guests == [] and second > first
+    workspace.client.post(f"/api/items/{item_id}/guests", json={"guests": ""})
+    with workspace.app.app_context():
+        assert rows(workspace)[1].guests_updated_at == second
+    workspace.client.post(f"/api/items/{item_id}/guests/reset", json={})
+    with workspace.app.app_context():
+        third = rows(workspace)[1].guests_updated_at
+        assert rows(workspace)[1].admin_guests is None and third > second
+    workspace.client.post(f"/items/{item_id}/guests/reset", data={})
+    with workspace.app.app_context():
+        assert rows(workspace)[1].guests_updated_at == third
+
+
+def test_guest_form_warns_that_saving_replaces_feed_guests(workspace):  # noqa: F811
+    with workspace.app.app_context():
+        item = rows(workspace)[1]
+        item.feed_guests = ["Feed Guest"]
+        db.session.commit()
+        item_id = item.id
+    page = workspace.client.get(f"/items/{item_id}").get_data(as_text=True)
+    assert ("Saving replaces feed and inferred guests with this list, even unchanged: "
+            "feed guests become set by the administrator and the item is exported again.") in page
