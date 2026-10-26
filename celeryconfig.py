@@ -33,3 +33,8 @@ task_routes.update({"tasks." + name: {"queue": "classification"}
     for name in ("classify_item", "reconcile_classifications", "scan_source_rule")})
 beat_schedule["classification-reconciliation"] = {"task": "tasks.reconcile_classifications",
     "schedule": float(os.environ.get("CLASSIFICATION_RECONCILE_INTERVAL_SECONDS", "300"))}
+# Guest extraction calls Claude, so it runs only on the classifier's queue.
+task_routes["tasks.extract_guests"] = {"queue": "classification"}
+if os.environ.get("GUEST_EXTRACTION_ENABLED", "false").strip().lower() == "true":
+    beat_schedule["guest-extraction"] = {"task": "tasks.extract_guests",
+        "schedule": float(os.environ.get("GUEST_EXTRACTION_INTERVAL_SECONDS", "3600"))}

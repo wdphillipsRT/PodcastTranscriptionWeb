@@ -842,6 +842,24 @@ def get_classification_service():
         classifier=ClaudeClassifier(settings), settings=settings)
 
 
+def get_guest_extractor():
+    """Construct lazily; only the classifier container holds Claude credentials."""
+    from guest_extractor import ClaudeGuestExtractor
+    return ClaudeGuestExtractor(SimpleNamespace(**dict(current_app.config)))
+
+
+@celery_app.task(name="tasks.extract_guests", queue="classification")
+def extract_guests():
+    with application_context():
+        from extensions import db
+        from guest_extractor import extract_pending_guests
+        from models import utc_now
+        counts = extract_pending_guests(session=db.session, extractor=get_guest_extractor(),
+            settings=SimpleNamespace(**dict(current_app.config)), now=utc_now())
+        logging.getLogger(__name__).info("knowledge_guest_extraction", extra={"guest_extraction": counts})
+        return counts
+
+
 def _classification_phase(revision_id, phase, block_ordinal):
     from discovery_service import positive_id
     positive_id(revision_id)

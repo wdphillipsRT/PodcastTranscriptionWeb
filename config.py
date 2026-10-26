@@ -61,6 +61,13 @@ class Settings:
     CLASSIFICATION_ENABLED: bool = False
     CLASSIFICATION_RECONCILE_INTERVAL_SECONDS: int = 300
     CLASSIFICATION_RECONCILE_BATCH_SIZE: int = 100
+    GUEST_EXTRACTION_ENABLED: bool = False
+    CLAUDE_GUEST_MODEL: str = "claude-sonnet-5-5"
+    GUEST_EXTRACTION_TIMEOUT_SECONDS: int = 60
+    GUEST_EXTRACTION_MAX_BUDGET_USD: Decimal = Decimal("0.05")
+    GUEST_EXTRACTION_DAILY_BUDGET_USD: Decimal = Decimal("1.00")
+    GUEST_EXTRACTION_MAX_ITEMS_PER_RUN: int = 25
+    GUEST_EXTRACTION_INTERVAL_SECONDS: int = 3600
 
 
 _REQUIRED = (
@@ -136,7 +143,12 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
         raise ConfigError("CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES must not exceed 2097152")
     if values["CLASSIFICATION_RECONCILE_BATCH_SIZE"] > 500:
         raise ConfigError("CLASSIFICATION_RECONCILE_BATCH_SIZE must not exceed 500")
-    for name in ("CLAUDE_CLASSIFIER_MAX_BUDGET_USD", "CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD"):
+    if values["GUEST_EXTRACTION_MAX_ITEMS_PER_RUN"] > 100:
+        raise ConfigError("GUEST_EXTRACTION_MAX_ITEMS_PER_RUN must not exceed 100")
+    if values["GUEST_EXTRACTION_TIMEOUT_SECONDS"] > 600:
+        raise ConfigError("GUEST_EXTRACTION_TIMEOUT_SECONDS must not exceed 600")
+    for name in ("CLAUDE_CLASSIFIER_MAX_BUDGET_USD", "CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD",
+                 "GUEST_EXTRACTION_MAX_BUDGET_USD", "GUEST_EXTRACTION_DAILY_BUDGET_USD"):
         try:
             raw = environment.get(name, str(getattr(Settings, name))).strip()
             if not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", raw):
@@ -149,10 +161,13 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
         values[name] = value
     if values["CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD"] < values["CLAUDE_CLASSIFIER_MAX_BUDGET_USD"]:
         raise ConfigError("CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD must cover the per-call budget")
+    if values["GUEST_EXTRACTION_DAILY_BUDGET_USD"] < values["GUEST_EXTRACTION_MAX_BUDGET_USD"]:
+        raise ConfigError("GUEST_EXTRACTION_DAILY_BUDGET_USD must cover the per-call budget")
     if values["CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS"] < values["CLAUDE_CLASSIFIER_TIMEOUT_SECONDS"]:
         raise ConfigError("CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS must cover the per-call timeout")
     for name, pattern in (("CLAUDE_EXPECTED_VERSION", r"[0-9]+\.[0-9]+\.[0-9]+"),
-                          ("CLAUDE_CLASSIFIER_MODEL", r"claude-(?!latest-)[a-z]+-[0-9]+-[0-9]+(?:-[0-9]{8})?")):
+                          ("CLAUDE_CLASSIFIER_MODEL", r"claude-(?!latest-)[a-z]+-[0-9]+-[0-9]+(?:-[0-9]{8})?"),
+                          ("CLAUDE_GUEST_MODEL", r"claude-(?!latest-)[a-z]+-[0-9]+-[0-9]+(?:-[0-9]{8})?")):
         value = _nonempty(environment, name, getattr(Settings, name))
         if not re.fullmatch(pattern, value):
             raise ConfigError(f"{name} must be a pinned version")
@@ -161,6 +176,10 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
     if enabled not in {"true", "false"}:
         raise ConfigError("CLASSIFICATION_ENABLED must be true or false")
     values["CLASSIFICATION_ENABLED"] = enabled == "true"
+    enabled = environment.get("GUEST_EXTRACTION_ENABLED", "false").strip().lower()
+    if enabled not in {"true", "false"}:
+        raise ConfigError("GUEST_EXTRACTION_ENABLED must be true or false")
+    values["GUEST_EXTRACTION_ENABLED"] = enabled == "true"
 
     secure = environment.get("SESSION_COOKIE_SECURE", "true").strip().lower()
     if secure not in {"true", "false"}:
