@@ -10,7 +10,6 @@ import sys
 import pytest
 
 from extensions import db
-import models as m
 from tests.test_classification_service import env, finish  # noqa: F401
 
 
@@ -49,7 +48,9 @@ def test_unexpected_failures_are_reported_not_raised(ready, monkeypatch, caplog)
     monkeypatch.setattr(exporter, "export_knowledge", broken)
     assert tasks.export_knowledge.run() == {"status": "failed", "reason": "unexpected_error"}
     assert "private diagnostic" not in caplog.text
-    assert m.KnowledgeExportBatch.query.count() == 0
+    failure = next(r for r in caplog.records if r.getMessage() == "knowledge_export_failed")
+    assert failure.knowledge_export == {"status": "failed", "reason": "unexpected_error"}
+    assert failure.error_type == "RuntimeError"
 
 
 @pytest.mark.parametrize("enabled", ["true", "false"])

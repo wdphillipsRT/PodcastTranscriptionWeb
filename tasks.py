@@ -853,10 +853,12 @@ def export_knowledge():
         try:
             return exporter.export_knowledge(session=db.session, storage=get_processing_storage(),
                 settings=settings, inbox=settings.KNOWLEDGE_EXPORT_INBOX, now=utc_now()).as_dict()
-        except Exception:
+        except Exception as error:
             db.session.rollback()
             result = {"status": "failed", "reason": "unexpected_error"}
-            logging.getLogger(__name__).warning("knowledge_export_failed", extra={"knowledge_export": result})
+            # The type names the cause (e.g. SoftTimeLimitExceeded) without paths or messages.
+            logging.getLogger(__name__).warning("knowledge_export_failed", extra={
+                "knowledge_export": result, "error_type": type(error).__name__})
             return result
 
 
