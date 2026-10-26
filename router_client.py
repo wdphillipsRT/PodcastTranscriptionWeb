@@ -30,7 +30,9 @@ After any other failure the caller must use a new key.
 `RouterError.reason` is a closed, payload-free detail (see REASONS). The caller
 uses it where the category alone is not enough: a key whose 202 `in_progress`
 persists past the call's own time bound is stuck (the router restarted
-mid-generation and never expires in-progress keys), so the caller advances it.
+mid-generation and never expires in-progress keys), so the caller advances it;
+and a 409 `conflict` (the key was first sent with a different body, for example
+before a setting changed) is retried under a new key within the attempt budget.
 
 A RouterError raised by this client itself carries no exception chain
 (`__cause__` and `__context__` are None), because a requests exception holds the
@@ -86,7 +88,7 @@ REASONS = frozenset({
     "token",             # unusable token file
     "refused",           # a request this client will not send
     "too_large",         # too large for the route's context or output budget
-    "conflict",          # 409 idempotency conflict
+    "conflict",          # 409 LAMAD_IDEMPOTENCY_CONFLICT: the key's stored body differs
     "rejected",          # any other 4xx
     "mismatch",          # selected_model is not the expected model
 })
@@ -344,4 +346,5 @@ class RouterClient:
             if code is None:
                 _fail("router_busy", "proxy", advance_key=False)
             _fail("router_busy", "no_candidate" if code == "MODEL_NO_ELIGIBLE_CANDIDATE" else "router_failure")
-        _fail("model_config", "conflict" if status == 409 else "rejected")
+        # The router's only 409 is an idempotency key reused with a different body.
+        _fail("model_config", "conflict" if status == 409 and code == "LAMAD_IDEMPOTENCY_CONFLICT" else "rejected")

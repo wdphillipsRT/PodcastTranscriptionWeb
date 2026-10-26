@@ -440,3 +440,68 @@ def test_aged_queued_retry_replays_without_consuming_fifth_attempt(worker, phase
     assert 241 <= worker.sent[-1][2]["countdown"] <= 270
     reconcile()
     assert len(worker.sent) == 1 and revision.attempts == 4
+
+
+def test_a_busy_router_retries_the_same_block_with_doubling_back_off(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.sent.clear()
+    worker.env.classifier.error = ClassifierError("router_busy", advance_key=False)
+    for attempt in range(1, 9):
+        task().run(identity, "block", 1)
+        revision = db.session.get(m.ClassificationRevision, identity)
+        block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+        assert (revision.state, revision.attempts, revision.error_category) == ("retrying", 0, "router_busy")
+        assert (block.state, block.error_category, block.attempts) == ("pending", "router_busy", attempt)
+        options = worker.sent[-1][2]
+        assert options["task_id"].endswith("-b1") and options["countdown"] == min(600, 30 * 2 ** (attempt - 1))
+    assert [entry[1] for entry in worker.sent] == [[identity, "block", 1]] * 8
+    assert set(worker.env.classifier.keys) == {f"podcast.classification:rev-{identity}:block-1:g0"}
+    worker.env.classifier.error = None
+    task().run(identity, "block", 1)
+    task().run(identity, "finalize")
+    assert db.session.get(m.ClassificationRevision, identity).state == "completed"
+
+
+def test_only_stored_outcomes_change_the_block_key_and_only_real_failures_count(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    for error in (ClassifierError("router_busy"), ClassifierError("router_busy", advance_key=False),
+                  ClassifierError("model_invalid_output"), None):
+        worker.env.classifier.error = error
+        task().run(identity, "block", 1)
+    prefix = f"podcast.classification:rev-{identity}:block-1:g"
+    assert worker.env.classifier.keys == [prefix + "0", prefix + "1", prefix + "1", prefix + "2"]
+    revision = db.session.get(m.ClassificationRevision, identity)
+    assert revision.attempts == 1 and revision.state == "running"
+
+
+def test_a_key_conflict_retries_under_a_new_key_within_the_attempt_budget(worker):
+    # The block's stored request no longer matches (for example CLASSIFIER_TIMEOUT_SECONDS changed
+    # while it waited): a new key generation is tried, and each try is a counted failure.
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.sent.clear()
+    worker.env.classifier.error = ClassifierError("model_config", reason="conflict")
+    for attempt in range(1, 6):
+        task().run(identity, "block", 1)
+        revision = db.session.get(m.ClassificationRevision, identity)
+        assert (revision.attempts, revision.error_category) == (attempt, "model_config")
+        assert revision.state == ("retrying" if attempt < 5 else "failed")
+    assert len(worker.sent) == 4 and all(entry[1] == [identity, "block", 1] for entry in worker.sent)
+    prefix = f"podcast.classification:rev-{identity}:block-1:g"
+    assert worker.env.classifier.keys == [prefix + str(generation) for generation in range(5)]
+    task().run(identity, "block", 1)
+    assert len(worker.env.classifier.keys) == 5
+
+
+def test_a_key_conflict_that_then_succeeds_completes_the_revision(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.env.classifier.error = ClassifierError("model_config", reason="conflict")
+    task().run(identity, "block", 1)
+    worker.env.classifier.error = None
+    task().run(identity, "block", 1)
+    task().run(identity, "finalize")
+    revision = db.session.get(m.ClassificationRevision, identity)
+    assert (revision.state, revision.attempts) == ("completed", 1)

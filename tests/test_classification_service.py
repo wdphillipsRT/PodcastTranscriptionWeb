@@ -892,3 +892,71 @@ def test_prepared_request_explicit_replay_and_committing_mode_remain_compatible(
     request = env.service.prepare_revision_request(item_id)
     assert env.service.ensure_revision(item_id, "manual_retry", idempotency_key="prepared:explicit", prepared_request=request) == first
     assert not db.session().in_transaction()
+
+
+def test_a_busy_router_keeps_the_block_pending_and_its_key(env):
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = ClassifierError("router_busy", advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError) as caught:
+        env.service.run_block(revision_id, 1)
+    assert (caught.value.category, caught.value.retryable, caught.value.advance_key) == ("router_busy", True, False)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.state, block.error_category, block.request_generation) == ("pending", "router_busy", 0)
+    revision = db.session.get(m.ClassificationRevision, revision_id)
+    assert (revision.state, revision.error_category) == ("retrying", "router_busy")
+
+
+@pytest.mark.parametrize("seconds_ago, generation", [(-30, 0), (1, 1)])
+def test_a_key_left_in_progress_advances_only_once_it_is_stuck(env, seconds_ago, generation):
+    from classification_service import IN_PROGRESS_SLACK_SECONDS
+    from router_client import READ_MARGIN_SECONDS
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = ClassifierError("router_busy", reason="in_progress", advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.request_generation, block.request_generation_started_at is not None) == (0, True)
+    stuck_after = env.settings.CLASSIFIER_TIMEOUT_SECONDS + READ_MARGIN_SECONDS + IN_PROGRESS_SLACK_SECONDS
+    block.request_generation_started_at = m.utc_now() - timedelta(seconds=stuck_after + seconds_ago)
+    db.session.commit()
+    with pytest.raises(env.module.ClassificationServiceError) as caught:
+        env.service.run_block(revision_id, 1)
+    assert caught.value.category == "router_busy"
+    db.session.refresh(block)
+    assert (block.state, block.request_generation) == ("pending", generation)
+    assert (block.request_generation_started_at is None) is (generation == 1)
+
+
+@pytest.mark.parametrize("error, generation, state", [
+    (ClassifierError("router_busy"), 1, "pending"),
+    (ClassifierError("model_invalid_output"), 1, "failed"),
+    (ClassifierError("model_invalid_output", advance_key=False), 0, "failed"),
+])
+def test_stored_router_outcomes_advance_the_block_key(env, error, generation, state):
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = error
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.request_generation, block.state) == (generation, state)
+
+
+@pytest.mark.parametrize("reason, retryable, generation, revision_state", [
+    ("conflict", True, 1, "retrying"),   # the key's stored body differs (a setting changed): new key, retry
+    ("rejected", False, 1, "failed"),    # any other 4xx is a client bug
+    (None, False, 1, "failed"),
+])
+def test_only_a_key_conflict_makes_model_config_retryable(env, reason, retryable, generation, revision_state):
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = ClassifierError("model_config", reason=reason)
+    with pytest.raises(env.module.ClassificationServiceError) as caught:
+        env.service.run_block(revision_id, 1)
+    assert (caught.value.category, caught.value.retryable, caught.value.reason) == ("model_config", retryable, reason)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.state, block.error_category, block.request_generation) == ("failed", "model_config", generation)
+    revision = db.session.get(m.ClassificationRevision, revision_id)
+    assert (revision.state, revision.error_category) == (revision_state, "model_config")

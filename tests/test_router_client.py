@@ -80,6 +80,8 @@ def test_a_repeated_key_replays_instead_of_generating_twice(fake_router):  # noq
     (400, FakeRouter.error("MODEL_TASK_INVALID"), "model_config", "rejected", True),
     (404, FakeRouter.error("MODEL_ROUTE_NOT_FOUND"), "model_config", "rejected", True),
     (409, FakeRouter.error("LAMAD_IDEMPOTENCY_CONFLICT"), "model_config", "conflict", True),
+    (409, FakeRouter.error("SOME_OTHER_CONFLICT"), "model_config", "rejected", True),
+    (409, b"", "model_config", "rejected", True),
     (413, FakeRouter.error("MODEL_CONTEXT_TOO_LARGE"), "model_config", "rejected", True),
 ])
 def test_router_responses_map_to_closed_categories(fake_router, status, payload, category, reason,  # noqa: F811

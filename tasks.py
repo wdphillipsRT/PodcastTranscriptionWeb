@@ -963,9 +963,21 @@ def _classification_delay(attempts):
     return min(3600, 30 * 2 ** (attempts - 1)) + random.uniform(1, 30)
 
 
-def _classification_failed(revision_id, phase, ordinal, category):
-    """Caller holds the item lock; revision attempts count failed calls only."""
-    from classification_service import RETRYABLE_CLASSIFICATION_ERRORS, PERMANENT_CLASSIFICATION_ERRORS
+def _busy_delay(block_attempts):
+    """30 seconds, doubling per busy claim of the block, capped at 10 minutes."""
+    return min(600, 30 * 2 ** (min(max(block_attempts, 1), 6) - 1))
+
+
+def _classification_failed(revision_id, phase, ordinal, category, reason=None):
+    """Caller holds the item lock; revision attempts count failed calls only.
+
+    A busy router is not a failure: the attempt budget is untouched, the block
+    returns to pending, and the same block is retried after a back-off that
+    doubles from 30 seconds to 10 minutes. A key conflict (`model_config` with
+    reason `conflict`) is a counted failure retried under the block's next key.
+    """
+    from classification_service import (RETRYABLE_CLASSIFICATION_ERRORS, PERMANENT_CLASSIFICATION_ERRORS,
+                                         key_conflict)
     from extensions import db
     from models import ClassificationRevision, ClassificationBlock, utc_now
     if category not in RETRYABLE_CLASSIFICATION_ERRORS | PERMANENT_CLASSIFICATION_ERRORS:
@@ -974,21 +986,26 @@ def _classification_failed(revision_id, phase, ordinal, category):
     if revision.state in {"completed", "superseded"}:
         db.session.commit()
         return None, None, None
-    revision.attempts += 1
-    retry = category in RETRYABLE_CLASSIFICATION_ERRORS and revision.attempts < 5
+    busy = category == "router_busy"
+    if not busy:
+        revision.attempts += 1
+    retry = busy or (category in RETRYABLE_CLASSIFICATION_ERRORS or key_conflict(category, reason)) and revision.attempts < 5
     revision.state = "retrying" if retry else "failed"
     revision.error_category = "dispatch_pending" if retry else category
     revision.heartbeat_at = utc_now()
+    block_attempts = 1
     if ordinal is not None:
         block = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id, ordinal=ordinal).one_or_none()
         if block is not None and block.state not in {"completed", "superseded"}:
-            block.state, block.error_category = "failed", category
+            block.state, block.error_category = ("pending" if busy else "failed"), category
+        if block is not None:
+            block_attempts = block.attempts
     dispatch = _phase_dispatch(revision, phase, ordinal) if retry else None
     if dispatch:
         revision.celery_task_id = dispatch.task_id
     attempts = revision.attempts
     db.session.commit()
-    countdown = _classification_delay(attempts) if retry else None
+    countdown = _busy_delay(block_attempts) if busy else _classification_delay(attempts) if retry else None
     return dispatch, countdown, category
 
 
@@ -1015,7 +1032,7 @@ def _classification_step(service, revision_id, phase, ordinal=None, *, handoff_s
         if not error.record:
             # A live/stale claim or ambiguous commit is repaired by reconciliation.
             return None, None, None
-        outcome = _classification_failed(revision_id, phase, ordinal, error.category)
+        outcome = _classification_failed(revision_id, phase, ordinal, error.category, error.reason)
         _observe_classification("failed", observation_identity, started, retry_category=outcome[2])
         return outcome
     _observe_classification(phase, observation_identity, started, result=result)

@@ -29,6 +29,7 @@ from models import (ContentItem, ContentSource, SourceItem, SegmentOverride, Sou
                     ClassificationRevision, ClassificationBlock, CLASSIFICATION_REASONS, utc_now)
 from s3_utils import (DEFAULT_MAX_BYTES, StorageError, StorageTransientError,
                       validate_artifact_key)
+from router_client import READ_MARGIN_SECONDS, REASONS as ROUTER_REASONS
 from transcripts import canonical_json, parse_canonical_transcript, TranscriptValidationError
 
 
@@ -39,6 +40,18 @@ PERMANENT_CLASSIFICATION_ERRORS = frozenset({"model_auth", "model_config", "mode
 # Claude-era rows keep these stored names; they are displayed, never produced.
 LEGACY_CLASSIFICATION_ERRORS = {"claude_timeout": "router_busy", "claude_unavailable": "router_busy",
     "claude_invalid_output": "model_invalid_output", "claude_auth": "model_auth", "claude_config": "model_config"}
+# A 202 in_progress this long after the key's first send (beyond the call's own
+# deadline + read margin) means the router lost the generation: it restarted and
+# never expires in-progress keys. The key then advances.
+IN_PROGRESS_SLACK_SECONDS = 120
+
+
+def key_conflict(category, reason):
+    """A 409 on the block's key: its stored body differs (a setting changed while the
+    block waited). Retried under a new key, counted against the attempt budget."""
+    return category == "model_config" and reason == "conflict"
+
+
 SOURCE_SWEEP_RETRY_DELAY_SECONDS = 30
 SOURCE_SWEEP_RETRY_ERRORS = RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}
 _LOCK_NAMESPACE = 0x434C5346
@@ -140,10 +153,12 @@ class FinalizationResult:
 class ClassificationServiceError(RuntimeError):
     """A closed category, never an exception, transcript, or storage payload."""
 
-    def __init__(self, category, *, record=True):
+    def __init__(self, category, *, record=True, advance_key=False, reason=None):
         self.category = category if category in RETRYABLE_CLASSIFICATION_ERRORS | PERMANENT_CLASSIFICATION_ERRORS else "invalid_policy"
-        self.retryable = self.category in RETRYABLE_CLASSIFICATION_ERRORS
+        self.reason = reason if reason in ROUTER_REASONS else None
+        self.retryable = self.category in RETRYABLE_CLASSIFICATION_ERRORS or key_conflict(self.category, self.reason)
         self.record = record
+        self.advance_key = bool(advance_key)
         super().__init__(self.category)
 
 
@@ -762,7 +777,7 @@ class ClassificationService:
             if isinstance(error, ClassificationServiceError):
                 failure = error
             elif isinstance(error, ClassifierError):
-                failure = ClassificationServiceError(error.category)
+                failure = ClassificationServiceError(error.category, advance_key=error.advance_key, reason=error.reason)
             elif isinstance(error, StorageTransientError):
                 failure = ClassificationServiceError("storage_transient")
             else:
@@ -787,7 +802,22 @@ class ClassificationService:
             revision.state = "retrying" if failure.retryable else "failed"
             revision.error_category = failure.category
             if block is not None and block.state not in {"completed", "superseded"}:
-                block.state, block.error_category = "failed", failure.category
+                # A busy router is not a failure: the block waits to be retried as it is.
+                block.state = "pending" if failure.category == "router_busy" else "failed"
+                block.error_category = failure.category
+                if failure.advance_key or self._stuck_in_progress(failure, block):
+                    # The router may have stored an outcome under the current key and would
+                    # replay it forever (or holds the key in progress forever); the next call
+                    # uses a new key.
+                    block.request_generation += 1
+                    block.request_generation_started_at = None
+
+    def _stuck_in_progress(self, failure, block):
+        """A 202 for a key first sent longer ago than any router call can take."""
+        started = block.request_generation_started_at
+        limit = self.settings.CLASSIFIER_TIMEOUT_SECONDS + READ_MARGIN_SECONDS + IN_PROGRESS_SLACK_SECONDS
+        return (failure.category == "router_busy" and failure.reason == "in_progress" and started is not None
+                and (utc_now() - started).total_seconds() > limit)
 
     def _current(self, item, revision, inputs, identity):
         provenance = self._provenance()
@@ -916,6 +946,8 @@ class ClassificationService:
                 block.state, block.started_at, block.heartbeat_at = "running", utc_now(), utc_now()
                 block.attempts += 1
                 block.error_category = None
+                if block.request_generation_started_at is None:
+                    block.request_generation_started_at = block.started_at
                 revision.state, revision.heartbeat_at, revision.error_category = "running", utc_now(), None
                 claim = (block.attempts, block.started_at)
                 ownership["token"] = claim
