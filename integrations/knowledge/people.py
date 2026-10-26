@@ -33,7 +33,12 @@ def source_hosts(source):
 
 
 def item_guests(item, extraction):
-    """Return (name, basis, confidence) guests for one item."""
+    """Return (name, basis, confidence) guests for one item.
+
+    `extraction` must be the item's GuestExtraction for its current input
+    (`input_sha256 == guest_input_sha256(item)`) or None; a stale row would
+    export guests inferred from an old title or description.
+    """
     if item.admin_guests is not None:
         return tuple((name, "admin_set", 1) for name in item.admin_guests)
     if item.feed_guests:
@@ -79,7 +84,7 @@ def parse_admin_names(text, *, limit):
     if not isinstance(text, str) or len(text) > MAX_ADMIN_TEXT_CHARS:
         raise ValueError("names must be text")
     lines = [line for line in text.splitlines() if line.strip()]
-    if len(lines) > limit:
+    if len({" ".join(line.split()).casefold() for line in lines}) > limit:
         raise ValueError("too many names")
     names = person_names(lines, limit=limit)
     if len(names) != len({" ".join(line.split()).casefold() for line in lines}):

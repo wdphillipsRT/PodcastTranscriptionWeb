@@ -63,7 +63,7 @@ def test_admin_names_are_parsed_one_per_line(text, expected):
     assert parse_admin_names(text, limit=10) == expected
 
 
-@pytest.mark.parametrize("text", ["!!!", "\n".join(f"Name {n}" for n in range(11)), "x" * 10_001, None, 7])
+@pytest.mark.parametrize("text", ["!!!", "\n".join(f"Name {n}" for n in range(11)), "\n" * 10_001 + "Ada", None, 7])
 def test_admin_names_reject_unnameable_too_many_or_invalid_input(text):
     with pytest.raises(ValueError):
         parse_admin_names(text, limit=10)
@@ -79,3 +79,7 @@ def test_guest_input_identity_covers_prompt_title_and_description_only():
     assert base == guest_input_sha256(item(title="Episode", description="With   James Clear"))
     assert base != guest_input_sha256(item(title="Episode 2", description="With James Clear"))
     assert GUEST_PROMPT_VERSION == "episode-guest-extraction/v1"
+
+
+def test_admin_names_limit_counts_unique_names():
+    assert parse_admin_names("\n".join(["Ada"] + [f"Name {n}" for n in range(9)] + ["ADA"]), limit=10)[0] == "Ada"
