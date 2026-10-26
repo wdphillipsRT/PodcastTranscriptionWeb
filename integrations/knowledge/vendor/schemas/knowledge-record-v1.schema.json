@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema://bezalel/knowledge-record/v1",
+  "title": "Knowledge record v1",
+  "$comment": "Structural rules only. Cross-field rules and RFC 3339 timestamp checks are enforced by reference/knowledge_contract.py (KNOWLEDGE-INTAKE-0001).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_id", "kind", "title", "summary", "content", "source", "observed_at", "attributes", "rights", "sensitivity"],
+  "properties": {
+    "schema_version": {"const": "knowledge-record/v1"},
+    "record_id": {"$ref": "#/$defs/record_id"},
+    "kind": {"enum": [
+      "podcast.episode", "podcast.segment",
+      "issachar.article", "issachar.evidence_span", "issachar.theme_version",
+      "issachar.forecast_contract", "issachar.forecast", "issachar.resolution", "issachar.calibration"
+    ]},
+    "title": {"type": "string", "minLength": 1, "maxLength": 500},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "content": {"oneOf": [
+      {"type": "null"},
+      {
+        "type": "object", "additionalProperties": false,
+        "required": ["sha256", "media_type", "bytes"],
+        "properties": {
+          "sha256": {"$ref": "#/$defs/sha256"},
+          "media_type": {"enum": ["text/plain; charset=utf-8", "text/markdown; charset=utf-8", "application/json"]},
+          "bytes": {"type": "integer", "minimum": 0, "maximum": 1073741824}
+        }
+      }
+    ]},
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["uri", "publisher", "published_at", "retrieved_at"],
+      "properties": {
+        "uri": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "publisher": {"type": ["string", "null"], "maxLength": 500},
+        "published_at": {"type": ["string", "null"], "format": "date-time"},
+        "retrieved_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "observed_at": {"type": "string", "format": "date-time"},
+    "valid_from": {"type": ["string", "null"], "format": "date-time"},
+    "valid_until": {"type": ["string", "null"], "format": "date-time"},
+    "participants": {"type": "array", "maxItems": 50, "uniqueItems": true, "items": {"$ref": "#/$defs/participant"}},
+    "attributes": {"type": "object"},
+    "relations": {
+      "type": "array", "maxItems": 500, "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["type", "target_record_id"],
+        "properties": {
+          "type": {"enum": ["derived_from", "cites", "resolves", "part_of"]},
+          "target_record_id": {"$ref": "#/$defs/record_id"}
+        }
+      }
+    },
+    "supersedes": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/record_id"}]},
+    "rights": {
+      "type": "object", "additionalProperties": false,
+      "required": ["basis", "redistribution", "training"],
+      "properties": {
+        "basis": {"const": "personal_research"},
+        "redistribution": {"const": "none"},
+        "training": {"const": "requires_approval"}
+      }
+    },
+    "sensitivity": {"enum": ["internal"]}
+  },
+  "if": {"required": ["kind"], "properties": {"kind": {"enum": ["podcast.episode", "podcast.segment"]}}},
+  "then": {"properties": {"attributes": {"required": ["platform"], "properties": {"platform": {"enum": ["podcast", "youtube"]}}}}},
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}(?!\\n)$"},
+    "record_id": {"type": "string", "maxLength": 512, "pattern": "^(podcast|issachar):[a-z]+\\.[a-z_]+:[A-Za-z0-9._:/@+-]+(?!\\n)$"},
+    "participant": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "role", "basis", "confidence", "entity_id"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 300},
+        "role": {"enum": ["host", "co_host", "guest"]},
+        "basis": {"enum": ["feed_declared", "admin_set", "inferred"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "entity_id": {"type": "string", "pattern": "^person:[a-z0-9][a-z0-9-]{0,127}(?!\\n)$"}
+      }
+    }
+  }
+}
