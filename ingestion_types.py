@@ -83,6 +83,9 @@ def normalize_public_url(value: str) -> str:
 
 
 MAX_PERSON_NAME_CHARS = 300
+# Zero-width (non-)joiners spell real Persian and Indic names; other format
+# characters (bidi overrides, zero-width spaces) are dropped with the name.
+_NAME_JOINERS = frozenset("\u200c\u200d")
 
 
 def person_names(values, *, limit: int) -> tuple[str, ...]:
@@ -99,7 +102,8 @@ def person_names(values, *, limit: int) -> tuple[str, ...]:
             raise TypeError("person names must be strings")
         name = " ".join(value.split())
         if (not name or len(name) > MAX_PERSON_NAME_CHARS
-                or any(unicodedata.category(char) in ("Cc", "Cf") for char in name)):
+                or any(unicodedata.category(char) in ("Cc", "Cf") and char not in _NAME_JOINERS
+                       for char in name)):
             continue
         if name.casefold() not in seen:
             seen.add(name.casefold())

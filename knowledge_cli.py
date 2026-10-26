@@ -41,7 +41,7 @@ def seed_hosts():
     seeded = 0
     for source in db.session.scalars(sa.select(ContentSource).where(
             ContentSource.feed_hosts.is_(None), ContentSource.source_type.like("youtube_%"))
-            .order_by(ContentSource.id)):
+            .order_by(ContentSource.id).with_for_update(of=ContentSource)):  # discovery may write feed_hosts
         if source.source_type == "youtube_channel":
             names = [source.name]
         else:

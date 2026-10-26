@@ -159,3 +159,8 @@ def test_person_names_rejects_a_non_positive_limit(limit):
 @pytest.mark.parametrize("name", ["Bad\x80Name", "Bad\u202eName", "Bad\u200bName", "Bad\x9bName"])
 def test_person_names_drop_format_and_c1_control_characters(name):
     assert person_names([name, "Kept"], limit=5) == ("Kept",)
+
+
+def test_person_names_keep_zero_width_joiners():
+    names = ["\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645", "\u0915\u094d\u200d\u0937"]
+    assert person_names(names, limit=5) == tuple(names)

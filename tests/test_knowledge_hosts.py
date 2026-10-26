@@ -30,6 +30,17 @@ def test_discovery_records_feed_hosts_and_guests(store):
     assert items["2"].feed_guests is None and items["2"].guests_updated_at is None
 
 
+def test_unchanged_hosts_and_guests_keep_their_timestamps(store):
+    source = store()
+    page = lambda: DiscoveryPage(items=[descriptor(1, guests=["James Clear"])], source_hosts=["Ada Host"])
+    discover(source, page())
+    discover(source, page())
+    hosts_at, guests_at = source.hosts_updated_at, ContentItem.query.one().guests_updated_at
+    assert hosts_at is not None and guests_at is not None
+    discover(source, page())
+    assert source.hosts_updated_at == hosts_at and ContentItem.query.one().guests_updated_at == guests_at
+
+
 def test_feed_changes_never_move_admin_overrides(store):
     source = store()
     source.admin_hosts, source.hosts_updated_at = ["Admin Host"], None
