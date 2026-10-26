@@ -8,15 +8,24 @@ description (compared after NFKC normalisation and case folding) are kept,
 spelled as the episode text spells them, and every result is marked `inferred`.
 
 Limits: before each call the run re-reads today's (UTC) recorded calls and stops
-at GUEST_EXTRACTION_MAX_CALLS_PER_DAY (`daily_limit`). At most
+at GUEST_EXTRACTION_MAX_CALLS_PER_DAY (`daily_limit`). Only recorded calls count:
+the unrecorded call that stops a run (busy or environmental, below) is not
+counted, and there is at most one per run. At most
 GUEST_EXTRACTION_MAX_ITEMS_PER_RUN items run per hourly run, and no call starts
-that could outlast RUN_DEADLINE_SECONDS. Each input is extracted once: an invalid
-result is recorded as failed and never retried for that input, and the run moves
-on. A busy router (`router_busy`) stops the run without a record, so the item is
-tried again next run. Environmental failures (authentication, configuration, a
-model other than the pinned one) also stop the run unrecorded. Router calls cost
-nothing; `cost_microusd` is recorded as 0. Runs never overlap (a PostgreSQL
-session advisory lock).
+that could outlast RUN_DEADLINE_SECONDS, counting the call's deadline plus the
+client's connect timeout and read margin. Each input is extracted once: an
+invalid result is recorded as failed and never retried for that input, and the
+run moves on. A busy router (`router_busy`: in progress, rate limited, a timeout,
+a dropped connection, the proxy, no eligible candidate) stops the run without a
+record, so the item is tried again next run. A router failure with the router's
+own error body (`router_busy` with reason `router_failure`, such as 504
+MODEL_TIMEOUT for an input the model never finishes) is recorded as failed and
+then stops the run: items run newest first under a new key each run, so leaving
+it unrecorded would retry that input first in every run and block every other
+item. Environmental failures (authentication, configuration, a model other than
+the pinned one) stop the run unrecorded. Router calls cost nothing;
+`cost_microusd` is recorded as 0. Runs never overlap (a PostgreSQL session
+advisory lock).
 """
 
 from contextlib import contextmanager
@@ -32,7 +41,8 @@ import sqlalchemy as sa
 
 from ingestion_types import person_names
 from integrations.knowledge.people import guest_input_sha256, has_host, participants, plain_text, source_hosts
-from router_client import GUEST_MAX_OUTPUT_TOKENS, GUEST_ROUTE, RouterClient, RouterError
+from router_client import (CONNECT_TIMEOUT_SECONDS, GUEST_MAX_OUTPUT_TOKENS, GUEST_ROUTE, READ_MARGIN_SECONDS,
+                           RouterClient, RouterError)
 from transcripts import canonical_json
 
 
@@ -55,7 +65,9 @@ OUTPUT_SCHEMA = {
 MAX_DESCRIPTION_CHARS = 6_000
 # Failures no item can fix: they stop the run unrecorded.
 ENVIRONMENTAL = frozenset({"model_auth", "model_config", "model_mismatch"})
-RUN_DEADLINE_SECONDS = 600
+# Room for one call at the longest GUEST_EXTRACTION_TIMEOUT_SECONDS (600) plus the
+# client's connect timeout and read margin; well inside the 1800 s soft time limit.
+RUN_DEADLINE_SECONDS = 900
 RUN_LOCK_KEY = 0x5047_5545_5354_0001
 
 
@@ -66,7 +78,10 @@ class GuestResult:
 
 
 def _fail(category="model_invalid_output"):
-    raise RouterError(category) from None
+    """Raise a chain-free RouterError. Never call it inside an `except` block (that sets __context__)."""
+    error = RouterError(category)
+    error.__cause__ = error.__context__ = None
+    raise error
 
 
 def _searchable(text):
@@ -96,30 +111,35 @@ def _verbatim(name, texts):
 
 def _result(parsed, texts):
     try:
-        if not isinstance(parsed, dict) or set(parsed) != {"guests"}:
-            _fail()
-        entries = parsed["guests"]
-        if not isinstance(entries, list) or len(entries) > 10:
-            _fail()
-        guests, seen = [], set()
-        for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {"name", "confidence"}:
-                _fail()
-            confidence = entry["confidence"]
-            if (not isinstance(entry["name"], str) or type(confidence) not in (int, float)
-                    or not math.isfinite(confidence) or not 0 <= confidence <= 1):
-                _fail()
-            for candidate in person_names([entry["name"]], limit=1):
-                for name in person_names([_verbatim(candidate, texts) or ""], limit=1):
-                    if name.casefold() in seen:
-                        continue
-                    seen.add(name.casefold())
-                    guests.append((name, float(Decimal(str(confidence)).quantize(Decimal("0.01"), ROUND_HALF_UP))))
-        return GuestResult(tuple(guests))
+        return _parse(parsed, texts)
     except RouterError:
         raise
     except (ValueError, TypeError, KeyError, ArithmeticError, UnicodeError, RecursionError):
+        pass
+    _fail()  # Outside the handler, so the error carries no payload-bearing chain.
+
+
+def _parse(parsed, texts):
+    if not isinstance(parsed, dict) or set(parsed) != {"guests"}:
         _fail()
+    entries = parsed["guests"]
+    if not isinstance(entries, list) or len(entries) > 10:
+        _fail()
+    guests, seen = [], set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"name", "confidence"}:
+            _fail()
+        confidence = entry["confidence"]
+        if (not isinstance(entry["name"], str) or type(confidence) not in (int, float)
+                or not math.isfinite(confidence) or not 0 <= confidence <= 1):
+            _fail()
+        for candidate in person_names([entry["name"]], limit=1):
+            for name in person_names([_verbatim(candidate, texts) or ""], limit=1):
+                if name.casefold() in seen:
+                    continue
+                seen.add(name.casefold())
+                guests.append((name, float(Decimal(str(confidence)).quantize(Decimal("0.01"), ROUND_HALF_UP))))
+    return GuestResult(tuple(guests))
 
 
 class RouterGuestExtractor:
@@ -134,6 +154,7 @@ class RouterGuestExtractor:
                                   "known_hosts": list(hosts)[:10], **text})
         texts = (_searchable(text["title"]), _searchable(text["description"]))
         key = request_key if request_key is not None else f"podcast.guests:adhoc:{uuid.uuid4().hex}"
+        result = None
         try:
             result = self.client.run(GUEST_ROUTE, [{"role": "system", "content": SYSTEM_PROMPT},
                                                    {"role": "user", "content": payload}],
@@ -143,7 +164,9 @@ class RouterGuestExtractor:
         except RouterError:
             raise
         except (OSError, ValueError, TypeError, AttributeError):
-            _fail("model_config")
+            pass
+        if result is None:
+            _fail("model_config")  # Outside the handler, so the error carries no payload-bearing chain.
         return _result(result.parsed, texts)
 
 
@@ -227,7 +250,8 @@ def _extract(session, extractor, settings, clock, monotonic, counts):
             break
     session.commit()  # No database transaction is held across a router call.
     for entry in work:
-        if monotonic() - started + settings.GUEST_EXTRACTION_TIMEOUT_SECONDS > RUN_DEADLINE_SECONDS:
+        longest_call = settings.GUEST_EXTRACTION_TIMEOUT_SECONDS + CONNECT_TIMEOUT_SECONDS + READ_MARGIN_SECONDS
+        if monotonic() - started + longest_call > RUN_DEADLINE_SECONDS:
             counts["stopped"] = "run_deadline"
             break
         if _calls_today(session, clock()) >= settings.GUEST_EXTRACTION_MAX_CALLS_PER_DAY:
@@ -239,7 +263,8 @@ def _extract(session, extractor, settings, clock, monotonic, counts):
             result = extractor.extract(show=entry["show"], hosts=entry["hosts"], title=entry["title"],
                                        description=entry["description"], request_key=key)
         except RouterError as error:
-            if error.category in ENVIRONMENTAL or error.category == "router_busy":
+            recorded_busy = error.category == "router_busy" and error.reason == "router_failure"
+            if error.category in ENVIRONMENTAL or (error.category == "router_busy" and not recorded_busy):
                 counts["stopped"] = error.category
                 break
             session.add(GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], state="failed",
@@ -247,6 +272,9 @@ def _extract(session, extractor, settings, clock, monotonic, counts):
                 created_at=clock()))
             session.commit()
             counts["failed"] += 1
+            if recorded_busy:  # The router itself is failing: record this input, then stop until next run.
+                counts["stopped"] = error.category
+                break
             continue
         session.add(GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], state="completed",
             guests=[{"name": name, "confidence": confidence} for name, confidence in result.guests],

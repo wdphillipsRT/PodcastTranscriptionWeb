@@ -13,8 +13,8 @@ from config import ConfigError, load_settings
 from extensions import db
 from integrations.knowledge.people import guest_input_sha256
 import models as m
-from router_client import (GUEST_MAX_OUTPUT_TOKENS, ROUTE_LIMITS, RouterClient, RouterError,
-                           estimated_context_tokens)
+from router_client import (CONNECT_TIMEOUT_SECONDS, GUEST_MAX_OUTPUT_TOKENS, READ_MARGIN_SECONDS, ROUTE_LIMITS,
+                           RouterClient, RouterError, estimated_context_tokens)
 from tests.router_fake import MODEL, FakeRouter, fake_router  # noqa: F401
 from tests.router_schema_validator import validate_schema
 from tests.test_classification_service import add_item, env, finish  # noqa: F401
@@ -116,6 +116,38 @@ def test_invalid_results_and_router_failures_fail_closed(run, setup, category):
     with pytest.raises(RouterError) as caught:
         invoke()
     assert caught.value.category == category
+
+
+def test_a_router_failure_body_keeps_its_reason(run):
+    invoke, router = run
+    router.reply(504, FakeRouter.error("MODEL_TIMEOUT"))
+    with pytest.raises(RouterError) as caught:
+        invoke([])
+    assert (caught.value.category, caught.value.reason) == ("router_busy", "router_failure")
+
+
+class _BrokenClient:
+    expected_model = MODEL
+
+    def run(self, *arguments, **keywords):
+        raise OSError("/router/token: secret detail")
+
+
+def test_failures_carry_no_exception_chain(valid_environment, monkeypatch):  # noqa: F811
+    settings = load_settings({**valid_environment, "GUEST_EXTRACTION_ENABLED": "true"})
+    extractor = guest_extractor.RouterGuestExtractor(settings, client=_BrokenClient())
+    with pytest.raises(RouterError) as caught:
+        extractor.extract(show="Show", hosts=(), title=TITLE, description=DESCRIPTION)
+    assert caught.value.category == "model_config"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+    def broken(*arguments, **keywords):
+        raise ValueError("secret detail")
+    monkeypatch.setattr(guest_extractor, "person_names", broken)
+    with pytest.raises(RouterError) as caught:
+        guest_extractor._result({"guests": [{"name": "James Clear", "confidence": 0.5}]}, ())
+    assert caught.value.category == "model_invalid_output"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 def test_guest_settings_defaults_and_validation(valid_environment):  # noqa: F811
@@ -245,6 +277,26 @@ def test_a_busy_router_stops_the_run_unrecorded_and_the_item_waits_for_the_next_
     assert extract(ready) == {"scanned": 2, "extracted": 2, "failed": 0, "stopped": None}
 
 
+def test_a_router_failure_is_recorded_and_stops_the_run_so_the_next_run_moves_on(ready):
+    """A provider timeout (504 MODEL_TIMEOUT) would recur for the newest item and block every run."""
+    newer = newer_item(ready)
+    ready.extractor.errors = [RouterError("router_busy", reason="router_failure")]
+    assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 1, "stopped": "router_busy"}
+    failed = m.GuestExtraction.query.one()
+    assert (failed.item_id, failed.state, failed.error_category, failed.cost_microusd, failed.model) == (
+        newer.id, "failed", "router_busy", 0, MODEL)
+    assert extract(ready) == {"scanned": 1, "extracted": 1, "failed": 0, "stopped": None}
+    assert m.GuestExtraction.query.filter_by(item_id=ready.item.id).one().state == "completed"
+
+
+@pytest.mark.parametrize("reason", ["in_progress", "rate_limited", "timeout", "transport", "proxy", "no_candidate"])
+def test_other_busy_reasons_stay_unrecorded(ready, reason):
+    newer_item(ready)
+    ready.extractor.errors = [RouterError("router_busy", reason=reason, advance_key=False)]
+    assert extract(ready)["stopped"] == "router_busy"
+    assert m.GuestExtraction.query.count() == 0
+
+
 def test_invalid_output_is_recorded_once_and_the_run_continues(ready):
     newer = newer_item(ready)
     ready.extractor.errors = [RouterError("model_invalid_output")]
@@ -268,11 +320,19 @@ def test_todays_calls_are_reread_per_call_and_rows_are_stamped_when_recorded(rea
 
 
 def test_no_call_starts_that_could_outlast_the_run_deadline(ready):
+    """A call can take its deadline plus the client's connect timeout and read margin."""
     newer_item(ready)
-    monotonic = lambda: 0.0 if not ready.extractor.calls else 541.0  # noqa: E731
+    worst = 60 + CONNECT_TIMEOUT_SECONDS + READ_MARGIN_SECONDS
+    last_start = guest_extractor.RUN_DEADLINE_SECONDS - worst
+    monotonic = lambda: 0.0 if not ready.extractor.calls else last_start + 1.0  # noqa: E731
     assert extract(ready, monotonic=monotonic, GUEST_EXTRACTION_TIMEOUT_SECONDS=60) == {
         "scanned": 1, "extracted": 1, "failed": 0, "stopped": "run_deadline"}
-    assert extract(ready, monotonic=lambda: 540.0, GUEST_EXTRACTION_TIMEOUT_SECONDS=60)["extracted"] == 1
+    assert extract(ready, monotonic=lambda: float(last_start), GUEST_EXTRACTION_TIMEOUT_SECONDS=60)["extracted"] == 1
+
+
+def test_the_longest_allowed_call_still_fits_one_run(ready):
+    assert 600 + CONNECT_TIMEOUT_SECONDS + READ_MARGIN_SECONDS <= guest_extractor.RUN_DEADLINE_SECONDS
+    assert extract(ready, GUEST_EXTRACTION_TIMEOUT_SECONDS=600)["extracted"] == 1
 
 
 class _Connection:
