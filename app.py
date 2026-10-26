@@ -29,6 +29,7 @@ def create_app(config_override: Mapping | None = None) -> Flask:
 
     from admin_cli import admin_cli
     from classification_cli import classification_cli
+    from knowledge_cli import knowledge_cli
     from system_checks import ReadinessCache, system_cli
     from web.auth import auth
     from web.routes import workspace
@@ -43,6 +44,7 @@ def create_app(config_override: Mapping | None = None) -> Flask:
 
     app.cli.add_command(admin_cli)
     app.cli.add_command(classification_cli)
+    app.cli.add_command(knowledge_cli)
     app.cli.add_command(system_cli)
     readiness = ReadinessCache()
     app.register_blueprint(auth)

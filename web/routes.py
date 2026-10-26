@@ -202,7 +202,8 @@ def add_source():
             raise ValueError
         # Keep only canonical normalized fields and the typed discovery metadata.
         canonical = SourceDescriptor(descriptor.source_type, descriptor.external_id, descriptor.canonical_url,
-                                     descriptor.title, descriptor.description, descriptor.image_url)
+                                     descriptor.title, descriptor.description, descriptor.image_url,
+                                     hosts=descriptor.hosts)
         if not isinstance(canonical.external_id, str) or not 0 < len(canonical.external_id) <= 1024:
             raise ValueError
         if not isinstance(canonical.title, str) or not 0 < len(canonical.title) <= 500:
@@ -219,7 +220,8 @@ def add_source():
     source = ContentSource(admin_id=current_user.id, source_type=canonical.source_type,
         external_id=canonical.external_id, canonical_url=canonical.canonical_url, name=canonical.title,
         description=canonical.description, image_url=canonical.image_url, provider_metadata=metadata,
-        initial_item_limit=25, next_check_at=utc_now())
+        initial_item_limit=25, next_check_at=utc_now(), feed_hosts=list(canonical.hosts) or None,
+        hosts_updated_at=utc_now() if canonical.hosts else None)
     try:
         db.session.add(source)
         db.session.flush()
