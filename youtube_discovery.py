@@ -249,7 +249,8 @@ class YouTubeDiscoveryClient:
             data = self._request("videos", id=identity)
             item = self._videos(data, [identity], kind, identity)[0]
             return SourceDescriptor(kind, identity, item.canonical_url, item.title, item.description,
-                                    item.thumbnail_url, {"channel_id": item.channel_id})
+                                    item.thumbnail_url, {"channel_id": item.channel_id},
+                                    hosts=(item.channel_name,) if item.channel_name else ())
         resource = "channels" if kind == "youtube_channel" else "playlists"
         data = self._request(resource, **{selector: identity})
         entry = self._single(data, identity if selector == "id" else None)
@@ -267,8 +268,11 @@ class YouTubeDiscoveryClient:
                         "channel_name": _text(snippet.get("channelTitle"))}
             canonical = f"https://www.youtube.com/playlist?list={identity}"
         try:
-            return SourceDescriptor(kind, identity, canonical, _text(snippet.get("title"), required=True),
-                                    _text(snippet.get("description", "")), _thumbnail(snippet), metadata)
+            title = _text(snippet.get("title"), required=True)
+            # The channel owner is the host: the channel itself, or the playlist's channel.
+            owner = title if kind == "youtube_channel" else metadata.get("channel_name")
+            return SourceDescriptor(kind, identity, canonical, title, _text(snippet.get("description", "")),
+                                    _thumbnail(snippet), metadata, hosts=(owner,) if owner else ())
         except IngestionError:
             raise YouTubeDiscoveryError("invalid_response") from None
 
