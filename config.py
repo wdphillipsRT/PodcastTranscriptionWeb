@@ -68,6 +68,10 @@ class Settings:
     GUEST_EXTRACTION_DAILY_BUDGET_USD: Decimal = Decimal("1.00")
     GUEST_EXTRACTION_MAX_ITEMS_PER_RUN: int = 25
     GUEST_EXTRACTION_INTERVAL_SECONDS: int = 3600
+    KNOWLEDGE_EXPORT_ENABLED: bool = False
+    KNOWLEDGE_EXPORT_INBOX: str = "/spool/podcast/inbox"
+    KNOWLEDGE_EXPORT_MAX_BATCHES_PER_RUN: int = 5
+    KNOWLEDGE_EXPORT_MAX_RECORDS_PER_BATCH: int = 10_000
 
 
 _REQUIRED = (
@@ -180,6 +184,18 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
     if enabled not in {"true", "false"}:
         raise ConfigError("GUEST_EXTRACTION_ENABLED must be true or false")
     values["GUEST_EXTRACTION_ENABLED"] = enabled == "true"
+    enabled = environment.get("KNOWLEDGE_EXPORT_ENABLED", "false").strip().lower()
+    if enabled not in {"true", "false"}:
+        raise ConfigError("KNOWLEDGE_EXPORT_ENABLED must be true or false")
+    values["KNOWLEDGE_EXPORT_ENABLED"] = enabled == "true"
+    inbox = _nonempty(environment, "KNOWLEDGE_EXPORT_INBOX", Settings.KNOWLEDGE_EXPORT_INBOX)
+    if not inbox.startswith("/") or "\x00" in inbox or "/../" in inbox + "/":
+        raise ConfigError("KNOWLEDGE_EXPORT_INBOX must be an absolute path")
+    values["KNOWLEDGE_EXPORT_INBOX"] = inbox
+    if values["KNOWLEDGE_EXPORT_MAX_RECORDS_PER_BATCH"] > 10_000:
+        raise ConfigError("KNOWLEDGE_EXPORT_MAX_RECORDS_PER_BATCH must not exceed 10000")
+    if values["KNOWLEDGE_EXPORT_MAX_BATCHES_PER_RUN"] > 999:
+        raise ConfigError("KNOWLEDGE_EXPORT_MAX_BATCHES_PER_RUN must not exceed 999")
 
     secure = environment.get("SESSION_COOKIE_SECURE", "true").strip().lower()
     if secure not in {"true", "false"}:
