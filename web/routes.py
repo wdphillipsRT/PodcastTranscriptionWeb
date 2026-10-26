@@ -159,7 +159,10 @@ def item_people(row):
         guests=[dict(name=name, basis=PEOPLE_BASIS_LABELS[basis], inferred=basis == "inferred",
                      confidence=confidence) for name, basis, confidence in guests],
         guests_overridden=row.admin_guests is not None,
-        guests_text="\n".join(row.admin_guests if row.admin_guests is not None else [g[0] for g in guests]))
+        # Inferred guests are never prefilled: saving the form unchanged must not
+        # turn a model's guess into an administrator-set guest.
+        guests_text="\n".join(row.admin_guests if row.admin_guests is not None
+                              else [name for name, basis, _ in guests if basis != "inferred"]))
 
 
 def item_view(item, classification=None):
@@ -426,12 +429,12 @@ def update_item_guests(item_id):
 @workspace.post("/items/<int:item_id>/guests/reset")
 @login_required
 def reset_item_guests(item_id):
+    """Drop the administrator guest list so feed, then inferred, guests apply."""
     row = item_owned(item_id)
     classification_payload(set())
     row.admin_guests, row.guests_updated_at = None, utc_now()
     db.session.commit()
     guests = item_people(row)[0]
-    db.session.commit()
     return result(dict(id=row.id, guests=[name for name, _, _ in guests]),
                   location=url_for("workspace.item", item_id=row.id), message="Guests reset.")
 

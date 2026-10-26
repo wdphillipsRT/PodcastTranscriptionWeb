@@ -63,6 +63,8 @@ def test_item_page_shows_guests_with_basis_and_accepts_corrections(workspace):  
     page = workspace.client.get(f"/items/{item_id}").get_data(as_text=True)
     assert "Grace Hopper · Inferred from the title and description · confidence 0.81" in page
     assert "Hosts: none" in page
+    # The correction form is not prefilled with the model's guess.
+    assert '<textarea id="guests" name="guests" rows="3" maxlength="10000"></textarea>' in page
     response = workspace.client.post(f"/items/{item_id}/guests", data={"guests": "Grace Hopper\nAlan Turing"})
     assert response.status_code == 303
     page = workspace.client.get(f"/items/{item_id}").get_data(as_text=True)
