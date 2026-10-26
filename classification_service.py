@@ -17,10 +17,10 @@ import secrets
 import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 
-from claude_classifier import (BlockDecision, ClassifierExample, ClassifierError,
-                               ClassifierResult, SYSTEM_PROMPT)
+from router_classifier import (BlockDecision, ClassifierExample, ClassifierError,
+                               ClassifierResult, expected_provenance)
 from commercial_policy import (ClassificationRange, ClassifierProvenance,
-    LearningProjection, SegmentPolicy, POLICY_VERSION, PROMPT_VERSION, LABELS,
+    LearningProjection, SegmentPolicy, POLICY_VERSION, LABELS, MAX_INTEGER,
     REASON_CODES, SIGNAL_CODES, MAX_BLOCKS_PER_REVISION, MAX_BLOCK_TEXT_CHARS,
     TARGET_SEGMENTS_PER_BLOCK, build_segment_policy, build_learning_projection)
 from commercial_signals import (CommercialSignalError, ExactRule, build_classifier_windows, collect_signals,
@@ -29,15 +29,55 @@ from models import (ContentItem, ContentSource, SourceItem, SegmentOverride, Sou
                     ClassificationRevision, ClassificationBlock, CLASSIFICATION_REASONS, utc_now)
 from s3_utils import (DEFAULT_MAX_BYTES, StorageError, StorageTransientError,
                       validate_artifact_key)
+from router_client import READ_MARGIN_SECONDS, REASONS as ROUTER_REASONS
 from transcripts import canonical_json, parse_canonical_transcript, TranscriptValidationError
 
 
-RETRYABLE_CLASSIFICATION_ERRORS = frozenset({"claude_timeout", "claude_unavailable",
-    "claude_invalid_output", "storage_transient", "dispatch_pending", "worker_timeout"})
-PERMANENT_CLASSIFICATION_ERRORS = frozenset({"claude_auth", "claude_config", "model_mismatch",
+RETRYABLE_CLASSIFICATION_ERRORS = frozenset({"router_busy", "model_invalid_output",
+    "storage_transient", "dispatch_pending", "worker_timeout"})
+PERMANENT_CLASSIFICATION_ERRORS = frozenset({"model_auth", "model_config", "model_mismatch",
     "invalid_canonical", "invalid_policy", "revision_budget_exhausted"})
+# Claude-era rows keep these stored names; they are displayed, never produced. Retry
+# decisions read them through current_error_category, so a row that was retrying
+# under Claude keeps retrying under its router-era equivalent.
+LEGACY_CLASSIFICATION_ERRORS = {"claude_timeout": "router_busy", "claude_unavailable": "router_busy",
+    "claude_invalid_output": "model_invalid_output", "claude_auth": "model_auth", "claude_config": "model_config"}
+
+
+def current_error_category(category):
+    """A stored error category in router-era terms (Claude-era names mapped, others unchanged)."""
+    return LEGACY_CLASSIFICATION_ERRORS.get(category, category)
+
+
+# A 202 in_progress this long after the key's first send (beyond the call's own
+# deadline + read margin) means the router lost the generation: it restarted and
+# never expires in-progress keys. The key then advances.
+IN_PROGRESS_SLACK_SECONDS = 120
+
+
+def key_conflict(category, reason):
+    """A 409 on the block's key: its stored body differs (a setting changed while the
+    block waited). Retried under a new key, counted against the attempt budget."""
+    return category == "model_config" and reason == "conflict"
+
+
+def soft_time_limit(error):
+    """Celery's SoftTimeLimitExceeded, matched by name so the service does not import Celery."""
+    return type(error).__name__ == "SoftTimeLimitExceeded"
+
+
+def _soft_time_limit_error():
+    # The block's call may still be generating under its key, which is kept.
+    error = ClassifierError("router_busy", reason="timeout", advance_key=False)
+    error.__cause__ = error.__context__ = None
+    return error
+
+
 SOURCE_SWEEP_RETRY_DELAY_SECONDS = 30
 SOURCE_SWEEP_RETRY_ERRORS = RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}
+# Stored names (current and Claude-era) that a source sweep retries; for SQL filters.
+SOURCE_SWEEP_RETRY_STORED_ERRORS = SOURCE_SWEEP_RETRY_ERRORS | {
+    legacy for legacy, current in LEGACY_CLASSIFICATION_ERRORS.items() if current in SOURCE_SWEEP_RETRY_ERRORS}
 _LOCK_NAMESPACE = 0x434C5346
 _BLOCK_SCHEMA = "commercial-block-decisions/v1"
 _ITEM_FIELDS = ("id", "admin_id", "platform", "external_id", "transcript_s3_key",
@@ -137,10 +177,13 @@ class FinalizationResult:
 class ClassificationServiceError(RuntimeError):
     """A closed category, never an exception, transcript, or storage payload."""
 
-    def __init__(self, category, *, record=True):
+    def __init__(self, category, *, record=True, advance_key=False, reason=None):
+        category = current_error_category(category)
         self.category = category if category in RETRYABLE_CLASSIFICATION_ERRORS | PERMANENT_CLASSIFICATION_ERRORS else "invalid_policy"
-        self.retryable = self.category in RETRYABLE_CLASSIFICATION_ERRORS
+        self.reason = reason if reason in ROUTER_REASONS else None
+        self.retryable = self.category in RETRYABLE_CLASSIFICATION_ERRORS or key_conflict(self.category, self.reason)
         self.record = record
+        self.advance_key = bool(advance_key)
         super().__init__(self.category)
 
 
@@ -154,7 +197,7 @@ def _hash(value):
 
 def source_sweep_retry_at(sweep):
     """The last committed retryable failure starts a durable fixed delay."""
-    if sweep.error_category in SOURCE_SWEEP_RETRY_ERRORS:
+    if current_error_category(sweep.error_category) in SOURCE_SWEEP_RETRY_ERRORS:
         return sweep.updated_at + timedelta(seconds=SOURCE_SWEEP_RETRY_DELAY_SECONDS)
     return None
 
@@ -278,9 +321,7 @@ class ClassificationService:
                 "rules": [_values(row, _RULE_FIELDS) for row in active], "origins": origins, "items": items}
 
     def _provenance(self):
-        return ClassifierProvenance(self.settings.CLAUDE_EXPECTED_VERSION,
-            self.settings.CLAUDE_CLASSIFIER_MODEL, self.settings.CLAUDE_CLASSIFIER_MODEL,
-            PROMPT_VERSION, sha256(SYSTEM_PROMPT.encode()).hexdigest())
+        return expected_provenance(self.settings)
 
     @staticmethod
     def _eligible(item, allow_precompletion=False):
@@ -429,6 +470,21 @@ class ClassificationService:
                 item.active_classification_revision_id, allow_precompletion, "")
             request = replace(request, _seal=_request_seal(request))
         return request
+
+    def active_revision_matches_inputs(self, item_id) -> bool:
+        """The item's active revision completed for its current transcript and inputs with the current classifier."""
+        provenance = self._provenance()
+        with self._transaction():
+            item = self.session.get(ContentItem, item_id, populate_existing=True)
+            active = (self.session.get(ClassificationRevision, item.active_classification_revision_id, populate_existing=True)
+                      if item is not None and item.active_classification_revision_id else None)
+            if (active is None or active.state != "completed" or active.transcript_sha256 != item.transcript_sha256
+                    or (active.requested_model, active.classifier_cli_version, active.prompt_sha256)
+                    != (provenance.requested_model, provenance.cli_version, provenance.prompt_sha256)):
+                return False
+            identity = active.input_identity_sha256
+        # Overrides or source rules changed since then still need a new revision.
+        return self.prepare_revision_request(item_id)._identity == identity
 
     def ensure_revision(self, item_id, reason, *, idempotency_key=None,
                         prepared_request: PreparedRevisionRequest | None = None, commit: bool = True) -> int:
@@ -761,9 +817,11 @@ class ClassificationService:
             if isinstance(error, ClassificationServiceError):
                 failure = error
             elif isinstance(error, ClassifierError):
-                failure = ClassificationServiceError(error.category)
+                failure = ClassificationServiceError(error.category, advance_key=error.advance_key, reason=error.reason)
             elif isinstance(error, StorageTransientError):
                 failure = ClassificationServiceError("storage_transient")
+            elif soft_time_limit(error):
+                failure = ClassificationServiceError("router_busy", reason="timeout")
             else:
                 failure = ClassificationServiceError("invalid_policy")
             if failure.record:
@@ -786,7 +844,28 @@ class ClassificationService:
             revision.state = "retrying" if failure.retryable else "failed"
             revision.error_category = failure.category
             if block is not None and block.state not in {"completed", "superseded"}:
-                block.state, block.error_category = "failed", failure.category
+                # A busy router is not a failure: the block waits to be retried as it is.
+                block.state = "pending" if failure.category == "router_busy" else "failed"
+                block.error_category = failure.category
+                token = claim.get("token") if claim else None
+                if (failure.category == "router_busy" and failure.reason in {"rate_limited", "proxy"}
+                        and token is not None and block.request_generation_started_at == token[1]):
+                    # A 429 (or Caddy's 502 with the router down) never reached the router's
+                    # idempotency store, so this claim's send did not start the key's clock.
+                    block.request_generation_started_at = None
+                if failure.advance_key or self._stuck_in_progress(failure, block):
+                    # The router may have stored an outcome under the current key and would
+                    # replay it forever (or holds the key in progress forever); the next call
+                    # uses a new key.
+                    block.request_generation += 1
+                    block.request_generation_started_at = None
+
+    def _stuck_in_progress(self, failure, block):
+        """A 202 for a key first sent longer ago than any router call can take."""
+        started = block.request_generation_started_at
+        limit = self.settings.CLASSIFIER_TIMEOUT_SECONDS + READ_MARGIN_SECONDS + IN_PROGRESS_SLACK_SECONDS
+        return (failure.category == "router_busy" and failure.reason == "in_progress" and started is not None
+                and (utc_now() - started).total_seconds() > limit)
 
     def _current(self, item, revision, inputs, identity):
         provenance = self._provenance()
@@ -905,25 +984,39 @@ class ClassificationService:
                     return BlockResult(revision_id, block_ordinal, "completed", total, self._dispatch(revision, blocks))
                 if block.state == "running" or any(b.ordinal < block_ordinal and b.state != "completed" for b in blocks):
                     _fail("worker_timeout", record=False)
-                elapsed = max(0, (utc_now() - revision.started_at).total_seconds())
+                # Only generation counts: a completed block's span runs from its last claim to
+                # completion, because started_at is reset at every claim. Busy waits and queueing do not count.
+                generated = sum(max(0.0, (b.completed_at - b.started_at).total_seconds()) for b in blocks
+                                if b.state == "completed" and b.started_at and b.completed_at)
                 if (len(blocks) > MAX_BLOCKS_PER_REVISION
-                        or total + self.settings.CLAUDE_CLASSIFIER_MAX_BUDGET_USD * 1_000_000 > self.settings.CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD * 1_000_000
-                        or elapsed + self.settings.CLAUDE_CLASSIFIER_TIMEOUT_SECONDS > self.settings.CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS):
+                        or generated + self.settings.CLASSIFIER_TIMEOUT_SECONDS > self.settings.CLASSIFIER_MAX_REVISION_SECONDS):
                     _fail("revision_budget_exhausted")
                 block.state, block.started_at, block.heartbeat_at = "running", utc_now(), utc_now()
                 block.attempts += 1
                 block.error_category = None
+                if block.request_generation_started_at is None:
+                    block.request_generation_started_at = block.started_at
                 revision.state, revision.heartbeat_at, revision.error_category = "running", utc_now(), None
                 claim = (block.attempts, block.started_at)
                 ownership["token"] = claim
+                # The request body is built only from the prepared checkpoint (window and examples,
+                # verified against block.input_sha256 above) and deployment settings, so a reused
+                # key resends identical bytes. Nothing else that can change between retries is read.
                 window = inputs.windows[block_ordinal - 1]
                 input_hash = block.input_sha256
+                request_key = f"podcast.classification:rev-{revision_id}:block-{block_ordinal}:g{block.request_generation}"
             try:
-                result = self.classifier.classify(window, examples=inputs.examples)
+                result = self.classifier.classify(window, examples=inputs.examples, request_key=request_key)
             except (ClassifierError, StorageError):
                 raise
-            except Exception:
-                _fail("claude_config")
+            except Exception as error:
+                if not soft_time_limit(error):
+                    _fail("model_config")
+                busy = True
+            else:
+                busy = False
+            if busy:
+                raise _soft_time_limit_error()
             payload = {"schema": _BLOCK_SCHEMA, "revision_id": revision_id, "block_ordinal": block_ordinal,
                 "input_sha256": input_hash, "decisions": [asdict(d) for d in result.decisions],
                 "classifier": asdict(result.provenance), "cost_microusd": result.total_cost_microusd}
@@ -959,7 +1052,7 @@ class ClassificationService:
                 result[key] = value
             return result
         try:
-            if not isinstance(raw, bytes) or not 0 < len(raw) <= self.settings.CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES:
+            if not isinstance(raw, bytes) or not 0 < len(raw) <= self.settings.CLASSIFIER_MAX_OUTPUT_BYTES:
                 _fail()
             data = json.loads(raw, object_pairs_hook=unique, parse_constant=lambda _: _fail())
             if (not isinstance(data, dict) or set(data) != {"schema", "revision_id", "block_ordinal", "input_sha256", "decisions", "classifier", "cost_microusd"}
@@ -971,7 +1064,7 @@ class ClassificationService:
             if provenance != self._provenance():
                 _fail()
             cost = data["cost_microusd"]
-            if type(cost) is not int or not 0 <= cost <= self.settings.CLAUDE_CLASSIFIER_MAX_BUDGET_USD * 1_000_000:
+            if type(cost) is not int or not 0 <= cost <= MAX_INTEGER:
                 _fail()
             rows = data["decisions"]
             if not isinstance(rows, list) or not 1 <= len(rows) <= TARGET_SEGMENTS_PER_BLOCK:
@@ -1026,7 +1119,7 @@ class ClassificationService:
             for checkpoint, window in zip(checkpoints, inputs.windows):
                 if checkpoint["decision_s3_key"] != _key(inputs.item, "classification", checkpoint["decision_sha256"]):
                     _fail()
-                raw = self.storage.get_bytes(checkpoint["decision_s3_key"], max_bytes=self.settings.CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES)
+                raw = self.storage.get_bytes(checkpoint["decision_s3_key"], max_bytes=self.settings.CLASSIFIER_MAX_OUTPUT_BYTES)
                 if sha256(raw).hexdigest() != checkpoint["decision_sha256"]:
                     _fail()
                 result = self._parse_decisions(raw, revision_id, checkpoint["ordinal"], checkpoint["input_sha256"], window)
@@ -1037,14 +1130,16 @@ class ClassificationService:
                     for segment in window.target_segments[positions[decision.first_segment_id]:positions[decision.last_segment_id] + 1]:
                         classifications.append(ClassificationRange(segment.id, segment.id, segment.start, segment.end,
                             decision.label, decision.label == "editorial", decision.confidence, decision.reason_codes,
-                            signal_map[segment.id], "claude", (), None))
+                            signal_map[segment.id], "model", (), None))
             positions = {segment.id: i for i, segment in enumerate(inputs.transcript.segments)}
             classifications.sort(key=lambda entry: positions[entry.first_segment_id])
             options = dict(transcript=inputs.transcript, classifier=self._provenance(), source_rule_set_sha256=inputs.rule_hash,
                 override_set_sha256=inputs.override_hash, previous_policy_sha256=previous_hash, processing_milliseconds=processing_ms)
             policy = build_segment_policy(classifications=classifications, **options)
             coalesced = []
-            metadata_fields = ("label", "eligible", "confidence", "reason_codes", "signal_codes", "decision_source", "matched_rule_ids", "override_id")
+            # model_label keeps adjacent thresholded segments with different model labels apart.
+            metadata_fields = ("label", "eligible", "confidence", "reason_codes", "signal_codes", "decision_source",
+                               "matched_rule_ids", "override_id", "model_label")
             for entry in policy.ranges:
                 if coalesced and _values(coalesced[-1], metadata_fields) == _values(entry, metadata_fields):
                     coalesced[-1] = replace(coalesced[-1], last_segment_id=entry.last_segment_id, end=entry.end)

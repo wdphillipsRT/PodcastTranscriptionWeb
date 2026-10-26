@@ -32,7 +32,7 @@ def facts(**item_changes):
         duration_seconds=3120, language="en")
     item.__dict__.update(item_changes)
     source = SimpleNamespace(name="The Mel Robbins Podcast")
-    revision = SimpleNamespace(id=4, included_milliseconds=27000, policy_version="commercial-policy/v1")
+    revision = SimpleNamespace(id=4, included_milliseconds=27000, uncertain_segments=0, policy_version="commercial-policy/v1")
     return episode_facts(item, source, revision, PEOPLE, observed_at=datetime(2026, 10, 22, 3, 15, 0, 500, tzinfo=UTC))
 
 
@@ -59,7 +59,7 @@ def test_episode_and_passage_records_match_the_golden_shape():
         "attributes": {"platform": "podcast", "item_id": 42, "classification_revision_id": 4,
                        "export_generation": 1, "editorial_passages": 2, "duration_seconds": 3120,
                        "language": "en", "editorial_milliseconds": 27000,
-                       "policy_version": "commercial-policy/v1"},
+                       "uncertain_segments": 0, "policy_version": "commercial-policy/v1"},
         "relations": [], "supersedes": "podcast:podcast.episode:item-42/rev-3/e1",
         "rights": rights, "sensitivity": "internal"}
     assert records[1] == {
@@ -70,7 +70,8 @@ def test_episode_and_passage_records_match_the_golden_shape():
         "content": {"sha256": digest, "media_type": "text/plain; charset=utf-8", "bytes": len(text)},
         "source": source, "observed_at": "2026-10-22T03:15:00Z", "participants": PEOPLE,
         "attributes": {"platform": "podcast", "start_ms": 724000, "end_ms": 751000, "label": "editorial",
-                       "segment_ids": [f"seg-000041-{'a' * 16}", f"seg-000042-{'a' * 16}"]},
+                       "segment_ids": [f"seg-000041-{'a' * 16}", f"seg-000042-{'a' * 16}"],
+                       "uncertain_segment_ids": []},
         "relations": [{"type": "part_of", "target_record_id": "podcast:podcast.episode:item-42/rev-4/e1"}],
         "supersedes": None, "rights": rights, "sensitivity": "internal"}
     assert records[2]["title"] == "Building habits that stick, 15:00-15:05"
@@ -148,3 +149,62 @@ def test_long_titles_summaries_and_empty_descriptions_stay_within_the_schema():
                                segments=(segment(1, 3600.0, 3605.0, ("word " * 100).strip()),))
     assert len(records[1]["title"]) <= 500 and records[1]["title"].endswith(", 1:00:00-1:00:05")
     assert len(records[1]["summary"]) <= 300 and records[1]["summary"].endswith("…")
+
+
+def test_uncertain_segments_join_their_neighbours_and_are_marked():
+    segments = (segment(1, 0.0, 5.0, "Editorial opening"), segment(2, 5.0, 9.0, "Uncertain bridge"),
+                segment(3, 9.0, 14.0, "Editorial lesson"), segment(8, 40.0, 44.0, "Uncertain coda"))
+    uncertain = (segments[1].id, segments[3].id)
+    groups = passages(segments, uncertain)
+    assert [(len(g.segment_ids), g.uncertain_segment_ids, g.label) for g in groups] == [
+        (3, (segments[1].id,), "mixed"), (1, (segments[3].id,), "uncertain")]
+    records, _ = build_records(facts(), generation=1, supersedes=None, segments=segments,
+                               uncertain_segment_ids=uncertain)
+    assert [(r["attributes"]["label"], r["attributes"]["uncertain_segment_ids"]) for r in records[1:]] == [
+        ("mixed", [segments[1].id]), ("uncertain", [segments[3].id])]
+    assert records[1]["content"]["bytes"] == len("Editorial opening\nUncertain bridge\nEditorial lesson".encode())
+
+
+def test_the_episode_counts_its_uncertain_segments_and_the_count_is_a_fact():
+    item = SimpleNamespace(id=42, platform="podcast", title="T", description=None, canonical_url="https://example.com/e",
+                           channel_name=None, published_at=None, created_at=datetime(2026, 10, 21, tzinfo=UTC),
+                           duration_seconds=None, language=None)
+    revision = SimpleNamespace(id=4, included_milliseconds=1, uncertain_segments=2, policy_version="p")
+    built = episode_facts(item, SimpleNamespace(name="Show"), revision, PEOPLE,
+                          observed_at=datetime(2026, 10, 22, tzinfo=UTC))
+    records, _ = build_records(built, generation=1, supersedes=None, segments=SEGMENTS)
+    assert records[0]["attributes"]["uncertain_segments"] == 2
+    assert payload_sha256(built) != payload_sha256(facts())
+
+
+def test_passages_record_the_model_label_of_their_thresholded_uncertain_segments():
+    segments = (segment(1, 0.0, 5.0, "Editorial opening"), segment(2, 5.0, 9.0, "Probable advert"),
+                segment(3, 9.0, 14.0, "Borderline lesson"), segment(4, 14.0, 18.0, "Model said uncertain"),
+                segment(9, 50.0, 55.0, "Editorial close"))
+    uncertain = (segments[1].id, segments[2].id, segments[3].id)
+    labels = {segments[1].id: "paid_commercial", segments[2].id: "editorial"}
+    groups = passages(segments, uncertain, labels)
+    assert [g.uncertain_segment_labels for g in groups] == [
+        ((segments[1].id, "paid_commercial"), (segments[2].id, "editorial")), ()]
+    records, _ = build_records(facts(), generation=1, supersedes=None, segments=segments,
+                               uncertain_segment_ids=uncertain, uncertain_segment_labels=labels)
+    assert records[1]["attributes"]["uncertain_segment_labels"] == labels
+    assert set(records[1]["attributes"]["uncertain_segment_labels"]) < set(records[1]["attributes"]["uncertain_segment_ids"])
+    assert "uncertain_segment_labels" not in records[2]["attributes"]
+    assert all("uncertain_segment_labels" not in record["attributes"] for record in records[:1])
+
+
+def test_passages_without_model_labels_omit_the_attribute():
+    segments = (segment(1, 0.0, 5.0, "Editorial opening"), segment(2, 5.0, 9.0, "Uncertain bridge"))
+    records, _ = build_records(facts(), generation=1, supersedes=None, segments=segments,
+                               uncertain_segment_ids=(segments[1].id,))
+    assert records[1]["attributes"]["uncertain_segment_ids"] == [segments[1].id]
+    assert "uncertain_segment_labels" not in records[1]["attributes"]
+
+
+@pytest.mark.parametrize("labels", ["editorial_segment", "unknown_segment"])
+def test_model_labels_are_only_for_uncertain_segments(labels):
+    segments = (segment(1, 0.0, 5.0, "Editorial opening"), segment(2, 5.0, 9.0, "Uncertain bridge"))
+    key = segments[0].id if labels == "editorial_segment" else segment(7, 0.0, 1.0, "x").id
+    with pytest.raises(ValueError):
+        passages(segments, (segments[1].id,), {key: "paid_commercial"})

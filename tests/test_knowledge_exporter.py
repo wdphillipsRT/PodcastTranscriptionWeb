@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
 import logging
 import os
@@ -16,6 +17,8 @@ from extensions import db
 from integrations.knowledge import exporter
 from integrations.knowledge.contract import validate_podcast_batch
 import models as m
+from transcripts import canonical_json
+from commercial_policy import SegmentPolicy, build_learning_projection
 from tests.test_classification_service import add_item, env, finish  # noqa: F401
 from tests.test_config import valid_environment  # noqa: F401
 
@@ -160,12 +163,55 @@ def test_items_without_a_host_or_awaiting_guests_wait(ready):
     assert (guest["name"], guest["basis"], guest["role"]) == ("James Clear", "feed_declared", "guest")
 
 
+@pytest.mark.parametrize("state, category, failures, waits", [
+    ("failed", "router_busy", 1, True), ("failed", "router_busy", 2, True),
+    ("failed", "router_busy", 3, False), ("failed", "model_invalid_output", 0, False),
+    ("completed", None, 1, False)])
+def test_an_input_still_being_retried_waits_for_its_guests(ready, state, category, failures, waits):
+    from integrations.knowledge.people import guest_input_sha256
+    db.session.add(m.GuestExtraction(item_id=ready.item.id, input_sha256=guest_input_sha256(ready.item), state=state,
+        guests=[] if state == "completed" else None, error_category=category, model="bonsai2:27b-pq2_0",
+        cost_microusd=0, router_failures=failures))
+    db.session.commit()
+    report = export(ready, settings={"GUEST_EXTRACTION_ENABLED": True})
+    if waits:
+        assert report.skipped == {"awaiting_guests": 1} and report.batches == []
+    else:
+        assert report.batches == ["podcast-20261022-001"]
+
+
+def test_extraction_pending_follows_the_shared_retry_limit():
+    from types import SimpleNamespace
+    from integrations.knowledge import people
+    import guest_extractor
+    assert guest_extractor.MAX_ROUTER_FAILURES is people.MAX_ROUTER_FAILURES == 3
+    row = lambda **values: SimpleNamespace(**{"state": "failed", "error_category": "router_busy",  # noqa: E731
+                                              "router_failures": 1, **values})
+    assert people.extraction_pending(None) is True
+    assert people.extraction_pending(row()) is True
+    assert people.extraction_pending(row(router_failures=3)) is False
+    assert people.extraction_pending(row(error_category="model_invalid_output")) is False
+    assert people.extraction_pending(row(state="completed", error_category=None)) is False
+
+
 def test_unavailable_projection_skips_the_item_without_reading_raw_text(ready):
     newer = ready.service.ensure_revision(ready.item.id, "manual_retry", idempotency_key="pending-newer")
     assert db.session.get(m.ClassificationRevision, newer).state == "pending"
     report = export(ready)
     assert report.skipped == {"projection_unavailable": 1} and report.batches == []
     assert not any(key.endswith(".txt") for key, _ in ready.storage.reads)
+
+
+@pytest.mark.parametrize("artifact, old, new", [("projection_s3_key", b"First editorial", b"Tampered editorial"),
+                                                 ("policy_s3_key", b'"paid_commercial"', b'"editorial"')])
+def test_tampered_stored_artifacts_fail_closed_and_nothing_is_exported(ready, artifact, old, new):
+    revision = db.session.get(m.ContentItem, ready.item.id).active_classification_revision
+    key = getattr(revision, artifact)
+    assert old in ready.storage.objects[key]
+    ready.storage.objects[key] = ready.storage.objects[key].replace(old, new)
+    report = export(ready)
+    assert report.skipped == {"projection_unavailable": 1} and report.batches == []
+    assert [path.name for path in ready.inbox.iterdir()] == [".podcast-knowledge-export.lock"]
 
 
 def test_large_exports_split_into_sequenced_batches_capped_per_run(ready):
@@ -267,7 +313,7 @@ def test_exporter_reads_transcripts_only_through_the_gateway():
     assert {path.name for path in modules} >= {"exporter.py", "records.py", "people.py", "contract.py"}
     assert forbidden_artifact_references(root) == []
     source = (root / "integrations/knowledge/exporter.py").read_text()
-    assert "load_active_learning_projection" in source
+    assert "load_active_knowledge_projection" in source and "load_active_learning_projection" not in source
     assert not any(name in path.read_text() for path in modules for name in ("get_bytes", "s3_key", "boto3"))
 
 
@@ -402,3 +448,118 @@ def test_a_pending_batch_claimed_by_the_intake_is_abandoned_and_re_exported(read
     second = batch_records(ready, "podcast-20261022-002")[0]
     assert first["record_id"].endswith("/e1") and second["record_id"].endswith("/e2")
     assert db.session.get(m.KnowledgeExportBatch, 1).state == "abandoned"
+
+
+def test_release_check_no_excluded_segment_leaves_and_every_uncertain_one_is_marked(ready):
+    texts = ("Editorial opening", "Uncertain bridge", "Editorial lesson", "Paid PRIVATE-AD read",
+             "Self PRIVATE-PROMO plug", "Cross PRIVATE-XPROMO plug", "Housekeeping PRIVATE-HK note", "Uncertain coda")
+    labels = ("editorial", "uncertain", "editorial", "paid_commercial", "self_promotion", "cross_promotion",
+              "housekeeping", "uncertain")
+    ready.item, ready.transcript = add_item(ready, external_id="release", texts=texts)
+    ready.classifier.labels.update({s.id: (label, 1.0) for s, label in zip(ready.transcript.segments, labels)})
+    # The bridge is a paid read below the exclusion threshold: uncertain, with its model label kept.
+    bridge = ready.transcript.segments[1].id
+    ready.classifier.labels[bridge] = ("paid_commercial", 0.9)
+    finish(ready)
+    report = export(ready)
+    assert report.status == "completed"
+    raw = b"".join(path.read_bytes() for batch in report.batches for path in (ready.inbox / batch).rglob("*")
+                   if path.is_file())
+    for marker in (b"PRIVATE-AD", b"PRIVATE-PROMO", b"PRIVATE-XPROMO", b"PRIVATE-HK"):
+        assert marker not in raw
+    assert b"Uncertain bridge" in raw and b"Uncertain coda" in raw
+    records = [record for batch in report.batches for record in batch_records(ready, batch)]
+    episode = next(r for r in records if r["kind"] == "podcast.episode" and r["attributes"]["item_id"] == ready.item.id)
+    passages = [r for r in records if r["kind"] == "podcast.segment"
+                and r["relations"] == [{"type": "part_of", "target_record_id": episode["record_id"]}]]
+    expected = {s.id for s, label in zip(ready.transcript.segments, labels) if label == "uncertain"}
+    marked = {i for p in passages for i in p["attributes"]["uncertain_segment_ids"]}
+    exported = {i for p in passages for i in p["attributes"]["segment_ids"]}
+    assert marked == expected and marked <= exported
+    assert exported == {s.id for s, label in zip(ready.transcript.segments, labels) if label in {"editorial", "uncertain"}}
+    assert all(set(p["attributes"]["uncertain_segment_ids"]) <= set(p["attributes"]["segment_ids"]) for p in passages)
+    assert [p["attributes"]["label"] for p in passages] == ["mixed", "uncertain"]
+    assert episode["attributes"]["uncertain_segments"] == 2
+    named = {}
+    for p in passages:
+        mapping = p["attributes"].get("uncertain_segment_labels", {})
+        assert set(mapping) <= set(p["attributes"]["uncertain_segment_ids"])
+        named.update(mapping)
+    assert named == {bridge: "paid_commercial"} and set(named) <= marked
+
+
+THRESHOLD_TEXTS = ("Editorial opening", "Probable advert", "Borderline lesson", "Model said uncertain", "Editorial close")
+
+
+def add_thresholded(ready):
+    """A paid read and an editorial segment, both at .7 (below threshold), then one the model called uncertain."""
+    ready.item, ready.transcript = add_item(ready, external_id="thresholded", texts=THRESHOLD_TEXTS)
+    segments = ready.transcript.segments
+    ready.classifier.labels.update({segments[1].id: ("paid_commercial", 0.7), segments[2].id: ("editorial", 0.7),
+                                    segments[3].id: ("uncertain", 1.0)})
+    finish(ready)
+    return segments
+
+
+def thresholded_passages(ready, report):
+    records = [record for batch in report.batches for record in batch_records(ready, batch)]
+    return [r for r in records if r["kind"] == "podcast.segment"
+            and r["record_id"].startswith(f"podcast:podcast.segment:item-{ready.item.id}/")]
+
+
+def test_passages_name_the_model_label_of_each_thresholded_uncertain_segment(ready):
+    segments = add_thresholded(ready)
+    revision = db.session.get(m.ContentItem, ready.item.id).active_classification_revision
+    policy = SegmentPolicy.from_json(ready.storage.objects[revision.policy_s3_key], transcript=ready.transcript)
+    # Adjacent thresholded segments with equal metadata but different model labels stay separate ranges.
+    assert [(r.label, r.model_label) for r in policy.ranges] == [
+        ("editorial", None), ("uncertain", "paid_commercial"), ("uncertain", "editorial"), ("uncertain", None),
+        ("editorial", None)]
+    report = export(ready)
+    assert report.status == "completed"
+    (passage,) = thresholded_passages(ready, report)
+    assert passage["attributes"]["uncertain_segment_ids"] == [s.id for s in segments[1:4]]
+    assert passage["attributes"]["uncertain_segment_labels"] == {segments[1].id: "paid_commercial",
+                                                                 segments[2].id: "editorial"}
+    assert passage["attributes"]["label"] == "mixed"
+
+
+def test_a_policy_stored_before_model_labels_exports_without_them(ready):
+    segments = add_thresholded(ready)
+    revision = db.session.get(m.ContentItem, ready.item.id).active_classification_revision
+    data = json.loads(ready.storage.objects[revision.policy_s3_key])
+    for row in data["ranges"]:
+        row.pop("model_label", None)
+    data.pop("policy_sha256")
+    raw = canonical_json({**data, "policy_sha256": sha256(canonical_json(data).encode()).hexdigest()})
+    legacy = SegmentPolicy.from_json(raw, transcript=ready.transcript)
+    learning = build_learning_projection(ready.transcript, legacy)
+    changes = {}
+    for kind, artifact, digest in (("policy", legacy, legacy.policy_sha256),
+                                   ("projection", learning, learning.projection_sha256)):
+        key = getattr(revision, f"{kind}_s3_key").rsplit("/", 1)[0] + f"/{digest}.json"
+        ready.storage.objects[key] = artifact.to_json().encode()
+        changes.update({f"{kind}_s3_key": key, f"{kind}_sha256": digest})
+    # Completed revisions are immutable through the ORM; this stands in for one stored before model labels.
+    db.session.execute(sa.update(m.ClassificationRevision).where(m.ClassificationRevision.id == revision.id)
+                       .values(**changes))
+    db.session.commit()
+    report = export(ready)
+    assert report.status == "completed" and not report.skipped
+    (passage,) = thresholded_passages(ready, report)
+    assert passage["attributes"]["uncertain_segment_ids"] == [s.id for s in segments[1:4]]
+    assert "uncertain_segment_labels" not in passage["attributes"]
+
+
+@pytest.mark.parametrize("new", [b'"model_label":"self_promotion"', b'"model_label":"editorial"'])
+def test_a_tampered_stored_model_label_fails_closed(ready, new):
+    add_thresholded(ready)
+    revision = db.session.get(m.ContentItem, ready.item.id).active_classification_revision
+    key = revision.policy_s3_key
+    old = b'"model_label":"paid_commercial"'
+    assert old in ready.storage.objects[key]
+    ready.storage.objects[key] = ready.storage.objects[key].replace(old, new)
+    report = export(ready)
+    assert report.skipped.get("projection_unavailable") == 1
+    assert not any(record["attributes"].get("item_id") == ready.item.id
+                   for batch in report.batches for record in batch_records(ready, batch))

@@ -833,13 +833,13 @@ def normalize_item_transcript(self, item_id):
 
 
 def get_classification_service():
-    """Construct lazily; media workers need no Claude credential configuration."""
+    """Construct lazily; only the classifier container holds router credentials, read per call."""
     from classification_service import ClassificationService
-    from claude_classifier import ClaudeClassifier
+    from router_classifier import RouterClassifier
     from extensions import db
     settings = SimpleNamespace(**dict(current_app.config))
     return ClassificationService(session=db.session, storage=get_processing_storage(),
-        classifier=ClaudeClassifier(settings), settings=settings)
+        classifier=RouterClassifier(settings), settings=settings)
 
 
 @celery_app.task(name="tasks.export_knowledge", queue="knowledge")
@@ -863,9 +863,9 @@ def export_knowledge():
 
 
 def get_guest_extractor():
-    """Construct lazily; only the classifier container holds Claude credentials."""
-    from guest_extractor import ClaudeGuestExtractor
-    return ClaudeGuestExtractor(SimpleNamespace(**dict(current_app.config)))
+    """Construct lazily; only the classifier container holds router credentials."""
+    from guest_extractor import RouterGuestExtractor
+    return RouterGuestExtractor(SimpleNamespace(**dict(current_app.config)))
 
 
 @celery_app.task(name="tasks.extract_guests", queue="classification")
@@ -963,9 +963,21 @@ def _classification_delay(attempts):
     return min(3600, 30 * 2 ** (attempts - 1)) + random.uniform(1, 30)
 
 
-def _classification_failed(revision_id, phase, ordinal, category):
-    """Caller holds the item lock; revision attempts count failed calls only."""
-    from classification_service import RETRYABLE_CLASSIFICATION_ERRORS, PERMANENT_CLASSIFICATION_ERRORS
+def _busy_delay(block_attempts):
+    """30 seconds, doubling per busy claim of the block, capped at 10 minutes."""
+    return min(600, 30 * 2 ** (min(max(block_attempts, 1), 6) - 1))
+
+
+def _classification_failed(revision_id, phase, ordinal, category, reason=None):
+    """Caller holds the item lock; revision attempts count failed calls only.
+
+    A busy router is not a failure: the attempt budget is untouched, the block
+    returns to pending, and the same block is retried after a back-off that
+    doubles from 30 seconds to 10 minutes. A key conflict (`model_config` with
+    reason `conflict`) is a counted failure retried under the block's next key.
+    """
+    from classification_service import (RETRYABLE_CLASSIFICATION_ERRORS, PERMANENT_CLASSIFICATION_ERRORS,
+                                         key_conflict)
     from extensions import db
     from models import ClassificationRevision, ClassificationBlock, utc_now
     if category not in RETRYABLE_CLASSIFICATION_ERRORS | PERMANENT_CLASSIFICATION_ERRORS:
@@ -974,21 +986,26 @@ def _classification_failed(revision_id, phase, ordinal, category):
     if revision.state in {"completed", "superseded"}:
         db.session.commit()
         return None, None, None
-    revision.attempts += 1
-    retry = category in RETRYABLE_CLASSIFICATION_ERRORS and revision.attempts < 5
+    busy = category == "router_busy"
+    if not busy:
+        revision.attempts += 1
+    retry = busy or (category in RETRYABLE_CLASSIFICATION_ERRORS or key_conflict(category, reason)) and revision.attempts < 5
     revision.state = "retrying" if retry else "failed"
     revision.error_category = "dispatch_pending" if retry else category
     revision.heartbeat_at = utc_now()
+    block_attempts = 1
     if ordinal is not None:
         block = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id, ordinal=ordinal).one_or_none()
         if block is not None and block.state not in {"completed", "superseded"}:
-            block.state, block.error_category = "failed", category
+            block.state, block.error_category = ("pending" if busy else "failed"), category
+        if block is not None:
+            block_attempts = block.attempts
     dispatch = _phase_dispatch(revision, phase, ordinal) if retry else None
     if dispatch:
         revision.celery_task_id = dispatch.task_id
     attempts = revision.attempts
     db.session.commit()
-    countdown = _classification_delay(attempts) if retry else None
+    countdown = _busy_delay(block_attempts) if busy else _classification_delay(attempts) if retry else None
     return dispatch, countdown, category
 
 
@@ -1015,19 +1032,134 @@ def _classification_step(service, revision_id, phase, ordinal=None, *, handoff_s
         if not error.record:
             # A live/stale claim or ambiguous commit is repaired by reconciliation.
             return None, None, None
-        outcome = _classification_failed(revision_id, phase, ordinal, error.category)
+        outcome = _classification_failed(revision_id, phase, ordinal, error.category, error.reason)
         _observe_classification("failed", observation_identity, started, retry_category=outcome[2])
         return outcome
     _observe_classification(phase, observation_identity, started, result=result)
     if result.next_dispatch is not None:
         return _prepare_classification_publication(result.next_dispatch), None, None
     if result.state == "superseded" and handoff_superseded:
+        try:
+            current = service.active_revision_matches_inputs(item_id)
+        except ClassificationServiceError:
+            db.session.rollback()
+            current = False  # Unknown: hand off as before; ensure_revision repeats the checks.
+        if current:
+            # A newer revision from the current classifier already completed for
+            # these inputs (for example while a reclassification was held).
+            db.session.commit()
+            return None, None, None
         identity = service.ensure_revision(item_id, "policy_upgrade")
         current = db.session.get(ClassificationRevision, identity)
         dispatch = _revision_dispatch(current)
         db.session.commit()
         return dispatch, None, None
     return None, None, None
+
+
+RECLASSIFY_QUEUED = "reclassify_queued"
+_RECLASSIFY_RELEASE_LOCK = 0x5243_4C53_0000_0001
+
+
+def _reclassify_prefix(provenance):
+    """Idempotency key prefix naming the whole classifier provenance, so a new model pin,
+    router route or prompt makes every item a reclassification candidate again."""
+    from hashlib import sha256
+    digest = sha256(f"{provenance.requested_model}|{provenance.cli_version}|{provenance.prompt_sha256}"
+                    .encode("utf-8")).hexdigest()
+    return f"reclassify:{digest[:12]}:"
+
+
+def _not_held():
+    import sqlalchemy as sa
+    from models import ClassificationRevision
+    return sa.or_(ClassificationRevision.error_category.is_(None),
+                  ClassificationRevision.error_category != RECLASSIFY_QUEUED)
+
+
+def queue_reclassification(*, limit=None):
+    """Hold a new revision for every completed item the current classifier has not classified, newest first.
+
+    Held revisions (`pending` with error category `reclassify_queued`) are never
+    published by the reconciler; `release_reclassification` dispatches them one at a time.
+    An item that already has this classifier's reclassification revision for its
+    transcript, in any state, is not a candidate: a failed one is retried with
+    `classification retry --item-id`, so reruns and `--limit` move on to new items.
+    `queued` counts revisions newly held by this run; `existing` counts candidates
+    found already classified or queued once their item lock was held.
+    """
+    import sqlalchemy as sa
+    from classification_service import ClassificationServiceError
+    from extensions import db
+    from models import ClassificationRevision, ContentItem
+    from router_classifier import expected_provenance
+    service = get_classification_service()
+    provenance = expected_provenance(service.settings)
+    prefix = _reclassify_prefix(provenance)
+    current = sa.exists().where(ClassificationRevision.item_id == ContentItem.id,
+        ClassificationRevision.transcript_sha256 == ContentItem.transcript_sha256,
+        ClassificationRevision.requested_model == provenance.requested_model,
+        ClassificationRevision.classifier_cli_version == provenance.cli_version,
+        ClassificationRevision.prompt_sha256 == provenance.prompt_sha256,
+        ClassificationRevision.state.in_(("pending", "running", "retrying", "completed")))
+    requested = sa.exists().where(ClassificationRevision.item_id == ContentItem.id,
+        ClassificationRevision.idempotency_key == sa.literal(prefix) + sa.func.substr(ContentItem.transcript_sha256, 1, 16))
+    eligible = sa.select(ContentItem.id).where(ContentItem.status == "completed", ~current, ~requested)
+    query = eligible.order_by(ContentItem.published_at.desc().nulls_last(), ContentItem.id.desc())
+    if limit is not None:
+        query = query.limit(limit)
+    candidates = list(db.session.scalars(query))
+    db.session.commit()
+    counts = dict(candidates=len(candidates), queued=0, existing=0, busy=0, failed=0)
+    for item_id in candidates:
+        with _item_lock(item_id) as acquired:
+            if not acquired:
+                counts["busy"] += 1
+                continue
+            try:
+                # Recheck under the lock: the item may have been classified or queued meanwhile.
+                still = db.session.scalar(eligible.where(ContentItem.id == item_id))
+                db.session.commit()
+                if still is None:
+                    counts["existing"] += 1
+                    continue
+                request = service.prepare_revision_request(item_id)
+                transcript_sha256 = db.session.get(ContentItem, item_id).transcript_sha256
+                revision_id = service.ensure_revision(item_id, "policy_upgrade",
+                                                      idempotency_key=prefix + transcript_sha256[:16],
+                                                      prepared_request=request, commit=False)
+                revision = db.session.get(ClassificationRevision, revision_id)
+                fresh = (revision.state == "pending" and revision.started_at is None
+                         and revision.error_category == "dispatch_pending")
+                if fresh:
+                    revision.error_category = RECLASSIFY_QUEUED
+                db.session.commit()
+                counts["queued" if fresh else "existing"] += 1
+            except ClassificationServiceError:
+                db.session.rollback()
+                counts["failed"] += 1
+    return counts
+
+
+def release_reclassification():
+    """Dispatch the oldest held revision once no other revision is pending, running or retrying."""
+    import sqlalchemy as sa
+    from extensions import db
+    from models import ClassificationRevision
+    if db.engine.dialect.name == "postgresql":
+        db.session.execute(sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": _RECLASSIFY_RELEASE_LOCK})
+    in_flight = db.session.scalar(sa.select(sa.func.count()).select_from(ClassificationRevision).where(
+        ClassificationRevision.state.in_(("pending", "running", "retrying")), _not_held()))
+    held = None if in_flight else db.session.scalar(sa.select(ClassificationRevision).where(
+        ClassificationRevision.state == "pending", ClassificationRevision.error_category == RECLASSIFY_QUEUED)
+        .order_by(ClassificationRevision.id).limit(1))
+    if held is None:
+        db.session.commit()
+        return None
+    held.error_category = "dispatch_pending"
+    dispatch = _revision_dispatch(held)
+    db.session.commit()
+    return dispatch
 
 
 @celery_app.task(name="tasks.classify_item", queue="classification")
@@ -1054,6 +1186,9 @@ def classify_item(revision_id, phase, block_ordinal=None):
                 return
             dispatch, countdown, category = _classification_step(get_classification_service(), revision_id, phase, block_ordinal)
         _publish_classification(dispatch, countdown=countdown, restore_category=category)
+        if dispatch is None:
+            # A chain ended (completed, failed or superseded): start the next held reclassification.
+            _publish_classification(release_reclassification())
 
 
 def _missing_classification_query():
@@ -1096,16 +1231,18 @@ def _reconcile_revision(revision_id, item_id, cutoff):
         dispatch = _revision_dispatch(revision)
         category, countdown = None, None
         if revision.state == "retrying":
-            from classification_service import RETRYABLE_CLASSIFICATION_ERRORS
-            if revision.error_category in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
-                category = revision.error_category
+            from classification_service import RETRYABLE_CLASSIFICATION_ERRORS, current_error_category
+            # Claude-era rows keep their stored names; map them so they keep their retry semantics.
+            if current_error_category(revision.error_category) in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
+                category = current_error_category(revision.error_category)
             # Block failures retain their category while the revision's sole
             # error field is used by the outbox. Prepare/finalize cannot recover
             # the original category after an unknown send; the next call will.
             failed = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id,
                 ordinal=dispatch.block_ordinal, state="failed").one_or_none() if dispatch.phase == "block" else None
-            if category is None and failed is not None and failed.error_category in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
-                category = failed.error_category
+            if (category is None and failed is not None
+                    and current_error_category(failed.error_category) in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}):
+                category = current_error_category(failed.error_category)
             countdown = _classification_delay(revision.attempts) if revision.attempts else None
         # Pending and retrying deliveries did not execute a failed checkpoint.
         # Re-arm the stable outbox without consuming the worker-attempt budget;
@@ -1145,7 +1282,7 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
             sa.func.coalesce(ClassificationBlock.heartbeat_at, ClassificationBlock.started_at) < cutoff)
         candidates = list(db.session.execute(sa.select(ClassificationRevision.id, ClassificationRevision.item_id).where(
             ClassificationRevision.id > after_revision_id,
-            ClassificationRevision.state.in_(("pending", "running", "retrying")),
+            ClassificationRevision.state.in_(("pending", "running", "retrying")), _not_held(),
             sa.or_(ClassificationRevision.error_category == "dispatch_pending", stale_running, stale_delivery, stale_block))
             .order_by(ClassificationRevision.id).limit(bound)))
         db.session.commit()
@@ -1194,6 +1331,7 @@ def reconcile_classifications(after_revision_id=0, after_item_id=0):
         counts = reconcile_classification_batch(after_revision_id=after_revision_id, after_item_id=after_item_id)
         if current_app.config["CLASSIFICATION_ENABLED"]:
             _reconcile_source_sweeps()
+            _publish_classification(release_reclassification())
         if (current_app.config["CLASSIFICATION_ENABLED"] and counts["scanned"]
                 == min(current_app.config["CLASSIFICATION_RECONCILE_BATCH_SIZE"], 100)):
             try:
@@ -1258,12 +1396,12 @@ def _publish_source_sweep(sweep_id):
     import sqlalchemy as sa
     from extensions import db
     from models import ClassificationSweep, utc_now
-    from classification_service import SOURCE_SWEEP_RETRY_ERRORS, source_sweep_retry_at
+    from classification_service import SOURCE_SWEEP_RETRY_ERRORS, current_error_category, source_sweep_retry_at
     if not current_app.config["CLASSIFICATION_ENABLED"]:
         return False
     sweep = db.session.get(ClassificationSweep, sweep_id, populate_existing=True)
     if (sweep is None or sweep.state not in {"pending", "running"}
-            or sweep.error_category not in SOURCE_SWEEP_RETRY_ERRORS | {"dispatch_pending"}):
+            or current_error_category(sweep.error_category) not in SOURCE_SWEEP_RETRY_ERRORS | {"dispatch_pending"}):
         db.session.commit()
         return False
     retry_at = source_sweep_retry_at(sweep)
@@ -1308,12 +1446,12 @@ def _reconcile_source_sweeps():
     import celeryconfig
     from extensions import db
     from models import ClassificationSweep, utc_now
-    from classification_service import SOURCE_SWEEP_RETRY_DELAY_SECONDS, SOURCE_SWEEP_RETRY_ERRORS
+    from classification_service import SOURCE_SWEEP_RETRY_DELAY_SECONDS, SOURCE_SWEEP_RETRY_STORED_ERRORS
     now = utc_now()
     cutoff = now - timedelta(seconds=celeryconfig.task_time_limit + 300)
     retry_cutoff = now - timedelta(seconds=SOURCE_SWEEP_RETRY_DELAY_SECONDS)
     aged_delivery = sa.and_(ClassificationSweep.error_category.is_(None), ClassificationSweep.updated_at < cutoff)
-    retry_ready = sa.and_(ClassificationSweep.error_category.in_(SOURCE_SWEEP_RETRY_ERRORS),
+    retry_ready = sa.and_(ClassificationSweep.error_category.in_(sorted(SOURCE_SWEEP_RETRY_STORED_ERRORS)),
         ClassificationSweep.updated_at <= retry_cutoff)
     identities = list(db.session.scalars(sa.select(ClassificationSweep.id).where(
         ClassificationSweep.state.in_(("pending", "running")),

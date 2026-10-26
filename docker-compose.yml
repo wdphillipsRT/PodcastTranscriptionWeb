@@ -82,12 +82,15 @@ services:
     <<: *app
     entrypoint: [/app/scripts/start-classifier.sh]
     command: [celery, -A, tasks.celery_app, worker, --loglevel=info, --queues, classification, --concurrency, "1", --hostname, "classifier@%h"]
-    environment:
-      CLAUDE_CONFIG_DIR: /claude-config
-      DISABLE_UPDATES: "1"
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    # Platform Model Router client bundle (client.crt, client.key, router-ca.crt,
+    # token, token.expires_at), read-only; only the classifier holds it.
     volumes:
-      - ${CLAUDE_CONFIG_HOST_PATH:-./.runtime/claude}:/claude-config
+      - type: bind
+        source: ${ROUTER_CREDENTIALS_HOST_PATH:-./.runtime/router}
+        target: /router
+        read_only: true
+        bind:
+          create_host_path: false
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1770
 
@@ -110,3 +113,13 @@ services:
 
 volumes:
   postgres_data:
+
+# Pinned: the Platform firewall admits only this subnet to the model router
+# (bezalel-deploy platform_router_podcast_client_cidrs). Changing it recreates
+# the network and needs a matching firewall change.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 192.168.144.0/20
+          gateway: 192.168.144.1

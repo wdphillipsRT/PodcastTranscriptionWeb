@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from extensions import db
 import models as m
 import tasks
-from claude_classifier import ClassifierError
+from router_classifier import ClassifierError
 from tests.test_classification_service import env, add_item, finish
 
 
@@ -114,7 +114,7 @@ def test_fast_worker_cannot_be_overwritten_by_publication_cleanup(worker, monkey
     assert revision.celery_task_id.endswith("-finalize")
 
 
-@pytest.mark.parametrize("category", ["claude_timeout", "claude_unavailable", "claude_invalid_output", "storage_transient"])
+@pytest.mark.parametrize("category", ["model_invalid_output", "storage_transient"])
 def test_transient_errors_exhaust_at_five_persisted_failures(worker, category):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
@@ -139,7 +139,7 @@ def test_transient_errors_exhaust_at_five_persisted_failures(worker, category):
     assert len(worker.env.classifier.calls) == 5
 
 
-@pytest.mark.parametrize("category", ["claude_auth", "claude_config", "model_mismatch"])
+@pytest.mark.parametrize("category", ["model_auth", "model_config", "model_mismatch"])
 def test_permanent_classifier_errors_stop_immediately(worker, category):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
@@ -323,12 +323,13 @@ def test_reconciliation_caps_total_candidates_at_one_hundred(worker):
     assert not worker.sent
 
 
-def test_lazy_service_construction_does_not_require_claude_configuration(worker, monkeypatch):
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    # Use the production factory with an injected offline storage boundary.
+def test_lazy_service_construction_reads_no_router_credentials(worker, monkeypatch):
+    from router_classifier import RouterClassifier
     monkeypatch.setattr(tasks, "get_processing_storage", lambda: worker.env.storage)
     service = worker.production_factory()
-    assert service.classifier.settings.CLAUDE_CLASSIFIER_MODEL == worker.app.config["CLAUDE_CLASSIFIER_MODEL"]
+    assert isinstance(service.classifier, RouterClassifier)
+    assert service.classifier.client.token_file == worker.app.config["ROUTER_TOKEN_FILE"]
+    assert service.classifier.client.expected_model == worker.app.config["ROUTER_EXPECTED_MODEL"]
 
 
 def test_queued_message_delivered_during_disabled_rollout_remains_recoverable(worker):
@@ -348,7 +349,7 @@ def test_queued_message_delivered_during_disabled_rollout_remains_recoverable(wo
 def test_fast_retry_same_task_id_cannot_lose_new_outbox(worker, monkeypatch):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
-    worker.env.classifier.error = ClassifierError("claude_timeout")
+    worker.env.classifier.error = ClassifierError("model_invalid_output")
     sending = []
     def fast(name, *, args, **options):
         worker.send(name, args=args, **options)
@@ -362,20 +363,17 @@ def test_fast_retry_same_task_id_cannot_lose_new_outbox(worker, monkeypatch):
     assert (row.attempts, row.state, row.error_category) == (2, "retrying", "dispatch_pending")
 
 
-@pytest.mark.parametrize("limit", ["cost", "time"])
-def test_worker_preserves_per_revision_budget_limits(worker, limit):
-    from dataclasses import replace
-    from decimal import Decimal
+def test_worker_preserves_the_generation_time_limit(worker):
     item, _ = add_item(worker.env, external_id="budget", texts=tuple(f"Line {n}" for n in range(81)))
     identity = worker.env.service.ensure_revision(item.id, "backfill")
     task().run(identity, "prepare")
     task().run(identity, "block", 1)
     row = db.session.get(m.ClassificationRevision, identity)
-    if limit == "cost":
-        worker.env.service.settings = replace(worker.env.settings, CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD=Decimal("0.50"))
-    else:
-        row.started_at = m.utc_now() - timedelta(seconds=7100)
-        db.session.commit()
+    block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+    settings = worker.env.settings
+    block.started_at = block.completed_at - timedelta(
+        seconds=settings.CLASSIFIER_MAX_REVISION_SECONDS - settings.CLASSIFIER_TIMEOUT_SECONDS + 1)
+    db.session.commit()
     worker.sent.clear()
     task().run(identity, "block", 2)
     assert row.state == "failed" and row.error_category == "revision_budget_exhausted"
@@ -442,3 +440,90 @@ def test_aged_queued_retry_replays_without_consuming_fifth_attempt(worker, phase
     assert 241 <= worker.sent[-1][2]["countdown"] <= 270
     reconcile()
     assert len(worker.sent) == 1 and revision.attempts == 4
+
+
+def test_a_busy_router_retries_the_same_block_with_doubling_back_off(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.sent.clear()
+    worker.env.classifier.error = ClassifierError("router_busy", advance_key=False)
+    for attempt in range(1, 9):
+        task().run(identity, "block", 1)
+        revision = db.session.get(m.ClassificationRevision, identity)
+        block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+        assert (revision.state, revision.attempts, revision.error_category) == ("retrying", 0, "router_busy")
+        assert (block.state, block.error_category, block.attempts) == ("pending", "router_busy", attempt)
+        options = worker.sent[-1][2]
+        assert options["task_id"].endswith("-b1") and options["countdown"] == min(600, 30 * 2 ** (attempt - 1))
+    assert [entry[1] for entry in worker.sent] == [[identity, "block", 1]] * 8
+    assert set(worker.env.classifier.keys) == {f"podcast.classification:rev-{identity}:block-1:g0"}
+    worker.env.classifier.error = None
+    task().run(identity, "block", 1)
+    task().run(identity, "finalize")
+    assert db.session.get(m.ClassificationRevision, identity).state == "completed"
+
+
+def test_only_stored_outcomes_change_the_block_key_and_only_real_failures_count(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    for error in (ClassifierError("router_busy"), ClassifierError("router_busy", advance_key=False),
+                  ClassifierError("model_invalid_output"), None):
+        worker.env.classifier.error = error
+        task().run(identity, "block", 1)
+    prefix = f"podcast.classification:rev-{identity}:block-1:g"
+    assert worker.env.classifier.keys == [prefix + "0", prefix + "1", prefix + "1", prefix + "2"]
+    revision = db.session.get(m.ClassificationRevision, identity)
+    assert revision.attempts == 1 and revision.state == "running"
+
+
+def test_a_key_conflict_retries_under_a_new_key_within_the_attempt_budget(worker):
+    # The block's stored request no longer matches (for example CLASSIFIER_TIMEOUT_SECONDS changed
+    # while it waited): a new key generation is tried, and each try is a counted failure.
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.sent.clear()
+    worker.env.classifier.error = ClassifierError("model_config", reason="conflict")
+    for attempt in range(1, 6):
+        task().run(identity, "block", 1)
+        revision = db.session.get(m.ClassificationRevision, identity)
+        assert (revision.attempts, revision.error_category) == (attempt, "model_config")
+        assert revision.state == ("retrying" if attempt < 5 else "failed")
+    assert len(worker.sent) == 4 and all(entry[1] == [identity, "block", 1] for entry in worker.sent)
+    prefix = f"podcast.classification:rev-{identity}:block-1:g"
+    assert worker.env.classifier.keys == [prefix + str(generation) for generation in range(5)]
+    task().run(identity, "block", 1)
+    assert len(worker.env.classifier.keys) == 5
+
+
+def test_a_key_conflict_that_then_succeeds_completes_the_revision(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.env.classifier.error = ClassifierError("model_config", reason="conflict")
+    task().run(identity, "block", 1)
+    worker.env.classifier.error = None
+    task().run(identity, "block", 1)
+    task().run(identity, "finalize")
+    revision = db.session.get(m.ClassificationRevision, identity)
+    assert (revision.state, revision.attempts) == ("completed", 1)
+
+
+@pytest.mark.parametrize("legacy,current", [("claude_timeout", "router_busy"),
+                                            ("claude_invalid_output", "model_invalid_output")])
+@pytest.mark.parametrize("phase", ["prepare", "block"])
+def test_aged_claude_era_retry_replays_with_its_current_category(worker, legacy, current, phase):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    if phase == "block":
+        task().run(identity, "prepare")
+    revision = db.session.get(m.ClassificationRevision, identity)
+    revision.state, revision.attempts, revision.error_category = "retrying", 2, legacy
+    revision.heartbeat_at = revision.updated_at = m.utc_now() - timedelta(days=7)
+    if phase == "block":
+        # The block keeps the Claude-era category; the revision's own field is not retryable.
+        revision.error_category = "invalid_policy"
+        block = m.ClassificationBlock.query.one()
+        block.state, block.error_category = "failed", legacy
+    db.session.commit()
+    worker.sent.clear()
+    reconcile()
+    assert (revision.state, revision.attempts, revision.error_category) == ("retrying", 2, current)
+    assert len(worker.sent) == 1 and worker.sent[-1][2]["countdown"] > 0

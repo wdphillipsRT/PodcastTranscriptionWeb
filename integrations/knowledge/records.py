@@ -6,11 +6,17 @@ classification revision, export generation, and passage:
     podcast.episode  item-<item id>/rev-<classification revision id>/e<generation>
     podcast.segment  <episode native id>/<first projection segment id>
 
-A passage is a run of consecutive editorial projection segments, so
-caption-sized cues become citable passages. A segment joins the current passage
-only while the passage stays within 60 seconds (measured to the latest segment
-end so far) and 6,000 characters; a single segment is never split, so a passage
-of one segment may exceed either limit.
+A passage is a run of consecutive knowledge-projection segments, editorial or
+uncertain alike, so caption-sized cues become citable passages and an uncertain
+stretch joins the content around it. Each passage lists its uncertain segments
+in `attributes.uncertain_segment_ids` and is labelled `editorial`, `uncertain`
+(all uncertain) or `mixed`. Where the confidence threshold made a segment
+uncertain and the policy recorded the model's own label, the passage maps that
+segment to it in `attributes.uncertain_segment_labels` (e.g. `paid_commercial`
+or `editorial`); the attribute is omitted when no segment in the passage has one. A segment joins the current passage only while the
+passage stays within 60 seconds (measured to the latest segment end so far)
+and 6,000 characters; a single segment is never split, so a passage of one
+segment may exceed either limit.
 Every fact that can change an episode's record is in `episode_facts`, which is
 read from the database only; its hash detects changes without storage reads.
 """
@@ -38,6 +44,14 @@ class Passage:
     start_ms: int
     end_ms: int
     text: str
+    uncertain_segment_ids: tuple[str, ...] = ()
+    uncertain_segment_labels: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def label(self):
+        if not self.uncertain_segment_ids:
+            return "editorial"
+        return "uncertain" if len(self.uncertain_segment_ids) == len(self.segment_ids) else "mixed"
 
 
 def timestamp(value):
@@ -76,6 +90,7 @@ def episode_facts(item, source, revision, people, *, observed_at):
     summary = _shorten(plain_text(item.description), SUMMARY_CHARS) or _shorten(f"{title} ({publisher})", SUMMARY_CHARS)
     attributes = {"duration_seconds": item.duration_seconds, "language": item.language,
                   "editorial_milliseconds": revision.included_milliseconds,
+                  "uncertain_segments": revision.uncertain_segments,
                   "policy_version": revision.policy_version}
     return {
         "item_id": item.id, "classification_revision_id": revision.id, "platform": item.platform,
@@ -95,8 +110,15 @@ def episode_native_id(item_id, revision_id, generation):
     return f"item-{item_id}/rev-{revision_id}/e{generation}"
 
 
-def passages(segments):
-    """Group consecutive editorial segments into bounded, citable passages."""
+def passages(segments, uncertain_segment_ids=(), uncertain_segment_labels=None):
+    """Group consecutive projection segments, whatever their label, into bounded passages.
+
+    `uncertain_segment_labels` maps uncertain segment IDs to the model's own label.
+    """
+    uncertain = frozenset(uncertain_segment_ids)
+    labels = dict(uncertain_segment_labels or {})
+    if not labels.keys() <= uncertain or not labels.keys() <= {segment.id for segment in segments}:
+        raise ValueError("model labels are only for exported uncertain segments")
     groups, current, previous = [], None, None
     for segment in segments:
         ordinal = int(segment.id[4:10])
@@ -109,16 +131,19 @@ def passages(segments):
         current["end"] = max(current["end"], end)
         current["text"] = segment.text if current["text"] is None else current["text"] + "\n" + segment.text
         previous = ordinal
-    return [Passage(tuple(group["ids"]), group["start"], group["end"], group["text"]) for group in groups]
+    return [Passage(tuple(group["ids"]), group["start"], group["end"], group["text"],
+                    tuple(identity for identity in group["ids"] if identity in uncertain),
+                    tuple((identity, labels[identity]) for identity in group["ids"] if identity in labels))
+            for group in groups]
 
 
-def build_records(facts, *, generation, supersedes, segments):
+def build_records(facts, *, generation, supersedes, segments, uncertain_segment_ids=(), uncertain_segment_labels=None):
     """Return (records, blobs) for one item: the episode first, then its passages."""
     native = episode_native_id(facts["item_id"], facts["classification_revision_id"], generation)
     episode_id = f"podcast:podcast.episode:{native}"
     common = {"schema_version": "knowledge-record/v1", "source": facts["source"], "observed_at": facts["observed_at"],
               "participants": facts["participants"], "rights": RIGHTS, "sensitivity": "internal"}
-    groups = passages(segments)
+    groups = passages(segments, uncertain_segment_ids, uncertain_segment_labels)
     records = [{
         **common, "record_id": episode_id, "kind": "podcast.episode", "title": facts["title"],
         "summary": facts["summary"], "content": None,
@@ -139,7 +164,10 @@ def build_records(facts, *, generation, supersedes, segments):
             "summary": _shorten(" ".join(group.text.split()), PASSAGE_SUMMARY_CHARS) or facts["title"],
             "content": {"sha256": digest, "media_type": TEXT_MEDIA_TYPE, "bytes": len(data)},
             "attributes": {"platform": facts["platform"], "start_ms": group.start_ms, "end_ms": group.end_ms,
-                           "label": "editorial", "segment_ids": list(group.segment_ids)},
+                           "label": group.label, "segment_ids": list(group.segment_ids),
+                           "uncertain_segment_ids": list(group.uncertain_segment_ids),
+                           **({"uncertain_segment_labels": dict(group.uncertain_segment_labels)}
+                              if group.uncertain_segment_labels else {})},
             "relations": [{"type": "part_of", "target_record_id": episode_id}], "supersedes": None,
         })
     return records, blobs

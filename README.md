@@ -18,8 +18,8 @@ Start with that guide before running Compose: valid AWS credentials and a
 YouTube Data API key are required by startup checks.
 
 Phase 1 implements ingestion, transcription, and commercial-segment classification
-with an isolated Claude worker and owner review/corrections. Claude learning bundles and
-Agent Factory delivery are deferred to later phases.
+through the Bezalel Platform Model Router (an isolated classifier worker) with owner
+review/corrections. Learning bundles and Agent Factory delivery are deferred to later phases.
 Their mandatory filtered-input gateway is implemented in `learning_projection.py`:
 future Phase 2 bundle extraction and Phase 3 publishers must call
 `load_active_learning_projection(session=..., storage=..., item_id=...)` and
@@ -28,8 +28,10 @@ The immutable result contains only exact canonical segments labeled `editorial`;
 commercials, promotions, housekeeping, and `uncertain` segments are ineligible.
 Missing, corrupt, stale, failed, or superseded inputs raise
 `LearningProjectionUnavailable`; there is no full-transcript fallback.
-The optional `exporter` service is its first consumer: it writes nightly
-KNOWLEDGE-INTAKE-0001 batches of episode and editorial passage records, naming
+The optional `exporter` service reads the separate knowledge projection
+(`load_active_knowledge_projection`): it writes nightly KNOWLEDGE-INTAKE-0001
+batches of episode and passage records, editorial with uncertain segments
+marked, naming
 each show's hosts and each episode's guests, for the Platform knowledge intake,
 which delivers them to Lamad and Ebenezer. See
 [knowledge intake export](docs/operations.md#knowledge-intake-export).
@@ -63,7 +65,7 @@ Commercial exclusion has a separate offline release gate:
 
 It exercises both completed podcast and YouTube canonical transcripts through
 the final-stage hook, durable classification, immutable artifacts, owner review,
-correction, and filtered loading. Crash recovery and replay preserve paid block
+correction, and filtered loading. Crash recovery and replay preserve completed block
 checkpoints; learned rules remain source-scoped. Synthetic evaluation covers all
 six labels and confidence/boundary cases, blocks any editorial false exclusion,
 and binds expected count metrics to the policy version. This tests the future

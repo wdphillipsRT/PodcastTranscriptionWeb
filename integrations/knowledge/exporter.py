@@ -3,9 +3,10 @@
 An item is exported when it is completed, its active classification revision is
 completed, its classifying source names a host, and its episode facts differ
 from its last live export (or it has none). Transcript text is read only
-through `load_active_learning_projection`, so only editorial segments leave
-the application. A changed item gets a new export generation whose episode
-record supersedes the previous one; record identifiers are never reused.
+through `load_active_knowledge_projection`: editorial segments and uncertain
+segments (each marked) leave the application; excluded labels never do. A
+changed item gets a new export generation whose episode record supersedes the
+previous one; record identifiers are never reused.
 
 Export state lives in `knowledge_export_batches` and `knowledge_item_exports`.
 A batch is reserved (state `pending`, with its item rows) and committed before
@@ -35,11 +36,12 @@ import sqlalchemy as sa
 from integrations.knowledge.contract import (
     ContractError, canonical_json, check_podcast_record, person_entity_id, write_podcast_batch,
 )
-from integrations.knowledge.people import guest_input_sha256, has_host, item_guests, participants, source_hosts
+from integrations.knowledge.people import (extraction_pending, guest_input_sha256, has_host, item_guests, participants,
+                                           source_hosts)
 from integrations.knowledge.records import (
     build_records, episode_facts, episode_native_id, payload_sha256, publisher_name, timestamp,
 )
-from learning_projection import LearningProjectionUnavailable, load_active_learning_projection
+from learning_projection import LearningProjectionUnavailable, load_active_knowledge_projection
 from models import (ClassificationRevision, ContentItem, ContentSource, GuestExtraction, KnowledgeExportBatch,
                     KnowledgeItemExport, utc_now)
 
@@ -168,7 +170,7 @@ def _plan(session, item_id, settings):
     extraction = session.scalar(sa.select(GuestExtraction).where(
         GuestExtraction.item_id == item.id, GuestExtraction.input_sha256 == guest_input_sha256(item)))
     if (settings.GUEST_EXTRACTION_ENABLED and item.admin_guests is None and not item.feed_guests
-            and extraction is None):
+            and extraction_pending(extraction)):
         return "awaiting_guests"
     guests = item_guests(item, extraction)
     people = participants(hosts, basis, guests)
@@ -291,7 +293,7 @@ def _export(session, storage, settings, inbox, now, since, until, max_batches, r
                 skipped[plan] += 1
                 continue
             try:
-                projection = load_active_learning_projection(session=session, storage=storage, item_id=item_id)
+                projection = load_active_knowledge_projection(session=session, storage=storage, item_id=item_id)
             except LearningProjectionUnavailable:
                 skipped["projection_unavailable"] += 1
                 continue
@@ -299,7 +301,12 @@ def _export(session, storage, settings, inbox, now, since, until, max_batches, r
                 skipped["changed_during_export"] += 1
                 continue
             records, blobs = build_records(plan.facts, generation=plan.generation, supersedes=plan.supersedes,
-                                           segments=projection.segments)
+                                           segments=projection.segments,
+                                           uncertain_segment_ids=projection.uncertain_segment_ids,
+                                           uncertain_segment_labels={
+                                               identity: label for identity, label in zip(
+                                                   projection.uncertain_segment_ids, projection.uncertain_model_labels)
+                                               if label is not None})
             try:
                 for record in records:
                     check_podcast_record(record)

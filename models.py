@@ -494,6 +494,10 @@ class ClassificationBlock(Timestamps, db.Model):
     ordinal = db.Column(db.Integer, nullable=False)
     state = db.Column(db.String(32), nullable=False, default="pending", server_default="pending", index=True)
     attempts = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    # Router idempotency-key generation; advances only after the router may have stored an outcome.
+    request_generation = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    # When the current generation's key was first sent; a 202 long after it means a stuck key.
+    request_generation_started_at = db.Column(UTCDateTime())
     target_first_segment_id = db.Column(db.String(27), nullable=False)
     target_last_segment_id = db.Column(db.String(27), nullable=False)
     input_sha256 = db.Column(db.String(64), nullable=False)
@@ -580,7 +584,7 @@ class ClassificationSweep(Timestamps, db.Model):
 
 
 class GuestExtraction(db.Model):
-    """One restricted Claude guest extraction over an item's title and description."""
+    """One restricted model-router guest extraction over an item's title and description."""
 
     __tablename__ = "guest_extractions"
     id = db.Column(db.Integer, primary_key=True)
@@ -591,6 +595,9 @@ class GuestExtraction(db.Model):
     error_category = db.Column(db.String(64))
     model = db.Column(db.String(128), nullable=False)
     cost_microusd = db.Column(db.BigInteger, nullable=False, default=0, server_default="0")
+    # Recorded router failures (reason router_failure) for this input; it is retried below the limit.
+    router_failures = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    # When the latest call was recorded: a retried input's row is re-stamped; a completed row never changes.
     created_at = db.Column(UTCDateTime(), nullable=False, default=utc_now, server_default=sa.func.now(), index=True)
     item = db.relationship("ContentItem")
     __table_args__ = (

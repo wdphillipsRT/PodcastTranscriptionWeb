@@ -7,6 +7,7 @@ stdin, never argv; child output is discarded, including third-party logging.
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -29,9 +30,19 @@ from sqlalchemy.pool import NullPool
 from aws_clients import create_aws_client
 
 COMPONENTS = ("database", "redis", "s3", "transcribe", "youtube", "yt_dlp", "deno", "worker", "beat")
+# Selectable for the classifier's startup guard only; web readiness never probes the router.
+CLASSIFIER_COMPONENTS = ("claude_absent", "router")
+ALL_COMPONENTS = COMPONENTS + CLASSIFIER_COMPONENTS
 PROBE_TIMEOUT_SECONDS = 8
+# Only the router probe: beyond the router client's 10 s connect timeout. The web /readyz
+# runs its probes serially, so the shared limit stays short.
+ROUTER_PROBE_TIMEOUT_SECONDS = 12
 CACHE_SECONDS = 15
-_CONFIG_KEYS = ("SQLALCHEMY_DATABASE_URI", "REDIS_URL", "AWS_REGION", "AWS_S3_BUCKET_NAME", "YOUTUBE_API_KEY")
+# Router entries are a URL and file paths; the probe child reads the files, never this process.
+_CONFIG_KEYS = ("SQLALCHEMY_DATABASE_URI", "REDIS_URL", "AWS_REGION", "AWS_S3_BUCKET_NAME", "YOUTUBE_API_KEY",
+                "ROUTER_URL", "ROUTER_TOKEN_FILE", "ROUTER_CA_FILE", "ROUTER_CLIENT_CERT_FILE",
+                "ROUTER_CLIENT_KEY_FILE")
+_CLAUDE_PACKAGE = Path("/usr/local/lib/node_modules/@anthropic-ai")
 _ROOT = Path(__file__).resolve().parent
 
 
@@ -149,15 +160,32 @@ def _check_beat(_config):
                for entry in beat_schedule.values())
 
 
+def _check_claude_absent(_config):
+    """Claude was removed: no CLAUDE* variable, no claude executable, no installed package."""
+    if any(name.upper().startswith("CLAUDE") for name in os.environ):
+        return False
+    return shutil.which("claude") is None and not _CLAUDE_PACKAGE.exists()
+
+
+def _check_router(config):
+    """The router answers /readyz as ready over mTLS (bounded; a 503 is a fast failure) and the token file is usable."""
+    from router_client import RouterClient
+    client = RouterClient(config["ROUTER_URL"], token_file=config["ROUTER_TOKEN_FILE"], expected_model="unused:0",
+                          ca_file=config["ROUTER_CA_FILE"], cert_file=config["ROUTER_CLIENT_CERT_FILE"],
+                          key_file=config["ROUTER_CLIENT_KEY_FILE"])
+    return client.token_available() and client.ready()
+
+
 def _run_isolated(component, config):
-    if component not in COMPONENTS:
+    if component not in ALL_COMPONENTS:
         raise ValueError("Invalid component selection")
     payload = {name: config[name] for name in _CONFIG_KEYS if name in config}
     process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--probe", component],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         text=True, start_new_session=True)
     try:
-        process.communicate(input=json.dumps(payload), timeout=PROBE_TIMEOUT_SECONDS)
+        process.communicate(input=json.dumps(payload),
+                            timeout=ROUTER_PROBE_TIMEOUT_SECONDS if component == "router" else PROBE_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         # Also terminate any credential helper/tool subprocess, then reap.
         try:
@@ -170,7 +198,7 @@ def _run_isolated(component, config):
 
 
 def run_checks(config, services=COMPONENTS):
-    if not services or len(set(services)) != len(services) or any(name not in COMPONENTS for name in services):
+    if not services or len(set(services)) != len(services) or any(name not in ALL_COMPONENTS for name in services):
         raise ValueError("Invalid component selection")
     results = {}
     for component in services:
@@ -209,8 +237,8 @@ def system_cli():
 @with_appcontext
 def check_command(services):
     selected = tuple(services.split(","))
-    if not selected or len(set(selected)) != len(selected) or any(name not in COMPONENTS for name in selected):
-        raise click.UsageError("Select unique components: " + ",".join(COMPONENTS))
+    if not selected or len(set(selected)) != len(selected) or any(name not in ALL_COMPONENTS for name in selected):
+        raise click.UsageError("Select unique components: " + ",".join(ALL_COMPONENTS))
     results = run_checks(current_app.config, selected)
     click.echo(json.dumps(results, sort_keys=True))
     if "failed" in results.values():
@@ -220,7 +248,7 @@ def check_command(services):
 if __name__ == "__main__":
     # This internal child entrypoint never prints exceptions or tool output.
     try:
-        valid = len(sys.argv) == 3 and sys.argv[1] == "--probe" and sys.argv[2] in COMPONENTS
+        valid = len(sys.argv) == 3 and sys.argv[1] == "--probe" and sys.argv[2] in ALL_COMPONENTS
         if not valid:
             raise ValueError("Invalid component selection")
         configuration = json.loads(sys.stdin.read(65536))

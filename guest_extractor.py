@@ -1,47 +1,53 @@
-"""Restricted, budgeted Claude extraction of episode guests from title and description.
+"""Restricted extraction of episode guests from title and description through the Platform Model Router.
 
-Runs on the classifier's isolated worker with the same Claude CLI restrictions
-as transcript classification: no tools, no MCP, one turn, a JSON schema, a
-pinned model, a per-call budget, a hardened environment, and an empty private
-working directory. Episode text is an untrusted quoted envelope. Only names that
-appear as whole words in the title or in the description (compared after NFKC
-normalisation and case folding) are kept, spelled as the episode text spells
-them, and every result is marked `inferred`.
+Runs on the classifier's worker, the only container holding router credentials,
+on the `podcast.guests` route: one structured task in the router's schema
+subset, temperature 0, local only. Episode text is an untrusted quoted
+envelope. Only names that appear as whole words in the title or in the
+description (compared after NFKC normalisation and case folding) are kept,
+spelled as the episode text spells them, and every result is marked `inferred`.
 
-Cost bound: before each call the run re-reads today's (UTC) recorded spend and
-stops when that spend plus the per-call cap would exceed the daily budget. A
-call that started and then timed out, exited unsuccessfully, or returned
-unusable output is recorded as failed, charged at the per-call cap (or at the
-reported cost when that is higher), and never retried for the same input; the
-run then moves on to the next item, except after claude_unavailable (an
-outage or rate limit that would fail every later item too), which still
-records that one item, so a genuinely stuck item cannot block the queue, and
-then stops the run. Only environmental failures, where the call
-never ran or could not have succeeded for any item (authentication,
-configuration, a missing or unstartable CLI, a model other than the pinned
-one), stop the run without a record, so daily spend is at most the daily budget
-plus one such unrecorded call per run, itself capped by the per-call budget.
-Runs never overlap (a PostgreSQL session advisory lock) and start no call that
-could outlast RUN_DEADLINE_SECONDS.
+Limits: before each call the run re-reads today's (UTC) recorded calls and stops
+at GUEST_EXTRACTION_MAX_CALLS_PER_DAY (`daily_limit`). Only recorded calls count:
+the unrecorded call that stops a run (busy or environmental, below) is not
+counted, and there is at most one per run. At most
+GUEST_EXTRACTION_MAX_ITEMS_PER_RUN items run per hourly run. No call starts that
+could outlast the run deadline, counting the call's deadline plus the client's
+connect timeout and read margin; the deadline is RUN_DEADLINE_SECONDS, or one
+call's worst case when that is longer, so a run always has room for one call.
+
+Each input is extracted once: an invalid result is recorded as failed and never
+retried for that input, and the run moves on. A busy router (`router_busy`: in
+progress, rate limited, a timeout, a dropped connection, the proxy, no eligible
+candidate) stops the run without a record, so the item is tried again next run.
+A router failure with the router's own error body (`router_busy` with reason
+`router_failure`: 504 MODEL_TIMEOUT for an input the model never finishes, 502
+for an unavailable provider, 500) is recorded as failed (`router_busy`) and
+then stops the run. Such an input is retried on later runs, after every input
+never tried, so it cannot block them, and is abandoned after
+MAX_ROUTER_FAILURES recorded router failures; its one row is updated in place.
+Environmental failures (authentication, configuration, a model other than the
+pinned one) stop the run unrecorded. Router calls cost nothing;
+`cost_microusd` is recorded as 0. Runs never overlap (a PostgreSQL session
+advisory lock).
 """
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP, localcontext
-import json
-import os
+from decimal import Decimal, ROUND_HALF_UP
+import math
 import re
-import selectors
-import subprocess
-import tempfile
 import time
 import unicodedata
+import uuid
 
 import sqlalchemy as sa
 
-from claude_classifier import ClassifierError, _environment, _exchange, _fail, _kill_and_reap, _unique_object
 from ingestion_types import person_names
-from integrations.knowledge.people import guest_input_sha256, has_host, participants, plain_text, source_hosts
+from integrations.knowledge.people import (MAX_ROUTER_FAILURES, guest_input_sha256, has_host, participants, plain_text,
+                                           source_hosts)
+from router_client import (CONNECT_TIMEOUT_SECONDS, GUEST_MAX_OUTPUT_TOKENS, GUEST_ROUTE, READ_MARGIN_SECONDS,
+                           RouterClient, RouterError)
 from transcripts import canonical_json
 
 
@@ -53,6 +59,7 @@ SYSTEM_PROMPT = (
     "sponsors, or people who are only mentioned. Give each a confidence from 0 to 1.\n"
     "Return an empty list when no guest is named. Do not browse or call tools."
 )
+PROMPT_VERSION = "episode-guest-extraction/v1"
 OUTPUT_SCHEMA = {
     "type": "object", "additionalProperties": False, "required": ["guests"],
     "properties": {"guests": {"type": "array", "maxItems": 10, "items": {
@@ -61,28 +68,29 @@ OUTPUT_SCHEMA = {
                        "confidence": {"type": "number", "minimum": 0, "maximum": 1}}}}},
 }
 MAX_DESCRIPTION_CHARS = 6_000
-MAX_OUTPUT_BYTES = 65_536
-# Failures no item can fix: they stop the run unrecorded. claude_timeout,
-# claude_unavailable, and claude_invalid_output happen only after the CLI has
-# started and may be caused by the item, so they are recorded and not retried.
-ENVIRONMENTAL = frozenset({"claude_auth", "claude_config", "model_mismatch"})
-# Recorded like any started call, but likely to fail every later call too
-# (an outage or rate limit), so the run stops after recording it.
-STOPS_AFTER_RECORDING = frozenset({"claude_unavailable"})
+# Failures no item can fix: they stop the run unrecorded.
+ENVIRONMENTAL = frozenset({"model_auth", "model_config", "model_mismatch"})
+# A run lasts at most 10 minutes, or one call when a single call (its deadline plus the
+# client's connect timeout and read margin, at most 700 s) needs longer; well inside
+# the 1800 s soft time limit.
 RUN_DEADLINE_SECONDS = 600
+# MAX_ROUTER_FAILURES (shared with the exporter, which holds such an input's item as
+# awaiting_guests while it is retried): an input the router itself failed on is retried
+# on later runs, after inputs never tried, and abandoned after that many router failures.
 RUN_LOCK_KEY = 0x5047_5545_5354_0001
 
 
 @dataclass(frozen=True, slots=True)
 class GuestResult:
     guests: tuple[tuple[str, float], ...]
-    cost_microusd: int
+    cost_microusd: int = 0
 
 
-def _micros(value):
-    with localcontext() as context:
-        context.prec = max(30, len(value.as_tuple().digits) + 7)
-        return int((value * 1_000_000).to_integral_value(rounding=ROUND_HALF_UP))
+def _fail(category="model_invalid_output"):
+    """Raise a chain-free RouterError. Never call it inside an `except` block (that sets __context__)."""
+    error = RouterError(category)
+    error.__cause__ = error.__context__ = None
+    raise error
 
 
 def _searchable(text):
@@ -110,102 +118,72 @@ def _verbatim(name, texts):
     return None
 
 
-def _result(raw, settings, texts):
+def _result(parsed, texts):
     try:
-        data = json.loads(raw, object_pairs_hook=_unique_object, parse_float=Decimal,
-                          parse_constant=lambda _: _fail())
-        if not isinstance(data, dict) or not {"structured_output", "total_cost_usd", "modelUsage"} <= data.keys():
-            _fail()
-        if not isinstance(data["modelUsage"], dict):
-            _fail()
-        if list(data["modelUsage"]) != [settings.CLAUDE_GUEST_MODEL]:
-            _fail("model_mismatch")
-        cost = data["total_cost_usd"]
-        if type(cost) not in (int, Decimal) or not Decimal(cost).is_finite() or Decimal(cost) < 0:
-            _fail()
-        if Decimal(cost) > settings.GUEST_EXTRACTION_MAX_BUDGET_USD:
-            error = ClassifierError("claude_invalid_output")
-            error.cost_microusd = _micros(Decimal(cost))  # Charged as reported, above the cap.
-            raise error from None
-        structured = data["structured_output"]
-        if not isinstance(structured, dict) or set(structured) != {"guests"}:
-            _fail()
-        entries = structured["guests"]
-        if not isinstance(entries, list) or len(entries) > 10:
-            _fail()
-        guests, seen = [], set()
-        for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {"name", "confidence"}:
-                _fail()
-            confidence = entry["confidence"]
-            if (not isinstance(entry["name"], str) or type(confidence) not in (int, Decimal)
-                    or not Decimal(confidence).is_finite() or not 0 <= confidence <= 1):
-                _fail()
-            for candidate in person_names([entry["name"]], limit=1):
-                for name in person_names([_verbatim(candidate, texts) or ""], limit=1):
-                    if name.casefold() in seen:
-                        continue
-                    seen.add(name.casefold())
-                    guests.append((name, float(Decimal(confidence).quantize(Decimal("0.01"), ROUND_HALF_UP))))
-        return GuestResult(tuple(guests), _micros(Decimal(cost)))
-    except ClassifierError:
+        return _parse(parsed, texts)
+    except RouterError:
         raise
     except (ValueError, TypeError, KeyError, ArithmeticError, UnicodeError, RecursionError):
+        pass
+    _fail()  # Outside the handler, so the error carries no payload-bearing chain.
+
+
+def _parse(parsed, texts):
+    if not isinstance(parsed, dict) or set(parsed) != {"guests"}:
         _fail()
+    entries = parsed["guests"]
+    if not isinstance(entries, list) or len(entries) > 10:
+        _fail()
+    guests, seen = [], set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"name", "confidence"}:
+            _fail()
+        confidence = entry["confidence"]
+        if (not isinstance(entry["name"], str) or type(confidence) not in (int, float)
+                or not math.isfinite(confidence) or not 0 <= confidence <= 1):
+            _fail()
+        for candidate in person_names([entry["name"]], limit=1):
+            for name in person_names([_verbatim(candidate, texts) or ""], limit=1):
+                if name.casefold() in seen:
+                    continue
+                seen.add(name.casefold())
+                guests.append((name, float(Decimal(str(confidence)).quantize(Decimal("0.01"), ROUND_HALF_UP))))
+    return GuestResult(tuple(guests))
 
 
-class ClaudeGuestExtractor:
-    def __init__(self, settings, *, environment=None, popen_factory=subprocess.Popen,
-                 selector_factory=selectors.DefaultSelector):
+class RouterGuestExtractor:
+    def __init__(self, settings, *, client=None):
         self.settings = settings
-        self.environment = environment
-        self.popen_factory = popen_factory
-        self.selector_factory = selector_factory
+        self.client = client if client is not None else RouterClient.from_settings(settings)
 
-    def extract(self, *, show, hosts, title, description) -> GuestResult:
-        settings = self.settings
+    def extract(self, *, show, hosts, title, description, request_key=None) -> GuestResult:
         text = {"show": " ".join(show.split())[:500], "title": " ".join(title.split())[:1000],
                 "description": plain_text(description)[:MAX_DESCRIPTION_CHARS]}
         payload = canonical_json({"schema": "episode-guest-extraction-input/v1", "untrusted_quoted_data": True,
-            "known_hosts": list(hosts)[:10], **text}).encode("utf-8")
+                                  "known_hosts": list(hosts)[:10], **text})
         texts = (_searchable(text["title"]), _searchable(text["description"]))
-        process, completed = None, False
+        key = request_key if request_key is not None else f"podcast.guests:adhoc:{uuid.uuid4().hex}"
+        result = None
         try:
-            environment = _environment(os.environ if self.environment is None else self.environment)
-            argv = ["claude", "--restricted", "--safe-mode", "-p", "--tools", "", "--disallowedTools", "mcp__*",
-                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-chrome", "--disable-slash-commands",
-                "--no-session-persistence", "--permission-prompts", "none", "--max-turns", "1", "--output-format", "json",
-                "--json-schema", canonical_json(OUTPUT_SCHEMA), "--model", settings.CLAUDE_GUEST_MODEL,
-                "--max-budget-usd", str(settings.GUEST_EXTRACTION_MAX_BUDGET_USD), "--system-prompt", SYSTEM_PROMPT]
-            with tempfile.TemporaryDirectory(prefix="claude-guests-") as directory:
-                deadline = time.monotonic() + settings.GUEST_EXTRACTION_TIMEOUT_SECONDS
-                process = self.popen_factory(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, text=False, shell=False, cwd=directory, env=environment,
-                    start_new_session=True)
-                try:
-                    raw = _exchange(process, payload, deadline, MAX_OUTPUT_BYTES, self.selector_factory)
-                    result = _result(raw, settings, texts)
-                    completed = True
-                    return result
-                finally:
-                    try:
-                        if not completed:
-                            _kill_and_reap(process)
-                    finally:
-                        for stream in (process.stdin, process.stdout, process.stderr):
-                            if stream is not None:
-                                stream.close()
-        except ClassifierError:
+            result = self.client.run(GUEST_ROUTE, [{"role": "system", "content": SYSTEM_PROMPT},
+                                                   {"role": "user", "content": payload}],
+                                     OUTPUT_SCHEMA, idempotency_key=key, prompt_version=PROMPT_VERSION,
+                                     max_output_tokens=GUEST_MAX_OUTPUT_TOKENS,
+                                     deadline=self.settings.GUEST_EXTRACTION_TIMEOUT_SECONDS)
+        except RouterError:
             raise
-        except (OSError, ValueError, TypeError, AttributeError, ArithmeticError):
-            _fail("claude_config")
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        if result is None:
+            _fail("model_config")  # Outside the handler, so the error carries no payload-bearing chain.
+        return _result(result.parsed, texts)
 
 
 def _candidates(session):
     """Classified items with a hosted source and no administrator or feed guests.
 
     The source must name a host the exporter can identify (the same check the
-    exporter applies), or the extraction would be paid for an unexportable item.
+    exporter applies), or the extraction would be spent on an unexportable item.
     """
     from models import ClassificationRevision, ContentItem, ContentSource
     rows = session.execute(sa.select(ContentItem, ContentSource).join(
@@ -242,26 +220,17 @@ def _run_lock(session):
         connection.close()
 
 
-def _spent_today(session, now):
+def _calls_today(session, now):
     from models import GuestExtraction
     day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    spent = session.scalar(sa.select(sa.func.coalesce(sa.func.sum(GuestExtraction.cost_microusd), 0))
+    calls = session.scalar(sa.select(sa.func.count()).select_from(GuestExtraction)
                            .where(GuestExtraction.created_at >= day))
-    session.commit()  # No database transaction is held across a Claude call.
-    return spent
+    session.commit()  # No database transaction is held across a router call.
+    return calls
 
 
 def extract_pending_guests(*, session, extractor, settings, clock=None, monotonic=time.monotonic):
-    """Extract guests for up to GUEST_EXTRACTION_MAX_ITEMS_PER_RUN items within today's budget.
-
-    Before each call, today's recorded spend is re-read (so a run that crosses
-    midnight UTC starts a new day) and the call is allowed only when the
-    per-call cap still fits and the call cannot outlast RUN_DEADLINE_SECONDS.
-    A failure after the CLI started is recorded as failed at the per-call cap
-    (or the higher reported cost) and is not retried for the same input; the
-    run continues, except after claude_unavailable, which stops it once that
-    item is recorded. Environmental failures stop the run without a record.
-    """
+    """Extract guests for up to GUEST_EXTRACTION_MAX_ITEMS_PER_RUN items within today's call limit."""
     from models import utc_now
     clock = clock or utc_now
     counts = {"scanned": 0, "extracted": 0, "failed": 0, "stopped": None}
@@ -275,48 +244,72 @@ def extract_pending_guests(*, session, extractor, settings, clock=None, monotoni
         return _extract(session, extractor, settings, clock, monotonic, counts)
 
 
+def _record(session, entry, clock, *, router_failure=False, **outcome):
+    """Write the input's one row: a new row, or the retried row after a recorded router failure.
+
+    Each recorded call stamps `created_at`, so the daily call limit counts a row on the day
+    of its latest call (a retried input's earlier calls that day go uncounted: at most
+    MAX_ROUTER_FAILURES - 1 per input)."""
+    from models import GuestExtraction
+    row = session.get(GuestExtraction, entry["row_id"]) if entry["row_id"] is not None else None
+    if row is None:
+        row = GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], router_failures=0)
+        session.add(row)
+    row.state, row.guests, row.error_category = outcome["state"], outcome.get("guests"), outcome.get("error_category")
+    row.model, row.cost_microusd, row.created_at = outcome["model"], 0, clock()
+    if router_failure:
+        row.router_failures = (row.router_failures or 0) + 1
+    session.commit()
+
+
 def _extract(session, extractor, settings, clock, monotonic, counts):
     from models import GuestExtraction
     started = monotonic()
-    ceiling = _micros(settings.GUEST_EXTRACTION_MAX_BUDGET_USD)
-    daily = _micros(settings.GUEST_EXTRACTION_DAILY_BUDGET_USD)
-    done = {tuple(row) for row in session.execute(sa.select(GuestExtraction.item_id, GuestExtraction.input_sha256))}
-    work = []
+    longest_call = settings.GUEST_EXTRACTION_TIMEOUT_SECONDS + CONNECT_TIMEOUT_SECONDS + READ_MARGIN_SECONDS
+    deadline = max(RUN_DEADLINE_SECONDS, longest_call)  # Room for one call even at the longest timeout.
+    run = clock().strftime("%Y%m%dT%H%M%SZ")
+    rows = {(item_id, digest): (row_id, retryable) for row_id, item_id, digest, retryable in session.execute(
+        sa.select(GuestExtraction.id, GuestExtraction.item_id, GuestExtraction.input_sha256,
+                  (GuestExtraction.state == "failed") & (GuestExtraction.error_category == "router_busy")
+                  & (GuestExtraction.router_failures < MAX_ROUTER_FAILURES)))}
+    fresh, retries = [], []
     for item, source in _candidates(session):
         digest = guest_input_sha256(item)
-        if (item.id, digest) not in done:
-            work.append(dict(item_id=item.id, digest=digest, show=source.name, hosts=source_hosts(source)[0],
-                             title=item.title, description=item.description or ""))
-        if len(work) == settings.GUEST_EXTRACTION_MAX_ITEMS_PER_RUN:
+        row_id, retryable = rows.get((item.id, digest), (None, True))
+        if retryable:  # Inputs never tried come first; inputs the router failed on are retried after them.
+            (fresh if row_id is None else retries).append(dict(
+                item_id=item.id, digest=digest, row_id=row_id, show=source.name, hosts=source_hosts(source)[0],
+                title=item.title, description=item.description or ""))
+        if len(fresh) == settings.GUEST_EXTRACTION_MAX_ITEMS_PER_RUN:
             break
-    session.commit()  # No database transaction is held across a Claude call.
+    work = (fresh + retries)[:settings.GUEST_EXTRACTION_MAX_ITEMS_PER_RUN]
+    session.commit()  # No database transaction is held across a router call.
+    model = settings.ROUTER_EXPECTED_MODEL
     for entry in work:
-        if monotonic() - started + settings.GUEST_EXTRACTION_TIMEOUT_SECONDS > RUN_DEADLINE_SECONDS:
+        if monotonic() - started + longest_call > deadline:
             counts["stopped"] = "run_deadline"
             break
-        if _spent_today(session, clock()) + ceiling > daily:
-            counts["stopped"] = "daily_budget"
+        if _calls_today(session, clock()) >= settings.GUEST_EXTRACTION_MAX_CALLS_PER_DAY:
+            counts["stopped"] = "daily_limit"
             break
         counts["scanned"] += 1
+        key = f"podcast.guests:item-{entry['item_id']}:{entry['digest'][:16]}:{run}"
         try:
             result = extractor.extract(show=entry["show"], hosts=entry["hosts"], title=entry["title"],
-                                       description=entry["description"])
-        except ClassifierError as error:
-            if error.category in ENVIRONMENTAL:
+                                       description=entry["description"], request_key=key)
+        except RouterError as error:
+            router_failure = error.category == "router_busy" and error.reason == "router_failure"
+            if error.category in ENVIRONMENTAL or (error.category == "router_busy" and not router_failure):
                 counts["stopped"] = error.category
                 break
-            session.add(GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], state="failed",
-                error_category=error.category, model=settings.CLAUDE_GUEST_MODEL,
-                cost_microusd=max(ceiling, getattr(error, "cost_microusd", 0)), created_at=clock()))
-            session.commit()
+            _record(session, entry, clock, router_failure=router_failure, state="failed",
+                    error_category=error.category, model=model)
             counts["failed"] += 1
-            if error.category in STOPS_AFTER_RECORDING:
+            if router_failure:  # The router itself is failing: record this input, then stop until next run.
                 counts["stopped"] = error.category
                 break
             continue
-        session.add(GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], state="completed",
-            guests=[{"name": name, "confidence": confidence} for name, confidence in result.guests],
-            model=settings.CLAUDE_GUEST_MODEL, cost_microusd=result.cost_microusd, created_at=clock()))
-        session.commit()
+        _record(session, entry, clock, state="completed", model=model,
+                guests=[{"name": name, "confidence": confidence} for name, confidence in result.guests])
         counts["extracted"] += 1
     return counts

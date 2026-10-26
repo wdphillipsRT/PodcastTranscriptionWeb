@@ -104,7 +104,7 @@ def test_cli_rejects_nonallowlisted_or_ambiguous_selection(app, checks, monkeypa
     result = app.test_cli_runner().invoke(args=["system", "check", "--services", selection])
     assert result.exit_code == 2
     assert calls == []
-    assert result.output.endswith("Error: Select unique components: " + ",".join(COMPONENTS) + "\n")
+    assert result.output.endswith("Error: Select unique components: " + ",".join(COMPONENTS + ("claude_absent", "router")) + "\n")
 
 
 def test_cli_all_components_success(app, checks, monkeypatch):
@@ -132,6 +132,9 @@ def test_database_requires_connectivity_and_exact_migration_head(checks, tmp_pat
     assert checks._check_database(config) is False
     with engine.begin() as connection:
         connection.execute(text("UPDATE alembic_version SET version_num = '0003_knowledge_export'"))
+    assert checks._check_database(config) is False
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE alembic_version SET version_num = '0004_router_classification'"))
     assert checks._check_database(config) is True
     engine.dispose()
 
@@ -366,3 +369,76 @@ def test_any_dependency_error_has_only_fixed_public_status(checks, monkeypatch, 
         raise RuntimeError("secret https://internal.invalid version-123")
     monkeypatch.setattr(checks, "_run_isolated", failed)
     assert checks.run_checks({}, (component,)) == {component: "failed"}
+
+
+from tests.router_fake import fake_router  # noqa: E402,F401
+
+
+def test_claude_absent_rejects_any_claude_variable_cli_or_package(checks, monkeypatch, tmp_path):
+    package = tmp_path / "anthropic"
+    monkeypatch.setattr(checks, "_CLAUDE_PACKAGE", package)
+    monkeypatch.setattr(checks.shutil, "which", lambda name: None)
+    monkeypatch.setattr(checks.os, "environ", {"PATH": "/usr/bin"})
+    assert checks._check_claude_absent({}) is True
+    for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDECODE", "claude_model"):
+        monkeypatch.setattr(checks.os, "environ", {"PATH": "/usr/bin", name: "1"})
+        assert checks._check_claude_absent({}) is False, name
+    monkeypatch.setattr(checks.os, "environ", {"PATH": "/usr/bin"})
+    monkeypatch.setattr(checks.shutil, "which", lambda name: "/usr/local/bin/claude" if name == "claude" else None)
+    assert checks._check_claude_absent({}) is False
+    monkeypatch.setattr(checks.shutil, "which", lambda name: None)
+    package.mkdir()
+    assert checks._check_claude_absent({}) is False
+
+
+def test_router_probe_needs_readiness_and_a_usable_token(checks, fake_router, tmp_path):  # noqa: F811
+    config = {"ROUTER_URL": fake_router.url, "ROUTER_TOKEN_FILE": fake_router.token_file, "ROUTER_CA_FILE": "",
+              "ROUTER_CLIENT_CERT_FILE": "", "ROUTER_CLIENT_KEY_FILE": ""}
+    assert checks._check_router(config) is True
+    assert checks._check_router({**config, "ROUTER_TOKEN_FILE": str(tmp_path / "missing")}) is False
+    fake_router.ready = False  # /readyz 503, e.g. Forge unavailable
+    assert checks._check_router(config) is False
+
+
+def test_classifier_components_are_selectable_but_not_part_of_web_readiness(app, checks, monkeypatch):
+    calls = []
+    monkeypatch.setattr(checks, "_run_isolated", lambda component, config: calls.append(component) or True)
+    result = app.test_cli_runner().invoke(args=["system", "check", "--services", "database,redis,s3,claude_absent,router"])
+    assert result.exit_code == 0, result.output
+    assert calls == ["database", "redis", "s3", "claude_absent", "router"]
+    assert "router" not in checks.COMPONENTS and "claude_absent" not in checks.COMPONENTS
+
+
+def test_only_the_router_probe_child_outlives_the_router_client_connect_timeout(monkeypatch):
+    """The web /readyz runs its probes serially, so only the router probe gets the longer limit."""
+    import router_client
+    import system_checks
+    assert system_checks.ROUTER_PROBE_TIMEOUT_SECONDS == 12 > router_client.CONNECT_TIMEOUT_SECONDS
+    assert system_checks.PROBE_TIMEOUT_SECONDS == 8
+    timeouts = {}
+
+    class Process:
+        pid, returncode = 0, 0
+
+        def __init__(self, arguments, **keywords):
+            self.component = arguments[-1]
+
+        def communicate(self, *, input, timeout):
+            timeouts[self.component] = timeout
+            return None, None
+    monkeypatch.setattr(system_checks.subprocess, "Popen", Process)
+    for component in ("router", "database"):
+        system_checks._run_isolated(component, {})
+    assert timeouts == {"router": 12, "database": 8}
+
+
+def test_router_probe_payload_carries_paths_never_secrets(checks, monkeypatch):
+    process = MagicMock(pid=1)
+    process.communicate.return_value = (None, None)
+    process.returncode = 0
+    monkeypatch.setattr(checks.subprocess, "Popen", MagicMock(return_value=process))
+    paths = {"ROUTER_URL": "https://router.invalid:8443", "ROUTER_TOKEN_FILE": "/router/token",
+             "ROUTER_CA_FILE": "/router/router-ca.crt", "ROUTER_CLIENT_CERT_FILE": "/router/client.crt",
+             "ROUTER_CLIENT_KEY_FILE": "/router/client.key"}
+    assert checks._run_isolated("router", {**paths, "SECRET_KEY": "omit-me"}) is True
+    assert json.loads(process.communicate.call_args.kwargs["input"]) == paths

@@ -1,27 +1,24 @@
-"""Restricted, budgeted Claude guest extraction; never a live Claude call."""
+"""Router guest extraction and its call-limited batch runner; never a live router call."""
 
 from dataclasses import replace
 from datetime import datetime, timezone
-from decimal import Decimal
-import importlib
 import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
-import subprocess
 
 import pytest
-import sqlalchemy as sa
 
-from claude_classifier import ClassifierError
-from config import ConfigError, Settings, load_settings
+from config import ConfigError, load_settings
 from extensions import db
 from integrations.knowledge.people import guest_input_sha256
 import models as m
-from tests.test_claude_classifier import PipeChild
+from router_client import (CONNECT_TIMEOUT_SECONDS, GUEST_MAX_OUTPUT_TOKENS, READ_MARGIN_SECONDS, ROUTE_LIMITS,
+                           RouterClient, RouterError, estimated_context_tokens)
+from tests.router_fake import MODEL, FakeRouter, fake_router  # noqa: F401
+from tests.router_schema_validator import validate_schema
 from tests.test_classification_service import add_item, env, finish  # noqa: F401
 from tests.test_config import valid_environment  # noqa: F401
-from transcripts import canonical_json
 import guest_extractor
 
 
@@ -31,146 +28,152 @@ DESCRIPTION = "<p>James Clear and <b>Ada Host</b> discuss habits. Sponsored by E
 
 
 @pytest.fixture
-def settings():
-    return Settings("test-secret", "postgresql://db/app", "postgresql://db/app", "redis://redis/0",
-                    "redis://redis/1", "us-east-1", "podcast-transcriptions-web-2025", "test-key",
-                    GUEST_EXTRACTION_ENABLED=True)
+def run(fake_router, valid_environment):  # noqa: F811
+    settings = load_settings({**valid_environment, "GUEST_EXTRACTION_ENABLED": "true"})
+    extractor = guest_extractor.RouterGuestExtractor(settings, client=RouterClient(
+        fake_router.url, token_file=fake_router.token_file, expected_model=MODEL))
 
-
-def reply(guests, *, cost=.004, model="claude-sonnet-5-5"):
-    return json.dumps({"structured_output": {"guests": guests}, "total_cost_usd": cost,
-                       "modelUsage": {model: {}}, "result": "secret raw telemetry"}).encode()
-
-
-@pytest.fixture
-def run(tmp_path, monkeypatch, settings):
-    calls, children = [], []
-    environment = {"PATH": "/usr/local/bin:/usr/bin:/bin", "CLAUDE_CONFIG_DIR": str(tmp_path),
-                   "AWS_SECRET_ACCESS_KEY": "secret", "HOME": "/secret"}
-    monkeypatch.setattr(os, "killpg", lambda pid, sig: [child.killed.set() for child in children])
-
-    def invoke(output, *, configuration=None, **arguments):
-        def factory(argv, **kwargs):
-            calls.append((argv, kwargs))
-            child = PipeChild(output)
-            children.append(child)
-            return child
-        extractor = guest_extractor.ClaudeGuestExtractor(configuration or settings, environment=environment,
-                                                         popen_factory=factory)
+    def invoke(guests=None, **arguments):
+        if guests is not None:
+            fake_router.output = {"guests": guests}
         values = dict(show="People Show", hosts=("Ada Host",), title=TITLE, description=DESCRIPTION)
         values.update(arguments)
         return extractor.extract(**values)
-
-    yield invoke, calls, children, environment
-    for child in children:
-        child.killed.set()
-        child.thread.join(2)
-        for stream in (child.stdin, child.stdout, child.stderr):
-            stream.close()
+    return invoke, fake_router
 
 
-def test_invocation_is_restricted_and_input_is_an_untrusted_envelope(run, settings):
-    invoke, calls, children, environment = run
-    result = invoke(reply([{"name": "James Clear", "confidence": 0.92}]))
-    argv, kwargs = calls[0]
-    assert argv == ["claude", "--restricted", "--safe-mode", "-p", "--tools", "", "--disallowedTools", "mcp__*",
-        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-chrome", "--disable-slash-commands",
-        "--no-session-persistence", "--permission-prompts", "none", "--max-turns", "1", "--output-format", "json",
-        "--json-schema", canonical_json(guest_extractor.OUTPUT_SCHEMA), "--model", "claude-sonnet-5-5",
-        "--max-budget-usd", "0.05", "--system-prompt", guest_extractor.SYSTEM_PROMPT]
-    assert kwargs["shell"] is False and kwargs["start_new_session"] is True
-    assert set(kwargs["env"]) == {"PATH", "LANG", "CLAUDE_CONFIG_DIR", "DISABLE_UPDATES",
-        "CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_DISABLE_CLAUDE_MDS", "CLAUDE_CODE_DISABLE_POLICY_SKILLS",
-        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-        "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL"}
-    assert json.loads(bytes(children[0].input)) == {
+def test_extraction_sends_one_guest_task_and_keeps_verbatim_names(run):
+    invoke, router = run
+    result = invoke([{"name": "James Clear", "confidence": 0.92}, {"name": "Invented Person", "confidence": 1}],
+                    request_key="podcast.guests:item-1:abc:20261022T120000Z")
+    assert result == guest_extractor.GuestResult((("James Clear", 0.92),), 0)
+    _, _, headers, body = router.requests[-1]
+    assert headers["Idempotency-Key"] == "podcast.guests:item-1:abc:20261022T120000Z"
+    assert (body["route"], body["prompt_version"], body["generation"]["max_output_tokens"],
+            body["requirements"]["max_latency_ms"]) == ("podcast.guests", "episode-guest-extraction/v1", 1024, 120_000)
+    assert body["messages"][0] == {"role": "system", "content": guest_extractor.SYSTEM_PROMPT}
+    assert json.loads(body["messages"][1]["content"]) == {
         "schema": "episode-guest-extraction-input/v1", "untrusted_quoted_data": True, "show": "People Show",
         "known_hosts": ["Ada Host"], "title": TITLE,
         "description": "James Clear and Ada Host discuss habits. Sponsored by Example Corp."}
-    assert result.guests == (("James Clear", 0.92),) and result.cost_microusd == 4000
-    assert "secret raw telemetry" not in repr(result)
+
+
+def test_the_guest_schema_is_in_the_router_subset():
+    validate_schema(guest_extractor.OUTPUT_SCHEMA)
 
 
 def test_only_names_found_verbatim_in_the_input_are_kept(run):
-    invoke, *_ = run
-    result = invoke(reply([{"name": "james  clear", "confidence": 0.9}, {"name": "Invented Person", "confidence": 1},
-                           {"name": "James Clear", "confidence": 0.5}, {"name": "!!!", "confidence": 0.7},
-                           {"name": "Example Corp", "confidence": 0.123}]))
+    invoke, _ = run
+    result = invoke([{"name": "james  clear", "confidence": 0.9}, {"name": "Invented Person", "confidence": 1},
+                     {"name": "James Clear", "confidence": 0.5}, {"name": "!!!", "confidence": 0.7},
+                     {"name": "Example Corp", "confidence": 0.123}])
     assert result.guests == (("James Clear", 0.9), ("Example Corp", 0.12))
 
 
 def test_names_match_whole_words_within_the_title_or_description(run):
-    invoke, *_ = run
-    result = invoke(reply([{"name": "Ann", "confidence": 0.9}, {"name": "Clear Discuss", "confidence": 0.9},
-                           {"name": "jane doe", "confidence": 0.8}, {"name": "james clear", "confidence": 0.7}]),
+    invoke, _ = run
+    result = invoke([{"name": "Ann", "confidence": 0.9}, {"name": "Clear Discuss", "confidence": 0.9},
+                     {"name": "jane doe", "confidence": 0.8}, {"name": "james clear", "confidence": 0.7}],
                     title="Annual habits with James Clear",
-                    description="Discuss habits with \uff2a\uff41\uff4e\uff45 \uff24\uff4f\uff45.")
+                    description="Discuss habits with Ｊａｎｅ Ｄｏｅ.")
     assert result.guests == (("Jane Doe", 0.8), ("James Clear", 0.7))
 
 
 def test_long_descriptions_are_truncated_before_the_call(run):
-    invoke, _, children, _ = run
-    invoke(reply([]), description="word " * 5000)
-    sent = json.loads(bytes(children[0].input))["description"]
+    invoke, router = run
+    invoke([], description="word " * 5000)
+    sent = json.loads(router.requests[-1][3]["messages"][1]["content"])["description"]
     assert len(sent) == guest_extractor.MAX_DESCRIPTION_CHARS
 
 
-@pytest.mark.parametrize("output, category", [
-    (reply([], model="claude-opus-5-5"), "model_mismatch"),
-    (reply([], cost=0.06), "claude_invalid_output"),
-    (reply([{"name": "James Clear"}]), "claude_invalid_output"),
-    (reply([{"name": "James Clear", "confidence": 2}]), "claude_invalid_output"),
-    (reply([{"name": "James Clear", "confidence": 0.5}] * 11), "claude_invalid_output"),
-    (b"not json", "claude_invalid_output"),
-    (reply([], cost=-0.001), "claude_invalid_output"),
-    (reply([], cost=True), "claude_invalid_output"),
-    (b'{"structured_output": {"guests": []}, "total_cost_usd": 0.001, "total_cost_usd": 0.002,'
-     b' "modelUsage": {"claude-sonnet-5-5": {}}}', "claude_invalid_output"),
-    (b'{"structured_output": {"guests": [], "guests": []}, "total_cost_usd": 0.001,'
-     b' "modelUsage": {"claude-sonnet-5-5": {}}}', "claude_invalid_output"),
+def test_the_largest_possible_input_fits_the_guest_route(run):
+    """Bounded show, title, description and hosts always fit podcast.guests (32,768 context, 1,024 output),
+    even when every character is JSON-escaped, so no item is refused as too large."""
+    invoke, router = run
+    escaped = "\x01"
+    invoke([], show=escaped * 1000, hosts=tuple(f"{index}" + escaped * 299 for index in range(12)),
+           title=escaped * 2000, description=escaped * 20_000)
+    body = router.requests[-1][3]
+    estimate = estimated_context_tokens(body["messages"], body["response_schema"],
+                                        body["generation"]["max_output_tokens"])
+    assert body["generation"]["max_output_tokens"] == GUEST_MAX_OUTPUT_TOKENS
+    assert estimate <= ROUTE_LIMITS["podcast.guests"][0] - 4096
+
+
+@pytest.mark.parametrize("setup, category", [
+    (lambda router: setattr(router, "model", "other:1b"), "model_mismatch"),
+    (lambda router: router.reply(502, FakeRouter.error("MODEL_OUTPUT_INVALID")), "model_invalid_output"),
+    (lambda router: router.reply(429, FakeRouter.error("MODEL_RATE_LIMITED")), "router_busy"),
+    (lambda router: router.reply(200, router.succeeded({}, {"guests": [{"name": "James Clear"}]})), "model_invalid_output"),
+    (lambda router: router.reply(200, router.succeeded({}, {"guests": [{"name": "James Clear", "confidence": 2}]})), "model_invalid_output"),
+    (lambda router: router.reply(200, router.succeeded({}, {"guests": [{"name": "J C", "confidence": 0.5}] * 11})), "model_invalid_output"),
+    (lambda router: router.reply(200, router.succeeded({}, ["not", "an", "object"])), "model_invalid_output"),
 ])
-def test_invalid_results_fail_closed(run, output, category):
-    invoke, *_ = run
-    with pytest.raises(ClassifierError) as caught:
-        invoke(output)
+def test_invalid_results_and_router_failures_fail_closed(run, setup, category):
+    invoke, router = run
+    router.output = {"guests": []}
+    setup(router)
+    with pytest.raises(RouterError) as caught:
+        invoke()
     assert caught.value.category == category
 
 
-@pytest.mark.parametrize("cost, charged", [(0.06, 60_000), (-0.001, None), (True, None), (0.004, None)])
-def test_reported_cost_above_the_cap_is_carried_on_the_error(run, cost, charged):
-    invoke, *_ = run
-    with pytest.raises(ClassifierError) as caught:
-        invoke(reply([{"name": "James Clear"}], cost=cost))
-    assert caught.value.category == "claude_invalid_output"
-    assert getattr(caught.value, "cost_microusd", None) == charged
+def test_a_router_failure_body_keeps_its_reason(run):
+    invoke, router = run
+    router.reply(504, FakeRouter.error("MODEL_TIMEOUT"))
+    with pytest.raises(RouterError) as caught:
+        invoke([])
+    assert (caught.value.category, caught.value.reason) == ("router_busy", "router_failure")
+
+
+class _BrokenClient:
+    expected_model = MODEL
+
+    def run(self, *arguments, **keywords):
+        raise OSError("/router/token: secret detail")
+
+
+def test_failures_carry_no_exception_chain(valid_environment, monkeypatch):  # noqa: F811
+    settings = load_settings({**valid_environment, "GUEST_EXTRACTION_ENABLED": "true"})
+    extractor = guest_extractor.RouterGuestExtractor(settings, client=_BrokenClient())
+    with pytest.raises(RouterError) as caught:
+        extractor.extract(show="Show", hosts=(), title=TITLE, description=DESCRIPTION)
+    assert caught.value.category == "model_config"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+    def broken(*arguments, **keywords):
+        raise ValueError("secret detail")
+    monkeypatch.setattr(guest_extractor, "person_names", broken)
+    with pytest.raises(RouterError) as caught:
+        guest_extractor._result({"guests": [{"name": "James Clear", "confidence": 0.5}]}, ())
+    assert caught.value.category == "model_invalid_output"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 def test_guest_settings_defaults_and_validation(valid_environment):  # noqa: F811
     settings = load_settings(valid_environment)
     assert settings.GUEST_EXTRACTION_ENABLED is False
-    assert settings.CLAUDE_GUEST_MODEL == "claude-sonnet-5-5"
-    assert settings.GUEST_EXTRACTION_MAX_BUDGET_USD == Decimal("0.05")
-    assert settings.GUEST_EXTRACTION_DAILY_BUDGET_USD == Decimal("1.00")
-    assert settings.GUEST_EXTRACTION_MAX_ITEMS_PER_RUN == 25
-    for name, value in (("GUEST_EXTRACTION_ENABLED", "yes"), ("CLAUDE_GUEST_MODEL", "haiku"),
-                        ("GUEST_EXTRACTION_MAX_BUDGET_USD", "0"), ("GUEST_EXTRACTION_DAILY_BUDGET_USD", "0.01"),
-                        ("GUEST_EXTRACTION_MAX_ITEMS_PER_RUN", "101"), ("GUEST_EXTRACTION_TIMEOUT_SECONDS", "601"),
-                        ("GUEST_EXTRACTION_INTERVAL_SECONDS", "3599")):
-        with pytest.raises(ConfigError, match=name if name != "GUEST_EXTRACTION_DAILY_BUDGET_USD" else "DAILY"):
+    assert (settings.GUEST_EXTRACTION_MAX_CALLS_PER_DAY, settings.GUEST_EXTRACTION_MAX_ITEMS_PER_RUN,
+            settings.GUEST_EXTRACTION_TIMEOUT_SECONDS) == (200, 25, 120)
+    for name, value in (("GUEST_EXTRACTION_ENABLED", "yes"), ("GUEST_EXTRACTION_MAX_ITEMS_PER_RUN", "101"),
+                        ("GUEST_EXTRACTION_TIMEOUT_SECONDS", "601"), ("GUEST_EXTRACTION_TIMEOUT_SECONDS", "4"),
+                        ("GUEST_EXTRACTION_INTERVAL_SECONDS", "3599"), ("GUEST_EXTRACTION_MAX_CALLS_PER_DAY", "2401")):
+        with pytest.raises(ConfigError, match=name):
             load_settings({**valid_environment, name: value})
 
 
 class FakeExtractor:
     def __init__(self):
-        self.calls, self.error, self.errors, self.cost = [], None, [], 4000
+        self.calls, self.keys, self.error, self.errors = [], [], None, []
 
-    def extract(self, *, show, hosts, title, description):
-        assert not db.session().in_transaction(), "Claude call held a database transaction"
+    def extract(self, *, show, hosts, title, description, request_key=None):
+        assert not db.session().in_transaction(), "Router call held a database transaction"
         self.calls.append((show, hosts, title, description))
+        self.keys.append(request_key)
         error = self.errors.pop(0) if self.errors else self.error
         if error:
             raise error
-        return guest_extractor.GuestResult((("James Clear", 0.92),), self.cost)
+        return guest_extractor.GuestResult((("James Clear", 0.92),))
 
 
 @pytest.fixture
@@ -201,13 +204,20 @@ def newer_item(ready):
     return other
 
 
-def test_extraction_runs_once_per_input_and_records_cost(ready):
+def recorded(item, *, created_at, state="completed"):
+    db.session.add(m.GuestExtraction(item_id=item.id, input_sha256="f" * 64, state=state, guests=[],
+                                     model=MODEL, cost_microusd=0, created_at=created_at))
+    db.session.commit()
+
+
+def test_extraction_runs_once_per_input_and_records_the_router_model(ready):
     assert extract(ready) == {"scanned": 1, "extracted": 1, "failed": 0, "stopped": None}
     row = m.GuestExtraction.query.one()
     assert (row.state, row.guests, row.cost_microusd, row.model) == (
-        "completed", [{"name": "James Clear", "confidence": 0.92}], 4000, "claude-sonnet-5-5")
+        "completed", [{"name": "James Clear", "confidence": 0.92}], 0, MODEL)
     assert row.input_sha256 == guest_input_sha256(ready.item)
     assert ready.extractor.calls == [("Feed", ("Ada Host",), TITLE, DESCRIPTION)]
+    assert ready.extractor.keys == [f"podcast.guests:item-{ready.item.id}:{row.input_sha256[:16]}:20261022T120000Z"]
     assert extract(ready)["scanned"] == 0
     ready.item.title = "Renamed episode with James Clear"
     db.session.commit()
@@ -229,91 +239,168 @@ def test_disabled_or_unneeded_items_make_no_call(ready):
 
 
 def test_sources_whose_hosts_cannot_be_exported_make_no_call(ready):
-    # The exporter needs a host with an identifier; extraction would be paid for nothing.
     ready.source.feed_hosts = ["!!!", "—"]
     db.session.commit()
     assert extract(ready)["scanned"] == 0 and not ready.extractor.calls
     ready.source.admin_hosts = ["Ada Host"]
     db.session.commit()
     assert extract(ready)["extracted"] == 1
-    assert ready.extractor.calls == [("Feed", ("Ada Host",), TITLE, DESCRIPTION)]
 
 
-def test_daily_budget_counts_todays_spend_and_stops_before_the_call(ready):
+def test_the_daily_call_limit_counts_todays_calls_and_stops_before_the_call(ready):
     other, _ = add_item(ready, external_id="other")
-    db.session.add(m.GuestExtraction(item_id=other.id, input_sha256="f" * 64, state="completed", guests=[],
-        model="claude-sonnet-5-5", cost_microusd=970_000, created_at=NOW.replace(hour=1)))
-    db.session.commit()
-    assert extract(ready)["stopped"] == "daily_budget" and not ready.extractor.calls
-    assert extract(ready, GUEST_EXTRACTION_DAILY_BUDGET_USD=Decimal("1.03"))["extracted"] == 1
+    recorded(other, created_at=NOW.replace(hour=1))
+    assert extract(ready, GUEST_EXTRACTION_MAX_CALLS_PER_DAY=1)["stopped"] == "daily_limit"
+    assert not ready.extractor.calls
+    assert extract(ready, GUEST_EXTRACTION_MAX_CALLS_PER_DAY=2)["extracted"] == 1
 
 
-@pytest.mark.parametrize("category", ["claude_auth", "claude_config", "model_mismatch"])
+def test_calls_from_earlier_days_do_not_count(ready):
+    other, _ = add_item(ready, external_id="yesterday")
+    recorded(other, created_at=NOW.replace(day=21))
+    assert extract(ready, GUEST_EXTRACTION_MAX_CALLS_PER_DAY=1)["extracted"] == 1
+
+
+@pytest.mark.parametrize("category", ["model_auth", "model_config", "model_mismatch"])
 def test_environmental_failures_stop_the_run_unrecorded(ready, category):
     newer_item(ready)
-    ready.extractor.error = ClassifierError(category)
+    ready.extractor.error = RouterError(category)
     assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 0, "stopped": category}
     assert m.GuestExtraction.query.count() == 0 and len(ready.extractor.calls) == 1
 
 
-@pytest.mark.parametrize("category", ["claude_timeout", "claude_invalid_output"])
-def test_item_failures_after_start_are_recorded_at_the_cap_and_the_run_continues(ready, category):
+def test_a_busy_router_stops_the_run_unrecorded_and_the_item_waits_for_the_next_run(ready):
+    newer_item(ready)
+    ready.extractor.errors = [RouterError("router_busy", advance_key=False)]
+    assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 0, "stopped": "router_busy"}
+    assert m.GuestExtraction.query.count() == 0
+    assert extract(ready) == {"scanned": 2, "extracted": 2, "failed": 0, "stopped": None}
+
+
+def router_failure():
+    return RouterError("router_busy", reason="router_failure")
+
+
+def test_a_router_failure_is_recorded_and_stops_the_run_so_the_next_run_moves_on(ready):
+    """A provider timeout (504 MODEL_TIMEOUT) would recur for the newest item and block every run."""
     newer = newer_item(ready)
-    ready.extractor.errors = [ClassifierError(category)]
+    ready.extractor.errors = [router_failure()]
+    assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 1, "stopped": "router_busy"}
+    failed = m.GuestExtraction.query.one()
+    assert (failed.item_id, failed.state, failed.error_category, failed.cost_microusd, failed.model,
+            failed.router_failures) == (newer.id, "failed", "router_busy", 0, MODEL, 1)
+    ready.extractor.errors = [None, router_failure()]
+    assert extract(ready) == {"scanned": 2, "extracted": 1, "failed": 1, "stopped": "router_busy"}
+    assert m.GuestExtraction.query.filter_by(item_id=ready.item.id).one().state == "completed"
+
+
+def test_router_failures_are_retried_after_fresh_items_and_abandoned_after_three(ready):
+    newer = newer_item(ready)
+    ready.extractor.errors = [router_failure()]
+    extract(ready)
+    # The fresh (older) item goes first; the input that failed is retried after it.
+    ready.extractor.errors = [None, router_failure()]
+    assert extract(ready) == {"scanned": 2, "extracted": 1, "failed": 1, "stopped": "router_busy"}
+    assert [key.split(":")[1] for key in ready.extractor.keys] == [
+        f"item-{newer.id}", f"item-{ready.item.id}", f"item-{newer.id}"]
+    ready.extractor.errors = [router_failure()]
+    assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 1, "stopped": "router_busy"}
+    row = m.GuestExtraction.query.filter_by(item_id=newer.id).one()
+    assert (row.state, row.error_category, row.router_failures) == (
+        "failed", "router_busy", guest_extractor.MAX_ROUTER_FAILURES)
+    assert extract(ready)["scanned"] == 0 and len(ready.extractor.calls) == 4
+
+
+def test_a_busy_router_neither_spends_nor_skips_a_retry(ready):
+    newer = newer_item(ready)
+    ready.extractor.errors = [router_failure()]
+    extract(ready)
+    ready.extractor.errors = [RouterError("router_busy", reason="rate_limited", advance_key=False)]
+    assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 0, "stopped": "router_busy"}
+    assert m.GuestExtraction.query.filter_by(item_id=newer.id).one().router_failures == 1
+    ready.extractor.errors = [None, router_failure()]
+    assert extract(ready) == {"scanned": 2, "extracted": 1, "failed": 1, "stopped": "router_busy"}
+    assert m.GuestExtraction.query.filter_by(item_id=newer.id).one().router_failures == 2
+
+
+def test_retries_count_against_the_items_per_run_limit(ready):
+    newer = newer_item(ready)
+    ready.extractor.errors = [router_failure()]
+    extract(ready, GUEST_EXTRACTION_MAX_ITEMS_PER_RUN=1)
+    assert extract(ready, GUEST_EXTRACTION_MAX_ITEMS_PER_RUN=1) == {
+        "scanned": 1, "extracted": 1, "failed": 0, "stopped": None}
+    assert ready.extractor.keys[-1].split(":")[1] == f"item-{ready.item.id}"
+    assert extract(ready, GUEST_EXTRACTION_MAX_ITEMS_PER_RUN=1) == {
+        "scanned": 1, "extracted": 1, "failed": 0, "stopped": None}
+    assert ready.extractor.keys[-1].split(":")[1] == f"item-{newer.id}"
+
+
+def test_a_retried_input_that_succeeds_completes_its_row(ready):
+    later = datetime(2026, 10, 22, 13, 0, tzinfo=timezone.utc)
+    ready.extractor.errors = [router_failure()]
+    extract(ready)
+    assert extract(ready, clock=lambda: later)["extracted"] == 1
+    row = m.GuestExtraction.query.one()
+    assert (row.state, row.error_category, row.guests, row.router_failures, row.created_at) == (
+        "completed", None, [{"name": "James Clear", "confidence": 0.92}], 1, later)
+
+
+def test_a_retried_input_with_invalid_output_is_abandoned(ready):
+    ready.extractor.errors = [router_failure(), RouterError("model_invalid_output")]
+    extract(ready)
+    assert extract(ready)["failed"] == 1
+    row = m.GuestExtraction.query.one()
+    assert (row.state, row.error_category, row.router_failures) == ("failed", "model_invalid_output", 1)
+    assert extract(ready)["scanned"] == 0
+
+
+@pytest.mark.parametrize("reason", ["in_progress", "rate_limited", "timeout", "transport", "proxy", "no_candidate"])
+def test_other_busy_reasons_stay_unrecorded(ready, reason):
+    newer_item(ready)
+    ready.extractor.errors = [RouterError("router_busy", reason=reason, advance_key=False)]
+    assert extract(ready)["stopped"] == "router_busy"
+    assert m.GuestExtraction.query.count() == 0
+
+
+def test_invalid_output_is_recorded_once_and_the_run_continues(ready):
+    newer = newer_item(ready)
+    ready.extractor.errors = [RouterError("model_invalid_output")]
     assert extract(ready) == {"scanned": 2, "extracted": 1, "failed": 1, "stopped": None}
     failed = m.GuestExtraction.query.filter_by(item_id=newer.id).one()
-    assert (failed.state, failed.error_category, failed.cost_microusd) == ("failed", category, 50_000)
-    assert m.GuestExtraction.query.filter_by(item_id=ready.item.id).one().state == "completed"
+    assert (failed.state, failed.error_category, failed.cost_microusd, failed.model) == (
+        "failed", "model_invalid_output", 0, MODEL)
     assert extract(ready)["scanned"] == 0 and len(ready.extractor.calls) == 2
 
 
-def test_an_unavailable_claude_records_that_item_and_stops_the_run(ready):
-    newer = newer_item(ready)
-    ready.extractor.errors = [ClassifierError("claude_unavailable")]
-    assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 1, "stopped": "claude_unavailable"}
-    failed = m.GuestExtraction.query.one()
-    assert (failed.item_id, failed.state, failed.error_category, failed.cost_microusd) == (
-        newer.id, "failed", "claude_unavailable", 50_000)
-    assert len(ready.extractor.calls) == 1
-    assert extract(ready) == {"scanned": 1, "extracted": 1, "failed": 0, "stopped": None}
-    assert m.GuestExtraction.query.filter_by(item_id=ready.item.id).one().state == "completed"
-
-
-def test_failures_still_respect_the_daily_budget(ready):
+def test_todays_calls_are_reread_per_call_and_rows_are_stamped_when_recorded(ready):
     newer_item(ready)
-    ready.extractor.error = ClassifierError("claude_timeout")
-    assert extract(ready, GUEST_EXTRACTION_DAILY_BUDGET_USD=Decimal("0.09")) == {
-        "scanned": 1, "extracted": 0, "failed": 1, "stopped": "daily_budget"}
-
-
-def test_reported_cost_above_the_cap_is_charged_as_reported(ready):
-    error = ClassifierError("claude_invalid_output")
-    error.cost_microusd = 60_000
-    ready.extractor.error = error
-    assert extract(ready)["failed"] == 1
-    assert m.GuestExtraction.query.one().cost_microusd == 60_000
-
-
-def test_spend_is_reread_per_call_and_rows_are_stamped_when_recorded(ready):
-    newer_item(ready)
-    late, early = datetime(2026, 10, 22, 23, 59, 59, tzinfo=timezone.utc), datetime(2026, 10, 23, 0, 0, 1,
-                                                                                     tzinfo=timezone.utc)
-    other, _ = add_item(ready, external_id="spent")
-    db.session.add(m.GuestExtraction(item_id=other.id, input_sha256="f" * 64, state="completed", guests=[],
-        model="claude-sonnet-5-5", cost_microusd=950_000, created_at=late.replace(hour=1)))
-    db.session.commit()
+    late = datetime(2026, 10, 22, 23, 59, 59, tzinfo=timezone.utc)
+    early = datetime(2026, 10, 23, 0, 0, 1, tzinfo=timezone.utc)
+    other, _ = add_item(ready, external_id="counted")
+    recorded(other, created_at=late.replace(hour=1))
     clock = lambda: late if not ready.extractor.calls else early  # noqa: E731
-    assert extract(ready, clock=clock)["extracted"] == 2
-    stamps = {row.created_at for row in m.GuestExtraction.query.filter(m.GuestExtraction.cost_microusd == 4000)}
+    assert extract(ready, clock=clock, GUEST_EXTRACTION_MAX_CALLS_PER_DAY=2)["extracted"] == 2
+    stamps = {row.created_at for row in m.GuestExtraction.query.filter(m.GuestExtraction.item_id != other.id)}
     assert stamps == {early}
 
 
 def test_no_call_starts_that_could_outlast_the_run_deadline(ready):
+    """A call can take its deadline plus the client's connect timeout and read margin; a run lasts
+    at most RUN_DEADLINE_SECONDS (10 minutes) unless one call alone needs longer."""
     newer_item(ready)
-    monotonic = lambda: 0.0 if not ready.extractor.calls else 541.0  # noqa: E731
-    assert extract(ready, monotonic=monotonic) == {"scanned": 1, "extracted": 1, "failed": 0,
-                                                   "stopped": "run_deadline"}
-    assert extract(ready, monotonic=lambda: 540.0)["extracted"] == 1
+    assert guest_extractor.RUN_DEADLINE_SECONDS == 600
+    last_start = 600 - (60 + CONNECT_TIMEOUT_SECONDS + READ_MARGIN_SECONDS)
+    monotonic = lambda: 0.0 if not ready.extractor.calls else last_start + 1.0  # noqa: E731
+    assert extract(ready, monotonic=monotonic, GUEST_EXTRACTION_TIMEOUT_SECONDS=60) == {
+        "scanned": 1, "extracted": 1, "failed": 0, "stopped": "run_deadline"}
+    assert extract(ready, monotonic=lambda: float(last_start), GUEST_EXTRACTION_TIMEOUT_SECONDS=60)["extracted"] == 1
+
+
+def test_the_longest_allowed_call_still_runs_once_per_run(ready):
+    newer_item(ready)
+    monotonic = lambda: 0.0 if not ready.extractor.calls else 1.0  # noqa: E731
+    assert extract(ready, monotonic=monotonic, GUEST_EXTRACTION_TIMEOUT_SECONDS=600) == {
+        "scanned": 1, "extracted": 1, "failed": 0, "stopped": "run_deadline"}
 
 
 class _Connection:
@@ -354,6 +441,14 @@ def test_task_runs_on_the_classifier_queue_with_the_app_settings(ready, monkeypa
     current_app.config["GUEST_EXTRACTION_ENABLED"] = True
     assert tasks.extract_guests.run()["extracted"] == 1
     assert tasks.extract_guests.queue == "classification"
+
+
+def test_the_production_factory_builds_a_router_extractor(app):
+    import tasks
+    with app.app_context():
+        extractor = tasks.get_guest_extractor()
+    assert isinstance(extractor, guest_extractor.RouterGuestExtractor)
+    assert extractor.client.expected_model == MODEL and extractor.client.token_file == "/router/token"
 
 
 @pytest.mark.parametrize("enabled, expected", [("true", True), ("false", False)])

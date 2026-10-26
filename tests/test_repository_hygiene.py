@@ -233,8 +233,8 @@ def test_backup_files_are_ignored_by_git_and_docker():
     assert "backups" in patterns and "*.dump" in patterns
 
 
-def test_claude_runtime_credentials_are_ignored_by_git_and_docker():
-    paths = (".runtime/claude/.credentials.json", ".runtime/claude/settings.json", ".runtime/other/private")
+def test_router_credentials_are_ignored_by_git_and_docker():
+    paths = (".runtime/router/token", ".runtime/router/client.key", ".runtime/other/private")
     checked = subprocess.run(["git", "check-ignore", "--no-index", "--stdin"],
                              input="\n".join(paths) + "\n", cwd=ROOT,
                              text=True, capture_output=True, check=False)
@@ -243,16 +243,19 @@ def test_claude_runtime_credentials_are_ignored_by_git_and_docker():
     assert ".runtime/" in (ROOT / ".dockerignore").read_text().splitlines()
 
 
-def test_operations_documents_classifier_authentication_and_current_schema():
+def test_operations_documents_router_credentials_and_current_schema():
     guide = (ROOT / "docs/operations.md").read_text()
     for command in (
-        "install -d -m 700 .runtime/claude",
-        "docker compose run --rm --entrypoint claude classifier auth login",
-        "docker compose run --rm --entrypoint claude classifier auth status --text",
+        "install -d -m 700 .runtime/router",
+        "docker compose exec classifier flask --app app:create_app classification router-smoke",
+        "classification router-smoke --wrong-client-cert",
+        "docker compose exec classifier flask --app app:create_app system check --services database,redis,s3,claude_absent,router",
         "docker compose exec classifier celery -A tasks.celery_app inspect --timeout 5 --destination",
+        "--app app:create_app classification compare --sample 20",
+        "flask --app app:create_app classification reclassify-all",
     ):
-        assert command in guide
-    assert "0003_knowledge_export" in guide
+        assert command in guide, command
+    assert "0004_router_classification" in guide
     assert "seven-service stack" in guide and "all sixteen table" in guide
     assert "six-service stack" not in guide and "all thirteen table" not in guide
     for table in ("admins", "content_sources", "content_items", "source_items", "backfill_requests",
@@ -260,8 +263,22 @@ def test_operations_documents_classifier_authentication_and_current_schema():
                   "classification_blocks", "segment_overrides", "source_classification_rules", "classification_sweeps",
                   "guest_extractions", "knowledge_export_batches", "knowledge_item_exports"):
         assert f"`{table}`" in guide
-    assert "@anthropic-ai/claude-code@2.1.303" in guide
-    assert "CLAUDE_CONFIG_HOST_PATH" in guide
+    for text in ("ROUTER_CREDENTIALS_HOST_PATH", "192.168.144.0/20", "router_busy", "reclassify_queued",
+                 "oldest_busy_key_sent=", "Model router busy", "request_generation", ".runtime/claude"):
+        assert text in guide, text
+    for retired in ("@anthropic-ai/claude-code", "auth login", "auth status", "auth-smoke", "CLAUDE_CONFIG_HOST_PATH",
+                    "CLAUDE_EXPECTED_VERSION", "Node 22", "claude_unavailable", "GUEST_EXTRACTION_DAILY_BUDGET_USD`.",
+                    "uncertain segments never leave", "Anthropic"):
+        assert retired not in guide, retired
+    readme = (ROOT / "README.md").read_text()
+    assert "Claude" not in readme and "Platform Model Router" in readme
+
+
+def test_operations_documents_router_rollback_and_upgrade_ordering():
+    guide = (ROOT / "docs/operations.md").read_text()
+    for text in ('decision source `model`', "flask --app app:create_app db downgrade 0003_knowledge_export",
+                 "exports the library twice", "before the next nightly export"):
+        assert text in guide, text
 
 
 def backup_block():
@@ -356,7 +373,8 @@ def test_operations_documents_the_knowledge_exporter():
                  "flask --app app:create_app knowledge export --since",
                  "flask --app app:create_app knowledge seed-hosts",
                  "flask --app app:create_app knowledge status",
-                 "GUEST_EXTRACTION_DAILY_BUDGET_USD", "load_active_learning_projection",
+                 "GUEST_EXTRACTION_MAX_CALLS_PER_DAY", "load_active_knowledge_projection", "uncertain_segment_ids",
+                 "MAX_ROUTER_FAILURES", "router_failures",
                  # Enablement order and operator caveats.
                  "before setting `GUEST_EXTRACTION_ENABLED=true`", "`awaiting_guests=`",
                  "recreate `beat`, `classifier`, and `exporter` (if it is running)",

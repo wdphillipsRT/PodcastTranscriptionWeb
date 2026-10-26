@@ -15,11 +15,13 @@ Use a Linux host with Docker Engine, the Docker Compose v2 plugin, Git,
 Python 3 for secret generation, curl, and an editor. Allow enough disk for the
 database/images and RAM for PostgreSQL, two worker processes, and the worker's
 768 MiB temporary media filesystem, plus one classifier process and its 256 MiB
-temporary filesystem. The non-root image supplies Python 3.11, FFmpeg,
-yt-dlp, Deno, Node 22, and Claude Code 2.1.303; no host media tools are needed.
-The host needs outbound HTTPS
-to AWS, Anthropic, Google/YouTube, Apple, public feed/media hosts, and image/package
-registries. Amazon Transcribe usage and provider quotas can incur costs.
+temporary filesystem. The non-root image supplies Python 3.11, FFmpeg, yt-dlp
+and Deno; no host media tools are needed. The host needs outbound HTTPS to AWS,
+Google/YouTube, Apple, public feed/media hosts, and image/package registries.
+The podcast Compose network (`192.168.144.0/20`, pinned in `docker-compose.yml`)
+must reach the Bezalel Platform Model Router at `https://192.168.68.200:18443`;
+see [Platform Model Router](#platform-model-router). Amazon Transcribe usage and
+provider quotas can incur costs; router calls do not.
 
 The administrator owns the Cloudflare Tunnel and DNS configuration for
 `podcasts.ennovocon.com`. Run the tunnel connector on this host so its origin
@@ -29,8 +31,8 @@ or DNS automation are included here. Do not publish the application port on
 all host interfaces: the app trusts one forwarding proxy.
 
 Phase 1 supports ingestion and transcription. Editorial knowledge reaches Lamad
-and Ebenezer only through the optional knowledge intake exporter below; Claude
-learning bundles and Agent Factory delivery are deferred to later phases.
+and Ebenezer only through the optional knowledge intake exporter below.
+Learning bundles and Agent Factory delivery are deferred to later phases.
 
 ## Filtered learning and delivery inputs
 
@@ -60,6 +62,15 @@ or raw policy. Only `editorial` is eligible; `uncertain` is always excluded.
 The method and the module's `assert_citable(projection, segment_id)` both
 reject excluded, uncertain, unknown, and promotional references with the same
 safe exception, without disclosing whether an excluded segment exists.
+
+The knowledge intake exporter alone uses a separate loader,
+`load_active_knowledge_projection`, which returns editorial and `uncertain`
+segments in transcript order with the uncertain ones listed in
+`uncertain_segment_ids`. It applies every check above, also reads the stored
+editorial projection byte for byte and requires it to equal the knowledge
+projection without its uncertain segments, and returns a type that
+`assert_citable` rejects. Excluded labels (paid, self or cross promotion,
+housekeeping) never appear in either projection.
 
 Loading requires a completed item and its active completed classification
 revision matching the current transcript and canonical-object hashes. All
@@ -124,12 +135,36 @@ real JSON Schema validator (`integrations/knowledge/vendor/`, pinned by `PIN`).
 An item is exported when it is completed, its active classification revision is
 completed, and its classifying source names a host. Each item becomes one
 `podcast.episode` record and one `podcast.segment` record per passage of
-consecutive editorial segments. A segment joins the current passage only while
-the passage stays within 60 seconds (from its first start to the latest segment
-end so far) and 6,000 characters; a single segment is never split, so a
-one-segment passage may exceed either limit. Transcript text is read only
-through `load_active_learning_projection`, so commercials, promotions,
-housekeeping, and uncertain segments never leave the application; a newer
+consecutive editorial or uncertain segments. A segment joins the current
+passage only while the passage stays within 60 seconds (from its first start to
+the latest segment end so far) and 6,000 characters; a single segment is never
+split, so a one-segment passage may exceed either limit. Transcript text is read
+only through `load_active_knowledge_projection`, so commercials, promotions and
+housekeeping never leave the application. Uncertain segments are exported
+inside their passages and marked: each passage lists them in
+`attributes.uncertain_segment_ids` (empty when none) and is labelled
+`editorial`, `uncertain` or `mixed`, and each episode carries
+`attributes.uncertain_segments`, the revision's count. When the confidence
+threshold (editorial below 0.80, any other label below 0.95) made a segment
+uncertain, the policy keeps the model's own label as the range's optional
+`model_label`, and the passage maps that segment to it in
+`attributes.uncertain_segment_labels`, for example
+`{"seg-…": "paid_commercial", "seg-…": "editorial"}`, so a probable advert can be
+told from a borderline editorial segment. Its keys are always a subset of
+`uncertain_segment_ids`. The attribute is omitted when no uncertain segment in
+the passage has a recorded label: one the model itself called `uncertain`, a
+conflict between source rules, an override, or any policy stored before model
+labels were kept (Claude-era and earlier router revisions; their labels are never
+inferred, and a later reclassification records them). `model_label` is optional
+under the unchanged `commercial-segment-policy/v1`, omitted from the stored JSON
+when absent, so existing policies keep their bytes and hashes and no revision
+becomes non-current; it is covered by the policy hash and the revision row like
+every other range field, and one inconsistent with the range's confidence fails
+closed. Code from before `model_label` rejects a policy that has one, so rolling
+back past it fails those episodes' validation like the `model` rollback below.
+Release check: exported content holds no excluded segment, every
+uncertain segment in it is marked, and model labels name only marked segments
+(`tests/test_knowledge_exporter.py::test_release_check_no_excluded_segment_leaves_and_every_uncertain_one_is_marked`). A newer
 pending or failed revision postpones the item. Records name the show as
 `source.publisher` (the YouTube channel for videos), set
 `attributes.platform`, and list participants with their basis. A host or guest
@@ -156,8 +191,9 @@ docker compose exec web flask --app app:create_app knowledge seed-hosts
 ```
 
 Guests come from the administrator's list on the item page, else
-`<podcast:person role="guest">` tags, else (when enabled) a restricted Claude
-extraction over the title and description that runs on the classifier. The
+`<podcast:person role="guest">` tags, else (when enabled) a restricted
+model-router extraction (route `podcast.guests`) over the title and description
+that runs on the classifier. The
 extraction keeps only names that appear as whole words in the title or, taken
 separately, in the description (compared after NFKC normalisation and case
 folding), stores them as that text spells them, and marks them `inferred` with
@@ -170,30 +206,60 @@ unchanged: their basis becomes administrator-set and the item is exported
 again. Saving the same administrator list again, or resetting an item that has
 no administrator list, changes nothing. While extraction is enabled, an item
 without declared guests waits (`awaiting_guests`) until its current title and
-description have been extracted.
+description have been extracted. An item whose extraction is still being
+retried after a router failure (below) also waits, so it is not exported
+without guests and then superseded; it is released once extraction completes or
+is given up.
 
 Extraction runs every `GUEST_EXTRACTION_INTERVAL_SECONDS` (default and minimum
 3600: configuration validation rejects less, and `celeryconfig` refuses to load
-with it) for up to `GUEST_EXTRACTION_MAX_ITEMS_PER_RUN` items, each call capped
-by `GUEST_EXTRACTION_MAX_BUDGET_USD`. A PostgreSQL advisory lock keeps runs from
-overlapping (a run that finds one active stops as `busy`), and a run starts no
-call that could outlast its 10-minute deadline. Each title and description is
-extracted at most once. A call that times out or returns invalid output
-(including a reported cost above the cap) is recorded as `failed`, charged at
-the per-call cap or its higher reported cost, and never retried for that
-input; the run moves on. `claude_unavailable` (an outage or rate limit) is
-recorded the same way and then stops the run. Authentication, configuration
-(including a missing CLI), and model-mismatch errors stop the run without a
-record. Before each call the run re-reads today's (UTC) recorded spend and stops
-when that spend plus the per-call cap would exceed
-`GUEST_EXTRACTION_DAILY_BUDGET_USD`. Daily spend is therefore at most the daily
-budget, plus one unrecorded call per run that ends in such an environmental
-stop, each capped by the per-call budget (only a call whose reported cost
-exceeds its cap can push recorded spend past the daily budget, and it is
-recorded at that cost). Extraction runs on the classifier's `classification`
-queue (concurrency 1), so each run can delay classification by up to about 10
-minutes (its run deadline). Only items whose source names a host the exporter
-can identify are extracted, newest first.
+with it) for up to `GUEST_EXTRACTION_MAX_ITEMS_PER_RUN` items. A PostgreSQL
+advisory lock keeps runs from overlapping (a run that finds one active stops as
+`busy`), and a run starts no call that could outlast its 10-minute deadline
+(each call is bounded by `GUEST_EXTRACTION_TIMEOUT_SECONDS`, default 120, plus
+the client's 10-second connect timeout and 90-second read margin; a timeout so
+long that one call needs more than 10 minutes allows exactly one call per run).
+Each title and description is extracted once. Invalid output
+(`model_invalid_output`) is recorded as `failed` and never retried for that
+input; the run moves on. A busy router (`router_busy`: in progress, rate
+limited, timed out, unreachable, or no eligible model) stops the run without a
+record, so the item is tried again next hour. A router failure reported by the
+router itself (for example a 504 model timeout on an input the model never
+finishes, or a model server that is down) is recorded as `failed` with
+category `router_busy` and stops the run. That input is retried on later runs,
+after every input never tried, so it cannot block them, and is given up after
+three router failures (`MAX_ROUTER_FAILURES`, counted in
+`guest_extractions.router_failures`). Authentication, configuration and
+model-mismatch errors stop the run without a record. Before each call the run
+re-reads today's (UTC) recorded calls and stops (`daily_limit`) at
+`GUEST_EXTRACTION_MAX_CALLS_PER_DAY` (default 200, at most 2400); the one
+unrecorded call that stops a run is not counted. Router calls cost nothing;
+rows record `cost_microusd` 0 and the router model. Extraction runs on the
+classifier's `classification` queue (concurrency 1), so each run can
+delay classification by up to about 10 minutes (its run deadline). Only items whose
+source names a host the exporter can identify are extracted, newest first.
+
+Inputs that failed under Claude stay `failed` and are never tried again,
+because each title and description is extracted once. To retry them with the
+router, delete the Claude-era failed rows (their `model` is the old `claude-...`
+model name; router rows record `ROUTER_EXPECTED_MODEL`). Run it inside the web
+container, which reads the database URL from its own environment, so the URL
+never appears on a command line:
+
+```bash
+docker compose exec -T web flask shell <<'PY'
+from extensions import db
+import sqlalchemy as sa
+deleted = db.session.execute(sa.text(
+    "DELETE FROM guest_extractions WHERE state = 'failed' AND model LIKE 'claude-%'")).rowcount
+db.session.commit()
+print("deleted", deleted)
+PY
+```
+
+Rows deleted today no longer count toward today's call limit. Completed
+Claude-era rows are kept; their guests stay valid until the title or
+description changes.
 
 Enable it with `GUEST_EXTRACTION_ENABLED=true`, then
 recreate `beat`, `classifier`, and `exporter` (if it is running); the exporter
@@ -201,8 +267,8 @@ reads the same setting to decide whether items wait for guests. Once it is
 enabled, every item otherwise ready to export that has no administrator or
 feed guests waits in `awaiting_guests` until it has been extracted. Extraction
 works newest first, at most `GUEST_EXTRACTION_MAX_ITEMS_PER_RUN` items an hour,
-and the default daily budget allows only 20 calls a day when calls cost their
-full per-call cap, so an existing library would wait for days or weeks. Run the
+and at most `GUEST_EXTRACTION_MAX_CALLS_PER_DAY` calls a day, so an existing
+library would wait for days. Run the
 initial backfill (`knowledge export`, below) before setting `GUEST_EXTRACTION_ENABLED=true`,
 or leave extraction off. While extraction is enabled, a run stopped by an
 authentication, configuration, or model-mismatch error records nothing, so
@@ -286,13 +352,13 @@ Run the offline commercial gate before promoting a classification policy:
 git diff --check
 ```
 
-No live Claude, authentication, AWS, RSS, YouTube, Redis, or broker is needed.
+No live model router, credentials, AWS, RSS, YouTube, Redis, or broker is needed.
 The smoke test injects only external storage/classifier/broker/provider boundaries
 and exercises real final-stage hooks, SQLite outboxes, worker checkpoints, artifact
 validation, owner review routes, correction sweeps, and filtered loaders. It covers
 both podcast and YouTube completed canonical items without reacquiring media.
 The crash case kills the task after block 1 commits and before publication, then
-reconciles/replays a multi-block revision without another paid call for block 1.
+reconciles/replays a multi-block revision without another model call for block 1.
 
 All ten section-13 invariants are checked at their implemented boundaries:
 canonical bytes/IDs/times/hashes remain unchanged; coverage is exact; citations
@@ -348,7 +414,7 @@ unexpected count fields. Finalization counts use `editorial`, aggregated `exclud
 and `matched` (items queued by that sweep); its revision ID identifies the
 originating reviewed policy. Stage duration uses a monotonic clock. Events can
 repeat on replay and are observations, not a billing ledger or activation signal.
-Use durable revision/block state for costs and completion. Log-sink failure cannot
+Use durable revision/block state for timing and completion. Log-sink failure cannot
 fail an otherwise committed checkpoint.
 
 Never add transcript bodies, segment IDs, prompts, model output, source URLs,
@@ -445,9 +511,245 @@ the tunnel connects to the origin over HTTP. For a temporary local HTTP browser
 test only, set it to `false` and recreate `web`; restore `true` before public
 use. HTTP curl health checks need no login cookie.
 
+## Platform Model Router
+
+Commercial classification and guest extraction call the Bezalel Platform Model
+Router (`POST /v1/model-tasks`) as the subject `intelligence:podcast`, on the
+local routes `podcast.classification` (32,768-token context, 8,192 output
+tokens) and `podcast.guests` (1,024 output tokens). Both are served by
+`bonsai2:27b-pq2_0`, the `reasoner` role. Every call is local only, `internal`,
+temperature 0, and carries a JSON schema in the router's subset. Calls cost
+nothing, so there are no dollar budgets. Claude-era revisions, policies and
+guest rows stay readable: their old error categories display as before, and
+their `claude` decision source remains valid. New revisions record the decision
+source `model`.
+
+Only `classifier` holds router credentials. They are the client bundle issued
+for `intelligence:podcast` (bezalel-deploy `bin/bezalel-router-credential`),
+kept in `.runtime/router/` (directory mode 700, files mode 600, owned by UID
+1000, ignored by Git and the image build) and mounted read-only at `/router`:
+
+| File | Use |
+| --- | --- |
+| `client.crt`, `client.key` | mTLS client certificate required by Caddy on `:18443` |
+| `router-ca.crt` | Verifies the router's server certificate |
+| `token` | Bearer token, read on every call; never printed, logged or put on argv |
+| `token.expires_at` | Token expiry, checked by the upgrade script |
+
+```bash
+install -d -m 700 .runtime/router
+for file in client.crt client.key router-ca.crt token token.expires_at; do
+  install -m 600 "/path/to/intelligence-podcast-bundle/$file" .runtime/router/
+done
+```
+
+The container runs as UID/GID 1000:1000, so the directory and files must be
+readable by that identity. If the SSH user has a different UID/GID, have the
+host administrator set ownership to 1000:1000 while keeping the modes. For
+another protected host directory set `ROUTER_CREDENTIALS_HOST_PATH` in the
+Compose environment; Compose refuses to start `classifier` if the directory is
+missing. Settings: `ROUTER_URL` (default `https://192.168.68.200:18443`),
+`ROUTER_EXPECTED_MODEL` (default `bonsai2:27b-pq2_0`; any other
+`selected_model` fails as `model_mismatch`), `CLASSIFIER_TIMEOUT_SECONDS` (540,
+5 to 900: the router latency budget per block),
+`CLASSIFIER_MAX_REVISION_SECONDS` (14400, counting generation time only),
+`CLASSIFIER_MAX_OUTPUT_BYTES`, `GUEST_EXTRACTION_TIMEOUT_SECONDS` (120, 5 to
+600) and `GUEST_EXTRACTION_MAX_CALLS_PER_DAY` (200, at most 2400). The container
+paths `ROUTER_TOKEN_FILE`, `ROUTER_CA_FILE`, `ROUTER_CLIENT_CERT_FILE` and
+`ROUTER_CLIENT_KEY_FILE` default to the mount. A retired setting (any former
+`CLAUDE_*` setting, `GUEST_EXTRACTION_MAX_BUDGET_USD` or
+`GUEST_EXTRACTION_DAILY_BUDGET_USD`) in the environment stops every service at
+startup: remove it from `.env`.
+
+The podcast Compose network is pinned to `192.168.144.0/20` because the
+Platform firewall admits only that subnet to the router
+(`platform_router_podcast_client_cidrs` in bezalel-deploy). Changing the subnet
+recreates the network and needs the matching firewall change.
+
+Router failures become closed categories:
+
+| Router response | Category | Effect |
+| --- | --- | --- |
+| 429, 202 (still running), 500, 503, 504, other 502, timeout, refused or reset connection, Celery soft time limit | `router_busy` | Block back to pending, revision `retrying`; retried after 30 s doubling to 10 min; never counts as a failed attempt |
+| 502 `MODEL_OUTPUT_INVALID`, or output failing the Python checks | `model_invalid_output` | Retried; counts toward the five attempts |
+| 401, 403, certificate verification failure or TLS alert, unusable token | `model_auth` | Revision fails |
+| Other 4xx, request too large | `model_config` | Revision fails |
+| `selected_model` not `ROUTER_EXPECTED_MODEL` | `model_mismatch` | Revision fails |
+
+Each block call uses the idempotency key
+`podcast.classification:rev-<revision>:block-<ordinal>:g<generation>`. The
+router stores every outcome it completes, failures included, and replays it for
+the same key. The generation (`classification_blocks.request_generation`)
+therefore advances after any outcome the router may have stored. It stays the
+same after 429, 202, a timeout or a refused connection, so a lost response is
+replayed instead of generated twice. A key still answered 202 long after it was
+first sent (`CLASSIFIER_TIMEOUT_SECONDS` plus about 3.5 minutes, for example
+after a router restart mid-generation) also advances.
+`CLASSIFIER_MAX_REVISION_SECONDS` sums the durations of completed block calls,
+so time spent waiting for a busy router does not count. The classifier runs one
+task at a time, so the application never has more than one router request in
+flight.
+
+Busy retries never end by design: a revision waiting on a busy router stays
+`retrying` with `router_busy` until the router answers. To spot them, run
+`docker compose exec classifier flask --app app:create_app classification status`
+and read `router_busy=<count>`, `oldest_busy_key_sent=` and
+`oldest_busy_updated=`; the item page shows "Model router busy". A 503
+`MODEL_NO_ELIGIBLE_CANDIDATE` caused by a missing or unloaded model is also
+`router_busy`: the block retries at most every 10 minutes, and the router stores
+a failed invocation for each try (each try uses a new key generation), so fix
+the model on the router rather than waiting it out.
+
+Classifier startup runs
+`system check --services database,redis,s3,claude_absent,router`.
+`claude_absent` fails on any `CLAUDE*` variable, a `claude` executable, or the
+old package. `router` fails unless `GET /readyz` answers `ready` over mTLS and
+the token file is usable, within the router probe's own 12-second bound (other
+probes keep theirs). A router whose provider is down answers 503 there, so the
+classifier restarts until the router is ready. Check and smoke-test the router
+path:
+
+```bash
+docker compose exec classifier flask --app app:create_app system check --services database,redis,s3,claude_absent,router
+docker compose exec classifier flask --app app:create_app classification router-smoke
+docker compose exec classifier flask --app app:create_app classification router-smoke --wrong-client-cert
+```
+
+`router-smoke` sends one synthetic window and prints
+`ready=1 model=<model> label=<label> seconds=<n>`. It touches no database or
+storage data. "Router is not ready" means `/readyz` did not answer `ready`.
+`Router smoke failed: <category> reason=<reason>` names the closed category.
+With `--wrong-client-cert` it sends the same request with a throwaway client
+certificate the router never issued and passes only when the router refuses it
+as `model_auth` (it prints `wrong-client-cert=model_auth reason=tls`, or
+`unauthorized`/`forbidden` when the proxy answers); any other result exits
+nonzero. While the classifier is processing, its one inference slot is busy and
+a smoke call can answer `router_busy` (429): stop `classifier` for the smoke
+test, or repeat it.
+
+After the router path is verified (a successful `router-smoke` and a completed
+revision), archive the retired Claude configuration directory privately or
+delete it; nothing reads it any more:
+
+```bash
+rm -rf -- .runtime/claude
+```
+
+### Comparing with Claude and reclassifying
+
+`classification compare` takes a fixed-seed sample of Claude-classified episodes
+spread across shows. It classifies at most `--max-blocks` windows of each with
+the router model and reports, per episode and in total: agreement by Claude
+label; content Claude called editorial that the router would exclude, and the
+reverse; the share the router marks uncertain; and seconds per call. Claude's
+side is the label stored in its policy, which was already thresholded (a Claude
+near-miss is stored as `uncertain`). The `raw_*` figures compare that with the
+router's raw label; the other figures compare both after the confidence
+threshold, as a revision would store them, and `threshold_to_uncertain` counts
+the router labels the threshold turned into `uncertain`
+(`threshold_to_uncertain_by_label` splits them by the router's raw label). A busy router is
+retried with the worker's back-off (at most about 15.5 minutes per window), then
+the episode is reported as skipped (`busy_skipped`); after three skipped
+episodes in a row the whole run stops with `Comparison stopped: router_busy`
+and exit status 1. Invalid model output is counted and the window skipped. It
+stores nothing and prints JSON with item and source IDs only. It needs the router
+credentials, so run it in a `classifier` container, while the classifier
+service is stopped so it is the only router caller (the reclassify script does
+this). `--seed` (default 20261026) and `--max-blocks` (default 4, at most 50)
+are optional; `--sample` is 1 to 100:
+
+```bash
+docker compose stop classifier
+docker compose run --rm --no-deps -T --entrypoint flask classifier --app app:create_app classification compare --sample 20 > ~/Bezalel/knowledge-intake-work/evidence/podcast-router-compare.json
+docker compose start classifier
+```
+
+The report is information only. `classification reclassify-all [--limit N]`
+creates, newest first, a `policy_upgrade` revision for every completed episode
+without a revision from the current classifier, including episodes already
+exported. Old revisions stay for history. New revisions wait as `pending` with
+error category `reclassify_queued`. The reconciler never publishes them. The
+classifier releases the oldest one whenever no other revision is pending,
+running or retrying. Rerunning queues nothing twice: an episode that already
+has its reclassification revision, in any state, is not a candidate, so reruns
+and `--limit` move on to episodes not yet queued. It prints
+`candidates= queued= existing= busy= failed= released=`; `queued` counts only
+revisions newly held by this run, and `existing` counts candidates that were
+classified or queued by something else while the command waited for them.
+
+```bash
+docker compose exec classifier flask --app app:create_app classification reclassify-all
+docker compose exec classifier flask --app app:create_app classification status
+```
+
+`status` shows `reclassify_queued=<n>` counting down, and `in_flight=<n>`
+with `oldest_in_flight_updated=` for the revisions that are pending, running
+or retrying and not held (normally the one being worked on). While an episode
+waits, the exporter skips it (`projection_unavailable`). When its new revision
+completes, the nightly export sends it as a replacement that supersedes the
+earlier record.
+
+A reclassification that fails (`failed` in `status`) is not queued again by
+`reclassify-all`, and the classifier moves on to the next held episode. Until
+it is retried, that episode cannot be exported (the exporter needs its latest
+revision), while the record already exported for it stays live. Retry it with
+`classification retry --item-id <id>`.
+
+### Upgrading from Claude classification
+
+Upgrading an existing deployment applies migration `0004_router_classification`,
+which only adds columns (`classification_blocks.request_generation`,
+`request_generation_started_at` and `guest_extractions.router_failures`). Its
+`ALTER TABLE` needs an exclusive lock, so stop the writers (`web`, `worker`,
+`beat`, `classifier`, `exporter`) before migrating. The operator script
+`~/Bezalel/knowledge-intake-work/podcast-router-upgrade.sh` performs the
+backup, build, migration, startup and smoke checks.
+
+Run `classification reclassify-all` (or keep the exporter stopped)
+before the next nightly export after the upgrade. The episode record now carries
+`attributes.uncertain_segments`, so every already-exported episode changes. A
+nightly export before reclassification therefore exports the library twice:
+once for that change, and again as each new revision completes. Queued episodes
+are skipped until their new revision completes. An export that runs before
+reclassification sends Claude-era revisions with their uncertain text, which
+earlier exports withheld, marked as uncertain.
+
+Rolling back the code is not a plain image rollback. The previous code does not
+know the decision source `model`, so it rejects every policy that contains it:
+router-classified episodes fail validation on the review page and in the
+exporter. The previous code has no command that reclassifies an episode whose
+active revision the router produced. The documented rollback is therefore to
+restore the PostgreSQL backup taken before the upgrade (the upgrade script
+writes it to `~/PodcastTranscriptionWeb-backups/postgres-<stamp>-*.dump`),
+losing every change since. In this order:
+
+1. Stop the writers.
+2. Downgrade migration `0004` with the current image, which is the only one that
+   has it. This drops the three columns.
+3. Restore the pre-upgrade backup as described in
+   [PostgreSQL backup and restore](#postgresql-backup-and-restore).
+4. Check out the previous revision, rebuild the images, and start the services.
+5. Restore `.runtime/claude` from the archive the upgrade script suggested
+   (`~/PodcastTranscriptionWeb-backups/claude-runtime-<stamp>.tar.gz`), or
+   authenticate the Claude CLI again, because the previous classifier needs it.
+
+```bash
+docker compose stop web worker beat classifier exporter
+docker compose run --rm --no-deps migrate flask --app app:create_app db downgrade 0003_knowledge_export
+# Restore the pre-upgrade backup, then:
+git checkout <previous revision>
+docker compose build
+(umask 077 && tar -C .runtime -xzf ~/PodcastTranscriptionWeb-backups/claude-runtime-<stamp>.tar.gz)
+```
+
+Upgrading again recreates `request_generation` as 0 for every block, so keys
+from generation `g0` repeat and the router may replay the outcome it stored for
+them earlier; a replayed failure advances the key and counts as one attempt.
+
 ## Build, migrate, start, and provision the administrator
 
-Build and migrate before authenticating the isolated classifier:
+Build and migrate, then install the router credentials (see
+[Platform Model Router](#platform-model-router)):
 
 ```bash
 docker compose version
@@ -456,27 +758,6 @@ docker compose build
 docker compose up -d --wait postgres redis
 docker compose run --rm --no-deps migrate
 ```
-
-Create the dedicated writable Claude configuration directory and authenticate
-from the SSH terminal using the device/browser flow:
-
-```bash
-install -d -m 700 .runtime/claude
-docker compose run --rm --entrypoint claude classifier auth login
-docker compose run --rm --entrypoint claude classifier auth status --text
-```
-
-Open the displayed browser/device URL on another computer if necessary and
-complete the terminal prompts. These commands bypass the startup guard only
-to perform authentication. Credentials remain in `.runtime/claude`, which is
-ignored by Git and excluded from the Docker build context; they are never copied
-into the image or repository. Do not share auth output or commit credentials.
-The container runs as UID/GID 1000:1000: this private directory must be owned
-by that identity and writable by it. If the SSH user has a different UID/GID,
-have the host administrator set ownership to 1000:1000 while retaining mode 700.
-For a different protected host directory, set `CLAUDE_CONFIG_HOST_PATH` in the
-Compose environment and create that exact directory with the same ownership
-and permissions. Only `classifier` mounts it at `/claude-config`.
 
 Then start the services:
 
@@ -490,12 +771,10 @@ docker compose logs --tail=100 migrate web worker beat classifier
 application startup on a successful migration. The web and worker entrypoints
 check the database schema, Redis, S3, Transcribe, YouTube API, yt-dlp, and Deno
 before starting; beat checks database, Redis, and its schedule. Classifier
-startup pins `PYTHONPATH=/app`, requires the exact configured Claude version
-(`CLAUDE_EXPECTED_VERSION=2.1.303`), silently checks `claude auth status`, and
-checks database, Redis, and S3 before executing Celery. Authentication or version
-failure prevents the classification consumer from starting and emits only a
-safe error. `DISABLE_UPDATES=1` prevents runtime updates; classifier also sets
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. If a provider
+startup pins `PYTHONPATH=/app` and checks database, Redis, S3, the absence of
+any Claude remnant (`claude_absent`) and router readiness (`router`) before
+executing Celery. A failure prevents the classification consumer from starting
+and emits only the component names. If a provider
 or credential fails, fix it and rerun `docker compose up -d`. Inspect logs and
 readiness as described below; never bypass these checks to hide a failure.
 
@@ -572,26 +851,25 @@ fails. A targeted check is:
 docker compose exec web flask --app app:create_app system check --services database,redis,s3,transcribe,youtube,yt_dlp,deno,worker,beat
 ```
 
-The web `/readyz` deliberately does not probe local Claude authentication:
-web has no Claude credential mount. Web, migrations, beat, and the media worker
-remain operational without that directory or Claude login. The classifier's
-startup guard protects its own consumer; web readiness alone does not establish
-classifier health. Verify the separate service and its named worker:
+The web `/readyz` deliberately does not probe the model router: web has no
+router credentials, and web, migrations, beat and the media worker run without
+them. The classifier's startup guard protects its own consumer; web readiness
+alone does not establish classifier health. Verify the separate service and its
+named worker:
 
 ```bash
 docker compose ps -a classifier
 docker compose logs --tail=100 classifier
 docker compose exec classifier celery -A tasks.celery_app inspect --timeout 5 --destination "classifier@$(docker compose exec -T classifier hostname)" ping
-docker compose exec classifier claude auth status --text
-docker compose exec classifier flask --app app:create_app system check --services database,redis,s3
+docker compose exec classifier flask --app app:create_app system check --services database,redis,s3,claude_absent,router
 ```
 
 The inspect destination must be the classifier hostname shown in its startup
 logs (`classifier@<container-hostname>`); it prevents a media-worker reply from
-being mistaken for classifier health. Inspect auth output only in a private
-terminal. If credentials expire, stop `classifier`, repeat the dedicated
-`auth login`/`auth status --text` commands above, then run
-`docker compose up -d classifier`. Other services do not need Claude credentials.
+being mistaken for classifier health. When the router credentials are rotated,
+replace the files in `.runtime/router/` and run `docker compose restart
+classifier`. The token is read on every call, so a token-only rotation needs no
+restart.
 
 The `beat` probe validates the configured hourly task; it is not a live
 scheduler heartbeat. Confirm that the beat container is running and its logs
@@ -729,20 +1007,20 @@ For a disposable Docker acceptance run, first inspect `docker compose ls`,
 that replaces each app service's `env_file` with that path and uses a unique
 image tag; `--env-file` alone does not replace the service-level `.env` reference.
 Use the same explicit project name, files, and env file for every command.
-Use no existing application volume, Claude credential directory, or administrator.
+Use no existing application volume, router credential directory, or administrator.
 Override the classifier's credential bind with a unique private disposable host
-directory (owned by 1000:1000, mode 700), even when testing its unauthenticated
-failure. Never reuse the deployed Claude mount. Verify migration head
-`0003_knowledge_export`, provision a temporary sole admin, and record
+directory (owned by 1000:1000, mode 700), even when testing its failure without
+credentials. Never reuse the deployed router bundle. Verify migration head
+`0004_router_classification`, provision a temporary sole admin, and record
 all sixteen table counts: `admins`, `content_sources`, `content_items`,
 `source_items`, `backfill_requests`, `discovery_runs`, `discovery_candidates`,
 `processing_jobs`, `classification_revisions`, `classification_blocks`,
 `segment_overrides`, `source_classification_rules`, `classification_sweeps`,
 `guest_extractions`, `knowledge_export_batches`, and `knowledge_item_exports`
 (plus Alembic's `alembic_version` metadata table). Perform ordinary project
-`down`/`up` without volume deletion, then compare counts. Without Claude
-authentication, confirm only the classifier fails closed and the media/web
-services remain independent; authenticated classification is a separately
+`down`/`up` without volume deletion, then compare counts. Without router
+credentials, confirm only the classifier fails closed and the media/web
+services remain independent; router classification is a separately
 authorized live check. Only web may publish loopback port 8005; if occupied, document an isolated
 loopback port override. Full readiness requires real configured providers. Clean
 up only resources carrying that exact disposable project label and its temporary
@@ -752,16 +1030,11 @@ files. Never remove volumes from the deployed application to run this gate.
 
 Record the current Git revision and take a database backup before upgrading.
 Review release notes and security changes before altering dependencies. Current
-pins are `yt-dlp[default]==2026.8.19` in `requirements.txt`, Deno `2.9.7`, and
-`@anthropic-ai/claude-code@2.1.303` in `Dockerfile`; yt-dlp reports `2026.08.19`
-and Claude reports exactly `2.1.303 (Claude Code)` at runtime. The Node 22
-Bookworm build stage installs Claude; the final image copies only Node and
-the installed Claude package, without npm. Claude 2.1.303 installs its native
-launcher at `bin/claude.exe`; the final image symlinks that installed executable.
-Both build stages validate the exact Claude version, including as UID/GID
-1000:1000 in the final Python runtime. Version expectations
-also live in `config.py`, `.env.example`, `youtube_media.py`,
-`system_checks.py`, `scripts/start-classifier.sh`, `claude_classifier.py`, and
+pins are `yt-dlp[default]==2026.8.19` in `requirements.txt` and Deno `2.9.7`;
+yt-dlp reports `2026.08.19` at runtime. The image carries no Claude CLI or Node
+(the build fails if `/usr/local/bin/claude` or `/usr/local/bin/node` exists).
+The router model pin is `ROUTER_EXPECTED_MODEL`. Version expectations also live
+in `config.py`, `.env.example`, `youtube_media.py`, `system_checks.py`, and
 their tests. Update all applicable pins, runtime checks,
 and the deployed `.env` together in a reviewed change. Do not enable runtime
 self-updates, plugins, remote components, external configs, or browser cookies.
@@ -777,7 +1050,7 @@ docker compose build --pull
 On the deployed checkout, pause writers, migrate the new image, then restart:
 
 ```bash
-docker compose stop web worker beat classifier
+docker compose stop web worker beat classifier exporter
 docker compose run --rm --no-deps migrate
 docker compose up -d
 docker compose ps -a
@@ -785,7 +1058,11 @@ docker compose exec web flask --app app:create_app system check
 ```
 
 An image rollback cannot undo a schema migration. Review migration compatibility
-before returning to a prior revision. After deployment, use one short public
+before returning to a prior revision; for the router upgrade see
+[Upgrading from Claude classification](#upgrading-from-claude-classification).
+`docker compose up -d` does not start the optional exporter; start it again
+with `COMPOSE_PROFILES=knowledge docker compose up -d exporter` if it was
+running. After deployment, use one short public
 video through the UI for a separately approved live smoke check; confirm
 caption provenance or private S3/audio fallback and the transcript. Live
 provider checks use quota and may incur charges; they are outside the offline

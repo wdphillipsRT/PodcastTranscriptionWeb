@@ -76,26 +76,31 @@ def test_commands_named_queues_beat_and_only_bounded_worker_tmpfs(compose):
     assert services["web"]["command"][-1] == "app:create_app()"
 
 
-def test_classifier_has_exclusive_credentials_queue_and_bounded_tmpfs(compose):
+def test_classifier_has_exclusive_router_credentials_queue_and_bounded_tmpfs(compose):
     services = compose["services"]
-    classifier = services.get("classifier", {})
-    assert classifier.get("entrypoint") == ["/app/scripts/start-classifier.sh"]
+    classifier = services["classifier"]
+    assert classifier["entrypoint"] == ["/app/scripts/start-classifier.sh"]
     assert classifier["command"] == [
         "celery", "-A", "tasks.celery_app", "worker", "--loglevel=info",
         "--queues", "classification", "--concurrency", "1", "--hostname", "classifier@%h",
     ]
-    assert classifier["environment"] == {
-        "CLAUDE_CONFIG_DIR": "/claude-config", "DISABLE_UPDATES": "1",
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-    }
-    assert classifier["volumes"] == ["${CLAUDE_CONFIG_HOST_PATH:-./.runtime/claude}:/claude-config"]
+    assert "environment" not in classifier
+    assert classifier["volumes"] == [{"type": "bind", "source": "${ROUTER_CREDENTIALS_HOST_PATH:-./.runtime/router}",
+                                      "target": "/router", "read_only": True, "bind": {"create_host_path": False}}]
     assert classifier["tmpfs"] == ["/tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1770"]
     for name, service in services.items():
         if name != "classifier":
             assert "classification" not in repr(service.get("command", []))
-            assert not service.get("environment", {}).get("CLAUDE_CONFIG_DIR")
-            assert "claude" not in repr(service.get("volumes", [])).lower()
+            assert "router" not in repr(service.get("volumes", []))
             assert "classifier" not in service.get("depends_on", {})
+    assert "claude" not in repr(compose).lower()
+
+
+def test_the_default_network_is_pinned_to_the_firewalled_podcast_subnet(compose):
+    assert compose["networks"] == {"default": {"ipam": {"config": [
+        {"subnet": "192.168.144.0/20", "gateway": "192.168.144.1"}]}}}
+    for service in compose["services"].values():
+        assert "networks" not in service and service.get("network_mode") is None
 
 
 def test_deployment_has_no_prohibited_services_credentials_or_host_mounts(compose):
@@ -130,17 +135,21 @@ def test_image_uses_exact_deno_stage_nonroot_owned_copy_and_minimal_apt():
     assert "build-essential" not in dockerfile and "curl" not in dockerfile
 
 
-def test_image_copies_only_pinned_claude_and_node_into_final_nonroot_runtime():
+def test_image_carries_no_claude_cli_node_or_package_manager():
     dockerfile = (ROOT / "Dockerfile").read_text()
-    assert "FROM node:22-bookworm-slim AS claude" in dockerfile
-    builder, runtime = dockerfile.split("FROM python:3.11-slim", 1)
-    assert re.search(r"npm install --global @anthropic-ai/claude-code@2\.1\.303(?:\s|$)", builder)
-    assert "COPY --from=claude /usr/local/bin/node /usr/local/bin/node" in runtime
-    assert "COPY --from=claude /usr/local/lib/node_modules/@anthropic-ai/claude-code /usr/local/lib/node_modules/@anthropic-ai/claude-code" in runtime
-    assert "ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude" in runtime
-    assert not re.search(r"\b(?:npm|npx|corepack)\b", runtime)
-    assert "DISABLE_UPDATES=1" in runtime
-    assert [line for line in runtime.splitlines() if line.startswith("USER ")] == ["USER 1000:1000"]
+    assert "@anthropic-ai" not in dockerfile and "FROM node" not in dockerfile and "claude-code" not in dockerfile
+    assert not re.search(r"\b(?:npm|npx|corepack)\b", dockerfile)
+    assert "RUN test ! -e /usr/local/bin/claude && test ! -e /usr/local/bin/node" in dockerfile
+    assert [line for line in dockerfile.splitlines() if line.startswith("USER ")] == ["USER 1000:1000"]
+
+
+def test_env_example_names_router_settings_and_no_retired_one():
+    from config import RETIRED_SETTINGS
+    keys = {line.split("=", 1)[0] for line in (ROOT / ".env.example").read_text().splitlines()
+            if "=" in line and not line.startswith("#")}
+    assert {"ROUTER_URL", "ROUTER_EXPECTED_MODEL", "CLASSIFIER_TIMEOUT_SECONDS",
+            "GUEST_EXTRACTION_MAX_CALLS_PER_DAY"} <= keys
+    assert not keys & set(RETIRED_SETTINGS) and not any(key.startswith("CLAUDE") for key in keys)
 
 
 def test_direct_python_runtime_and_dev_requirements_are_pinned():
@@ -157,6 +166,7 @@ def test_direct_python_runtime_and_dev_requirements_are_pinned():
     ("start-worker.sh", "database,redis,s3,transcribe,youtube,yt_dlp,deno"),
     ("start-beat.sh", "database,redis,beat"),
     ("start-exporter.sh", "database,redis,s3"),
+    ("start-classifier.sh", "database,redis,s3,claude_absent,router"),
 ])
 def test_startup_scripts_fail_closed_and_preserve_exec_arguments(script, selection, tmp_path):
     path = ROOT / "scripts" / script
@@ -188,9 +198,10 @@ def test_startup_scripts_fail_closed_and_preserve_exec_arguments(script, selecti
     assert "SYSTEM_CHECK_SERVICES" not in content
 
 
-def test_worker_startup_pins_app_pythonpath_for_prefork_lazy_imports(tmp_path):
+@pytest.mark.parametrize("name", ["start-worker.sh", "start-classifier.sh"])
+def test_worker_startup_pins_app_pythonpath_for_prefork_lazy_imports(tmp_path, name):
     """Celery's console loader must not leave child imports dependent on cwd."""
-    script = ROOT / "scripts" / "start-worker.sh"
+    script = ROOT / "scripts" / name
     fake = tmp_path / "flask"
     fake.write_text('#!/bin/sh\nprintf "guard:%s\\n" "$PYTHONPATH"\n')
     fake.chmod(0o755)
@@ -212,93 +223,11 @@ def test_worker_startup_pins_app_pythonpath_for_prefork_lazy_imports(tmp_path):
     assert result.stdout.splitlines() == ["guard:/app", "child:/app"]
 
 
-@pytest.fixture
-def classifier_startup(tmp_path):
-    path = ROOT / "scripts" / "start-classifier.sh"
-    for name, body in {
-        "claude": '''case "$*" in
-  --version) printf 'version:%s\\n' "$PYTHONPATH" >> "$STARTUP_EVENTS"
-    printf '%s\\n' "$FAKE_VERSION"; printf 'private-version-diagnostic\\n' >&2
-    exit "${VERSION_EXIT:-0}" ;;
-  'auth status') printf 'auth:%s\\n' "$PYTHONPATH" >> "$STARTUP_EVENTS"
-    printf 'private-auth-stdout\\n'; printf 'private-auth-stderr\\n' >&2
-    exit "${AUTH_EXIT:-0}" ;;
-  *) exit 99 ;;
-esac
-''',
-        "flask": '''printf 'flask:%s:%s\\n' "$PYTHONPATH" "$*" >> "$STARTUP_EVENTS"
-exit "${GUARD_EXIT:-0}"
-''',
-        "celery": '''printf 'celery:%s\\n' "$PYTHONPATH" >> "$STARTUP_EVENTS"
-printf '%s\\n' "$@"
-exit "${CELERY_EXIT:-0}"
-''',
-    }.items():
-        executable = tmp_path / name
-        executable.write_text("#!/bin/sh\n" + body)
-        executable.chmod(0o755)
-    events = tmp_path / "events"
-    environment = {
-        **os.environ, "PATH": str(tmp_path) + ":" + os.environ["PATH"],
-        "PYTHONPATH": "/tmp/untrusted-shadow-path", "STARTUP_EVENTS": str(events),
-        "FAKE_VERSION": "2.1.303 (Claude Code)", "CLAUDE_EXPECTED_VERSION": "2.1.303",
-        "AUTH_EXIT": "0", "VERSION_EXIT": "0", "GUARD_EXIT": "0", "CELERY_EXIT": "0",
-    }
-    return path, environment, events
-
-
-def run_classifier_startup(fixture, **overrides):
-    path, environment, events = fixture
-    assert path.is_file(), "classifier startup guard must exist"
-    assert os.access(path, os.X_OK)
-    content = path.read_text()
-    assert content.startswith("#!/bin/sh\nset -eu\n")
-    assert 'exec "$@"' in content and "eval " not in content and "set -x" not in content
-    assert subprocess.run(["sh", "-n", str(path)], capture_output=True).returncode == 0
-    result = subprocess.run(
-        [str(path), "celery", "literal $(echo injected-secret)", "argument with spaces"],
-        env={**environment, **overrides}, capture_output=True, text=True, timeout=3,
-    )
-    assert "private-" not in result.stdout + result.stderr
-    return result, events.read_text().splitlines()
-
-
-@pytest.mark.parametrize("expected", ["2.1.303", "12.34.567"])
-def test_classifier_startup_checks_in_order_pins_pythonpath_and_executes_literal_argv(classifier_startup, expected):
-    result, events = run_classifier_startup(
-        classifier_startup, CLAUDE_EXPECTED_VERSION=expected,
-        FAKE_VERSION=expected + " (Claude Code)", CELERY_EXIT="17",
-        SYSTEM_CHECK_SERVICES="redis; echo injected-secret",
-    )
-    assert result.returncode == 17
-    assert events == ["version:/app", "auth:/app",
-                      "flask:/app:--app app:create_app system check --services database,redis,s3", "celery:/app"]
-    assert result.stdout == "literal $(echo injected-secret)\nargument with spaces\n"
-
-
-@pytest.mark.parametrize("overrides,events", [
-    ({"FAKE_VERSION": "2.1.302 (Claude Code)"}, ["version:/app"]),
-    ({"FAKE_VERSION": "2.1.303 (Claude Code) extra"}, ["version:/app"]),
-    ({"VERSION_EXIT": "1"}, ["version:/app"]),
-    ({"CLAUDE_EXPECTED_VERSION": "$(echo injected-secret)"}, ["version:/app"]),
-    ({"AUTH_EXIT": "1"}, ["version:/app", "auth:/app"]),
-    ({"GUARD_EXIT": "1"}, ["version:/app", "auth:/app",
-                            "flask:/app:--app app:create_app system check --services database,redis,s3"]),
-])
-def test_classifier_failures_stop_before_celery_without_auth_or_version_output(classifier_startup, overrides, events):
-    result, actual = run_classifier_startup(classifier_startup, **overrides)
-    assert result.returncode != 0
-    assert result.stdout == ""
-    assert "injected-secret" not in result.stderr
-    assert actual == events
-
-
-def test_web_readiness_remains_independent_of_claude_auth(app, monkeypatch):
+def test_web_readiness_never_probes_the_router(app, monkeypatch):
     import system_checks
 
     components = ("database", "redis", "s3", "transcribe", "youtube", "yt_dlp", "deno", "worker", "beat")
     called = []
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setattr(system_checks, "_run_isolated", lambda component, config: called.append(component) or True)
     response = app.test_client().get("/readyz")
     assert response.status_code == 200
@@ -312,7 +241,7 @@ def test_dockerignore_excludes_sensitive_and_local_material_but_ships_app_assets
     patterns = [line for line in path.read_text().splitlines() if line and not line.startswith("#")]
     def excluded(name):
         return any(fnmatch.fnmatch(name, pattern) or name.startswith(pattern.rstrip("/") + "/") for pattern in patterns)
-    for name in (".env", ".env.prod", ".aws/credentials", ".runtime/claude/config.json", "credentials.json", "secret.pem", ".git/config", ".worktrees/other/app.py", ".venv/lib/pkg.py", "tests/test_auth.py", ".pytest_cache/v/cache", "__pycache__/app.pyc", "data/database.sqlite", ".superpowers/sdd/task.md"):
+    for name in (".env", ".env.prod", ".aws/credentials", ".runtime/router/client.key", "credentials.json", "secret.pem", ".git/config", ".worktrees/other/app.py", ".venv/lib/pkg.py", "tests/test_auth.py", ".pytest_cache/v/cache", "__pycache__/app.pyc", "data/database.sqlite", ".superpowers/sdd/task.md"):
         assert excluded(name), name
     for name in ("migrations/env.py", "migrations/versions/0001_media_foundation.py", "templates/index.html", "static/app.css", "scripts/start-web.sh", "scripts/start-worker.sh", "scripts/start-beat.sh", "scripts/start-classifier.sh"):
         assert not excluded(name), name

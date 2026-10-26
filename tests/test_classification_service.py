@@ -12,7 +12,8 @@ from types import SimpleNamespace
 import pytest
 import sqlalchemy as sa
 
-from claude_classifier import BlockDecision, ClassifierResult, ClassifierError, SYSTEM_PROMPT
+import router_classifier
+from router_classifier import BlockDecision, ClassifierResult, ClassifierError, expected_provenance
 from commercial_policy import (ClassifierProvenance, PROMPT_VERSION, SegmentPolicy,
                                LearningProjection)
 from commercial_signals import fingerprint_range
@@ -50,27 +51,26 @@ class MemoryStorage:
 class FakeClassifier:
     def __init__(self, settings):
         self.calls = []
+        self.keys = []
         self.settings = settings
         self.labels = {}
         self.cost = 25
         self.error = None
         self.on_call = None
 
-    def classify(self, window, *, examples=()):
-        assert not db.session().in_transaction(), "Claude call held a database transaction"
+    def classify(self, window, *, examples=(), request_key=None):
+        assert not db.session().in_transaction(), "Router call held a database transaction"
         self.calls.append((window, examples))
+        self.keys.append(request_key)
         if self.on_call:
             self.on_call()
         if self.error:
             raise self.error
-        provenance = ClassifierProvenance(self.settings.CLAUDE_EXPECTED_VERSION,
-            self.settings.CLAUDE_CLASSIFIER_MODEL, self.settings.CLAUDE_CLASSIFIER_MODEL,
-            PROMPT_VERSION, sha256(SYSTEM_PROMPT.encode()).hexdigest())
         decisions = []
         for segment in window.target_segments:
             label, confidence = self.labels.get(segment.id, ("editorial", 1.0))
             decisions.append(BlockDecision(segment.id, segment.id, label, confidence, ("substantive_content",)))
-        return ClassifierResult(tuple(decisions), self.cost, provenance)
+        return ClassifierResult(tuple(decisions), self.cost, expected_provenance(self.settings))
 
 
 def add_item(env, *, source=None, texts=("First editorial insight", "Buy now with promo code", "Final editorial insight"), external_id=None):
@@ -378,26 +378,52 @@ def test_hash_valid_block_artifacts_are_strictly_reparsed(env, corruption):
     assert db.session.get(m.ContentItem, env.item.id).active_classification_revision_id is None
 
 
-@pytest.mark.parametrize("limit", ["cost", "time"])
-def test_revision_limits_stop_before_next_paid_call(env, limit):
+def _long_revision(env):
     env.item, env.transcript = add_item(env, external_id="long", texts=tuple(f"Line {i}" for i in range(81)))
     revision_id = env.service.ensure_revision(env.item.id, "backfill")
     env.service.prepare_revision(revision_id)
     env.service.run_block(revision_id, 1)
-    if limit == "cost":
-        env.service.settings = replace(env.settings, CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD=Decimal("0.50"))
-    else:
-        revision = db.session.get(m.ClassificationRevision, revision_id)
-        revision.started_at = m.utc_now() - timedelta(seconds=7100)
-        db.session.commit()
+    return revision_id
+
+
+def test_generation_time_limit_stops_before_the_next_call(env):
+    revision_id = _long_revision(env)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(
+        m.ClassificationBlock.revision_id == revision_id, m.ClassificationBlock.ordinal == 1))
+    block.started_at = block.completed_at - timedelta(
+        seconds=env.settings.CLASSIFIER_MAX_REVISION_SECONDS - env.settings.CLASSIFIER_TIMEOUT_SECONDS + 1)
+    db.session.commit()
     with pytest.raises(env.module.ClassificationServiceError) as caught:
         env.service.run_block(revision_id, 2)
     assert caught.value.category == "revision_budget_exhausted"
     assert len(env.classifier.calls) == 1
 
 
-@pytest.mark.parametrize("error,category", [(ClassifierError("claude_timeout"), "claude_timeout"),
-    (StorageTransientError("SECRET body"), "storage_transient"), (RuntimeError("SECRET body"), "claude_config")])
+def test_waiting_for_a_busy_router_does_not_count_against_the_generation_limit(env):
+    revision_id = _long_revision(env)
+    revision = db.session.get(m.ClassificationRevision, revision_id)
+    revision.started_at = m.utc_now() - timedelta(seconds=10 * env.settings.CLASSIFIER_MAX_REVISION_SECONDS)
+    db.session.commit()
+    assert env.service.run_block(revision_id, 2).state == "completed"
+    assert len(env.classifier.calls) == 2
+
+
+def test_block_calls_carry_a_stable_router_key(env):
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.service.run_block(revision_id, 1)
+    assert env.classifier.keys == [f"podcast.classification:rev-{revision_id}:block-1:g0"]
+
+
+def test_model_decisions_are_recorded_as_the_model_decision_source(env):
+    revision_id, _ = finish(env)
+    _, policy, _ = artifacts(env, revision_id)
+    assert {entry.decision_source for entry in policy.ranges} == {"model"}
+    assert policy.classifier == expected_provenance(env.settings)
+
+
+@pytest.mark.parametrize("error,category", [(ClassifierError("model_invalid_output"), "model_invalid_output"),
+    (StorageTransientError("SECRET body"), "storage_transient"), (RuntimeError("SECRET body"), "model_config")])
 def test_failure_persistence_contains_only_closed_categories(env, error, category):
     revision_id = env.service.ensure_revision(env.item.id, "backfill")
     env.service.prepare_revision(revision_id)
@@ -565,7 +591,7 @@ def test_late_failure_cannot_fail_a_reclaimed_block(env):
         block.started_at = m.utc_now()
         db.session.commit()
     env.classifier.on_call = reclaim
-    env.classifier.error = ClassifierError("claude_timeout")
+    env.classifier.error = ClassifierError("model_invalid_output")
     with pytest.raises(env.module.ClassificationServiceError):
         env.service.run_block(revision_id, 1)
     block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
@@ -797,11 +823,11 @@ def test_prepared_request_rechecks_all_database_and_configuration_identity(env, 
     elif change == "origin":
         origin.range_fingerprint_sha256 = "a" * 64
     elif change == "model":
-        monkeypatch.setattr(env.service, "settings", replace(env.settings, CLAUDE_CLASSIFIER_MODEL="changed"))
+        monkeypatch.setattr(env.service, "settings", replace(env.settings, ROUTER_EXPECTED_MODEL="changed:1"))
     elif change == "cli":
-        monkeypatch.setattr(env.service, "settings", replace(env.settings, CLAUDE_EXPECTED_VERSION="changed"))
+        monkeypatch.setattr(router_classifier, "CLASSIFICATION_ROUTE", "podcast.changed")
     elif change == "prompt":
-        monkeypatch.setattr(env.module, "SYSTEM_PROMPT", "changed")
+        monkeypatch.setattr(router_classifier, "SYSTEM_PROMPT", "changed")
     elif change == "policy":
         monkeypatch.setattr(env.module, "POLICY_VERSION", "changed")
     elif change == "lineage":
@@ -866,3 +892,142 @@ def test_prepared_request_explicit_replay_and_committing_mode_remain_compatible(
     request = env.service.prepare_revision_request(item_id)
     assert env.service.ensure_revision(item_id, "manual_retry", idempotency_key="prepared:explicit", prepared_request=request) == first
     assert not db.session().in_transaction()
+
+
+def test_a_busy_router_keeps_the_block_pending_and_its_key(env):
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = ClassifierError("router_busy", advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError) as caught:
+        env.service.run_block(revision_id, 1)
+    assert (caught.value.category, caught.value.retryable, caught.value.advance_key) == ("router_busy", True, False)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.state, block.error_category, block.request_generation) == ("pending", "router_busy", 0)
+    revision = db.session.get(m.ClassificationRevision, revision_id)
+    assert (revision.state, revision.error_category) == ("retrying", "router_busy")
+
+
+@pytest.mark.parametrize("seconds_ago, generation", [(-30, 0), (1, 1)])
+def test_a_key_left_in_progress_advances_only_once_it_is_stuck(env, seconds_ago, generation):
+    from classification_service import IN_PROGRESS_SLACK_SECONDS
+    from router_client import READ_MARGIN_SECONDS
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = ClassifierError("router_busy", reason="in_progress", advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.request_generation, block.request_generation_started_at is not None) == (0, True)
+    stuck_after = env.settings.CLASSIFIER_TIMEOUT_SECONDS + READ_MARGIN_SECONDS + IN_PROGRESS_SLACK_SECONDS
+    block.request_generation_started_at = m.utc_now() - timedelta(seconds=stuck_after + seconds_ago)
+    db.session.commit()
+    with pytest.raises(env.module.ClassificationServiceError) as caught:
+        env.service.run_block(revision_id, 1)
+    assert caught.value.category == "router_busy"
+    db.session.refresh(block)
+    assert (block.state, block.request_generation) == ("pending", generation)
+    assert (block.request_generation_started_at is None) is (generation == 1)
+
+
+@pytest.mark.parametrize("error, generation, state", [
+    (ClassifierError("router_busy"), 1, "pending"),
+    (ClassifierError("model_invalid_output"), 1, "failed"),
+    (ClassifierError("model_invalid_output", advance_key=False), 0, "failed"),
+])
+def test_stored_router_outcomes_advance_the_block_key(env, error, generation, state):
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = error
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.request_generation, block.state) == (generation, state)
+
+
+@pytest.mark.parametrize("reason, retryable, generation, revision_state", [
+    ("conflict", True, 1, "retrying"),   # the key's stored body differs (a setting changed): new key, retry
+    ("rejected", False, 1, "failed"),    # any other 4xx is a client bug
+    (None, False, 1, "failed"),
+])
+def test_only_a_key_conflict_makes_model_config_retryable(env, reason, retryable, generation, revision_state):
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = ClassifierError("model_config", reason=reason)
+    with pytest.raises(env.module.ClassificationServiceError) as caught:
+        env.service.run_block(revision_id, 1)
+    assert (caught.value.category, caught.value.retryable, caught.value.reason) == ("model_config", retryable, reason)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.state, block.error_category, block.request_generation) == ("failed", "model_config", generation)
+    revision = db.session.get(m.ClassificationRevision, revision_id)
+    assert (revision.state, revision.error_category) == (revision_state, "model_config")
+
+
+@pytest.mark.parametrize("reason", ["rate_limited", "proxy"])
+def test_a_rejected_send_does_not_start_the_key_clock(env, monkeypatch, reason):
+    # A 429 (or Caddy's 502 with the router down) never reaches the router's idempotency store, so
+    # it must not count as the key's first send: a later 202 for the real first send is not stuck.
+    from classification_service import IN_PROGRESS_SLACK_SECONDS
+    from router_client import READ_MARGIN_SECONDS
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = ClassifierError("router_busy", reason=reason, advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.state, block.request_generation, block.request_generation_started_at) == ("pending", 0, None)
+    later = m.utc_now() + timedelta(seconds=env.settings.CLASSIFIER_TIMEOUT_SECONDS + READ_MARGIN_SECONDS
+                                    + IN_PROGRESS_SLACK_SECONDS + 60)
+    monkeypatch.setattr(env.module, "utc_now", lambda: later)
+    env.classifier.error = ClassifierError("router_busy", reason="in_progress", advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    db.session.refresh(block)
+    assert (block.request_generation, block.request_generation_started_at) == (0, later)
+
+
+def test_a_rejected_send_keeps_an_earlier_real_send_as_the_key_clock(env):
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = ClassifierError("router_busy", reason="in_progress", advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    first = block.request_generation_started_at
+    env.classifier.error = ClassifierError("router_busy", reason="rate_limited", advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    db.session.refresh(block)
+    assert first is not None and block.request_generation_started_at == first
+
+
+@pytest.mark.parametrize("where", ["classify", "storage"])
+def test_a_soft_time_limit_in_a_block_is_a_busy_timeout(env, monkeypatch, where):
+    from celery.exceptions import SoftTimeLimitExceeded
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    if where == "classify":
+        env.classifier.error = SoftTimeLimitExceeded()
+    else:
+        def soft_limit(*args, **kwargs):
+            raise SoftTimeLimitExceeded()
+        monkeypatch.setattr(env.storage, "put_content_addressed", soft_limit)
+    with pytest.raises(env.module.ClassificationServiceError) as caught:
+        env.service.run_block(revision_id, 1)
+    assert (caught.value.category, caught.value.reason, caught.value.advance_key) == ("router_busy", "timeout", False)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.state, block.error_category, block.request_generation) == ("pending", "router_busy", 0)
+
+
+@pytest.mark.parametrize("legacy,current,retryable", [
+    ("claude_timeout", "router_busy", True), ("claude_unavailable", "router_busy", True),
+    ("claude_invalid_output", "model_invalid_output", True), ("claude_auth", "model_auth", False),
+    ("claude_config", "model_config", False)])
+def test_claude_era_categories_keep_their_retry_semantics(legacy, current, retryable):
+    import classification_service as service
+    assert service.current_error_category(legacy) == current
+    assert service.current_error_category("storage_transient") == "storage_transient"
+    assert service.current_error_category(None) is None
+    error = service.ClassificationServiceError(legacy)
+    assert (error.category, error.retryable) == (current, retryable)
+    sweep = SimpleNamespace(error_category=legacy, updated_at=m.utc_now())
+    assert (service.source_sweep_retry_at(sweep) is not None) is retryable
