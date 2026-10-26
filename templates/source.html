@@ -12,6 +12,15 @@
   <dt>Last successful check</dt><dd>{{ source.last_success_at or 'Not checked yet' }}</dd>
   <dt>Next check</dt><dd>{{ source.next_check_at or 'Waiting' }}</dd>
 </dl>
+<section aria-labelledby="hosts-heading"><h2 id="hosts-heading">Hosts</h2>
+{% if source.hosts %}<p>{{ source.hosts|join(', ') }} · {{ source.hosts_basis }}</p>
+{% else %}<p role="alert">No host is set. Items from this source are not exported to the knowledge intake until a host is named.</p>{% endif %}
+<form method="post" action="{{ url_for('workspace.update_source_hosts', source_id=source.id) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() if config.WTF_CSRF_ENABLED else '' }}">
+  <label for="hosts">Hosts, one per line. The first is the host, the rest co-hosts. Leave empty to use the feed or channel.</label>
+  <textarea id="hosts" name="hosts" rows="3" maxlength="10000">{{ source.hosts_text }}</textarea>
+  <button type="submit">Save hosts</button>
+</form></section>
 <section aria-labelledby="items-heading"><h2 id="items-heading">Items</h2>
 {{ item_table(items) }}
 {{ item_navigation() }}
