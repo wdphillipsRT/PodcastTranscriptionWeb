@@ -4,17 +4,35 @@ Runs on the classifier's isolated worker with the same Claude CLI restrictions
 as transcript classification: no tools, no MCP, one turn, a JSON schema, a
 pinned model, a per-call budget, a hardened environment, and an empty private
 working directory. Episode text is an untrusted quoted envelope. Only names that
-appear verbatim in that text are kept, and every result is marked `inferred`.
+appear as whole words in the title or in the description (compared after NFKC
+normalisation and case folding) are kept, spelled as the episode text spells
+them, and every result is marked `inferred`.
+
+Cost bound: before each call the run re-reads today's (UTC) recorded spend and
+stops when that spend plus the per-call cap would exceed the daily budget. A
+call that started and then timed out, exited unsuccessfully, or returned
+unusable output is recorded as failed, charged at the per-call cap (or at the
+reported cost when that is higher), and never retried for the same input; the
+run then moves on to the next item. Only environmental failures, where the call
+never ran or could not have succeeded for any item (authentication,
+configuration, a missing or unstartable CLI, a model other than the pinned
+one), stop the run without a record, so daily spend is at most the daily budget
+plus one such unrecorded call per run, itself capped by the per-call budget.
+Runs never overlap (a PostgreSQL session advisory lock) and start no call that
+could outlast RUN_DEADLINE_SECONDS.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 import json
 import os
+import re
 import selectors
 import subprocess
 import tempfile
 import time
+import unicodedata
 
 import sqlalchemy as sa
 
@@ -41,7 +59,12 @@ OUTPUT_SCHEMA = {
 }
 MAX_DESCRIPTION_CHARS = 6_000
 MAX_OUTPUT_BYTES = 65_536
-RETRY_LATER = frozenset({"claude_timeout", "claude_unavailable", "claude_auth", "claude_config", "model_mismatch"})
+# Failures no item can fix: they stop the run unrecorded. claude_timeout,
+# claude_unavailable, and claude_invalid_output happen only after the CLI has
+# started and may be caused by the item, so they are recorded and not retried.
+ENVIRONMENTAL = frozenset({"claude_auth", "claude_config", "model_mismatch"})
+RUN_DEADLINE_SECONDS = 600
+RUN_LOCK_KEY = 0x5047_5545_5354_0001
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +79,32 @@ def _micros(value):
         return int((value * 1_000_000).to_integral_value(rounding=ROUND_HALF_UP))
 
 
-def _result(raw, settings, haystack):
+def _searchable(text):
+    """NFKC text with whitespace collapsed, its case fold, and where each folded character came from."""
+    source = " ".join(unicodedata.normalize("NFKC", text).split())
+    folded, origin, bounds = [], [], {0}
+    for index, char in enumerate(source):
+        piece = char.casefold()
+        folded.extend(piece)
+        origin.extend([index] * len(piece))
+        bounds.add(len(folded))
+    return source, "".join(folded), origin, bounds
+
+
+def _verbatim(name, texts):
+    """The span of the title or description that is `name` as whole words, in the text's own spelling."""
+    needle = " ".join(unicodedata.normalize("NFKC", name).split()).casefold()
+    if not needle:
+        return None
+    pattern = re.compile(r"(?<!\w)" + re.escape(needle) + r"(?!\w)")
+    for source, folded, origin, bounds in texts:
+        for match in pattern.finditer(folded):
+            if match.start() in bounds and match.end() in bounds:
+                return source[origin[match.start()]:origin[match.end() - 1] + 1]
+    return None
+
+
+def _result(raw, settings, texts):
     try:
         data = json.loads(raw, object_pairs_hook=_unique_object, parse_float=Decimal,
                           parse_constant=lambda _: _fail())
@@ -67,9 +115,12 @@ def _result(raw, settings, haystack):
         if list(data["modelUsage"]) != [settings.CLAUDE_GUEST_MODEL]:
             _fail("model_mismatch")
         cost = data["total_cost_usd"]
-        if type(cost) not in (int, Decimal) or not Decimal(cost).is_finite() or not (
-                0 <= Decimal(cost) <= settings.GUEST_EXTRACTION_MAX_BUDGET_USD):
+        if type(cost) not in (int, Decimal) or not Decimal(cost).is_finite() or Decimal(cost) < 0:
             _fail()
+        if Decimal(cost) > settings.GUEST_EXTRACTION_MAX_BUDGET_USD:
+            error = ClassifierError("claude_invalid_output")
+            error.cost_microusd = _micros(Decimal(cost))  # Charged as reported, above the cap.
+            raise error from None
         structured = data["structured_output"]
         if not isinstance(structured, dict) or set(structured) != {"guests"}:
             _fail()
@@ -84,8 +135,10 @@ def _result(raw, settings, haystack):
             if (not isinstance(entry["name"], str) or type(confidence) not in (int, Decimal)
                     or not Decimal(confidence).is_finite() or not 0 <= confidence <= 1):
                 _fail()
-            for name in person_names([entry["name"]], limit=1):
-                if name.casefold() in haystack and name.casefold() not in seen:
+            for candidate in person_names([entry["name"]], limit=1):
+                for name in person_names([_verbatim(candidate, texts) or ""], limit=1):
+                    if name.casefold() in seen:
+                        continue
                     seen.add(name.casefold())
                     guests.append((name, float(Decimal(confidence).quantize(Decimal("0.01"), ROUND_HALF_UP))))
         return GuestResult(tuple(guests), _micros(Decimal(cost)))
@@ -109,7 +162,7 @@ class ClaudeGuestExtractor:
                 "description": plain_text(description)[:MAX_DESCRIPTION_CHARS]}
         payload = canonical_json({"schema": "episode-guest-extraction-input/v1", "untrusted_quoted_data": True,
             "known_hosts": list(hosts)[:10], **text}).encode("utf-8")
-        haystack = " ".join(f"{text['title']} {text['description']}".split()).casefold()
+        texts = (_searchable(text["title"]), _searchable(text["description"]))
         process, completed = None, False
         try:
             environment = _environment(os.environ if self.environment is None else self.environment)
@@ -125,7 +178,7 @@ class ClaudeGuestExtractor:
                     start_new_session=True)
                 try:
                     raw = _exchange(process, payload, deadline, MAX_OUTPUT_BYTES, self.selector_factory)
-                    result = _result(raw, settings, haystack)
+                    result = _result(raw, settings, texts)
                     completed = True
                     return result
                 finally:
@@ -155,23 +208,65 @@ def _candidates(session):
     return [(item, source) for item, source in rows if source_hosts(source)[0]]
 
 
-def extract_pending_guests(*, session, extractor, settings, now):
+@contextmanager
+def _run_lock(session):
+    """A PostgreSQL session advisory lock held across the run's commits; SQLite runs unlocked."""
+    bind = session.get_bind()
+    if bind.dialect.name != "postgresql":
+        yield True
+        return
+    connection = bind.connect()
+    acquired = False
+    try:
+        acquired = bool(connection.execute(sa.text("SELECT pg_try_advisory_lock(:key)"),
+                                           {"key": RUN_LOCK_KEY}).scalar())
+        connection.commit()
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                connection.execute(sa.text("SELECT pg_advisory_unlock(:key)"), {"key": RUN_LOCK_KEY})
+                connection.commit()
+            except Exception:
+                connection.invalidate()
+        connection.close()
+
+
+def _spent_today(session, now):
+    from models import GuestExtraction
+    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    spent = session.scalar(sa.select(sa.func.coalesce(sa.func.sum(GuestExtraction.cost_microusd), 0))
+                           .where(GuestExtraction.created_at >= day))
+    session.commit()  # No database transaction is held across a Claude call.
+    return spent
+
+
+def extract_pending_guests(*, session, extractor, settings, clock=None, monotonic=time.monotonic):
     """Extract guests for up to GUEST_EXTRACTION_MAX_ITEMS_PER_RUN items within today's budget.
 
-    The daily spend is the recorded cost of today's extractions; each call is
-    allowed only when the per-call ceiling still fits. An item-specific invalid
-    result is recorded as failed at the per-call ceiling and is not retried for
-    the same input; transient, authentication, and configuration failures stop
-    the run without a record so the next run retries.
+    Before each call, today's recorded spend is re-read (so a run that crosses
+    midnight UTC starts a new day) and the call is allowed only when the
+    per-call cap still fits and the call cannot outlast RUN_DEADLINE_SECONDS.
+    A failure after the CLI started is recorded as failed at the per-call cap
+    (or the higher reported cost) and is not retried for the same input; the
+    run continues. Environmental failures stop the run without a record.
     """
-    from models import GuestExtraction
+    from models import utc_now
+    clock = clock or utc_now
     counts = {"scanned": 0, "extracted": 0, "failed": 0, "stopped": None}
     if not settings.GUEST_EXTRACTION_ENABLED:
         session.commit()
         return {**counts, "stopped": "disabled"}
-    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    spent = session.scalar(sa.select(sa.func.coalesce(sa.func.sum(GuestExtraction.cost_microusd), 0))
-                           .where(GuestExtraction.created_at >= day))
+    with _run_lock(session) as acquired:
+        if not acquired:
+            session.commit()
+            return {**counts, "stopped": "busy"}
+        return _extract(session, extractor, settings, clock, monotonic, counts)
+
+
+def _extract(session, extractor, settings, clock, monotonic, counts):
+    from models import GuestExtraction
+    started = monotonic()
     ceiling = _micros(settings.GUEST_EXTRACTION_MAX_BUDGET_USD)
     daily = _micros(settings.GUEST_EXTRACTION_DAILY_BUDGET_USD)
     done = {tuple(row) for row in session.execute(sa.select(GuestExtraction.item_id, GuestExtraction.input_sha256))}
@@ -185,7 +280,10 @@ def extract_pending_guests(*, session, extractor, settings, now):
             break
     session.commit()  # No database transaction is held across a Claude call.
     for entry in work:
-        if spent + ceiling > daily:
+        if monotonic() - started + settings.GUEST_EXTRACTION_TIMEOUT_SECONDS > RUN_DEADLINE_SECONDS:
+            counts["stopped"] = "run_deadline"
+            break
+        if _spent_today(session, clock()) + ceiling > daily:
             counts["stopped"] = "daily_budget"
             break
         counts["scanned"] += 1
@@ -193,20 +291,18 @@ def extract_pending_guests(*, session, extractor, settings, now):
             result = extractor.extract(show=entry["show"], hosts=entry["hosts"], title=entry["title"],
                                        description=entry["description"])
         except ClassifierError as error:
-            if error.category in RETRY_LATER:
+            if error.category in ENVIRONMENTAL:
                 counts["stopped"] = error.category
                 break
             session.add(GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], state="failed",
-                error_category=error.category, model=settings.CLAUDE_GUEST_MODEL, cost_microusd=ceiling,
-                created_at=now))
+                error_category=error.category, model=settings.CLAUDE_GUEST_MODEL,
+                cost_microusd=max(ceiling, getattr(error, "cost_microusd", 0)), created_at=clock()))
             session.commit()
-            spent += ceiling
             counts["failed"] += 1
             continue
         session.add(GuestExtraction(item_id=entry["item_id"], input_sha256=entry["digest"], state="completed",
             guests=[{"name": name, "confidence": confidence} for name, confidence in result.guests],
-            model=settings.CLAUDE_GUEST_MODEL, cost_microusd=result.cost_microusd, created_at=now))
+            model=settings.CLAUDE_GUEST_MODEL, cost_microusd=result.cost_microusd, created_at=clock()))
         session.commit()
-        spent += result.cost_microusd
         counts["extracted"] += 1
     return counts

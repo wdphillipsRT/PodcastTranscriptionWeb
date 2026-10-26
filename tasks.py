@@ -853,9 +853,8 @@ def extract_guests():
     with application_context():
         from extensions import db
         from guest_extractor import extract_pending_guests
-        from models import utc_now
         counts = extract_pending_guests(session=db.session, extractor=get_guest_extractor(),
-            settings=SimpleNamespace(**dict(current_app.config)), now=utc_now())
+            settings=SimpleNamespace(**dict(current_app.config)))
         logging.getLogger(__name__).info("knowledge_guest_extraction", extra={"guest_extraction": counts})
         return counts
 

@@ -36,5 +36,8 @@ beat_schedule["classification-reconciliation"] = {"task": "tasks.reconcile_class
 # Guest extraction calls Claude, so it runs only on the classifier's queue.
 task_routes["tasks.extract_guests"] = {"queue": "classification"}
 if os.environ.get("GUEST_EXTRACTION_ENABLED", "false").strip().lower() == "true":
-    beat_schedule["guest-extraction"] = {"task": "tasks.extract_guests",
-        "schedule": float(os.environ.get("GUEST_EXTRACTION_INTERVAL_SECONDS", "3600"))}
+    # Validated as config.load_settings does: beat must never schedule paid calls more often than hourly.
+    _guest_interval = os.environ.get("GUEST_EXTRACTION_INTERVAL_SECONDS", "3600").strip()
+    if not _guest_interval.isascii() or not _guest_interval.isdigit() or int(_guest_interval) < 3600:
+        raise ValueError("GUEST_EXTRACTION_INTERVAL_SECONDS must be an integer of at least 3600")
+    beat_schedule["guest-extraction"] = {"task": "tasks.extract_guests", "schedule": float(int(_guest_interval))}

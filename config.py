@@ -151,6 +151,8 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
         raise ConfigError("GUEST_EXTRACTION_MAX_ITEMS_PER_RUN must not exceed 100")
     if values["GUEST_EXTRACTION_TIMEOUT_SECONDS"] > 600:
         raise ConfigError("GUEST_EXTRACTION_TIMEOUT_SECONDS must not exceed 600")
+    if values["GUEST_EXTRACTION_INTERVAL_SECONDS"] < 3600:
+        raise ConfigError("GUEST_EXTRACTION_INTERVAL_SECONDS must be at least 3600")
     for name in ("CLAUDE_CLASSIFIER_MAX_BUDGET_USD", "CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD",
                  "GUEST_EXTRACTION_MAX_BUDGET_USD", "GUEST_EXTRACTION_DAILY_BUDGET_USD"):
         try:
