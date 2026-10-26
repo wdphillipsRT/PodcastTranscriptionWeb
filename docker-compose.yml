@@ -91,5 +91,22 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1770
 
+  # Optional: start with COMPOSE_PROFILES=knowledge once the Platform intake
+  # spool exists. It mounts only the podcast inbox and joins its group.
+  exporter:
+    <<: *app
+    profiles: [knowledge]
+    entrypoint: [/app/scripts/start-exporter.sh]
+    command: [celery, -A, tasks.celery_app, worker, --loglevel=info, --queues, knowledge, --concurrency, "1", --hostname, "exporter@%h"]
+    environment:
+      KNOWLEDGE_EXPORT_INBOX: /spool/podcast/inbox
+    group_add: ["${PODCAST_INTAKE_GID:-65534}"]
+    volumes:
+      - type: bind
+        source: ${PODCAST_INTAKE_INBOX_HOST_PATH:-/srv/bezalel/intake/podcast/inbox}
+        target: /spool/podcast/inbox
+        bind:
+          create_host_path: false
+
 volumes:
   postgres_data:

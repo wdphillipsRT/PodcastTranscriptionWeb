@@ -16,6 +16,7 @@ from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 from config import Settings
+from feed_people import parse_feed_people
 from ingestion_types import (IngestionError, SourceDescriptor, normalize_public_url,
     validated_http_url)
 from source_classifier import classify_source_url
@@ -276,7 +277,8 @@ def resolve_podcast_source(url, settings, session) -> SourceDescriptor:
     feed = parsed.feed
     return SourceDescriptor(source_type="podcast_rss",
         external_id=sha256(final_url.encode("utf-8")).hexdigest(), canonical_url=final_url,
-        title=feed.get("title") or "Untitled Podcast", description=feed.get("subtitle", ""))
+        title=feed.get("title") or "Untitled Podcast", description=feed.get("subtitle", ""),
+        hosts=parse_feed_people(body).hosts)
 
 
 def resolve_feed(url, settings=None, session=None):

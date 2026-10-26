@@ -842,6 +842,43 @@ def get_classification_service():
         classifier=ClaudeClassifier(settings), settings=settings)
 
 
+@celery_app.task(name="tasks.export_knowledge", queue="knowledge")
+def export_knowledge():
+    """Nightly knowledge export; consumed only by the exporter service."""
+    with application_context():
+        from extensions import db
+        from integrations.knowledge import exporter
+        from models import utc_now
+        settings = SimpleNamespace(**dict(current_app.config))
+        try:
+            return exporter.export_knowledge(session=db.session, storage=get_processing_storage(),
+                settings=settings, inbox=settings.KNOWLEDGE_EXPORT_INBOX, now=utc_now()).as_dict()
+        except Exception as error:
+            db.session.rollback()
+            result = {"status": "failed", "reason": "unexpected_error"}
+            # The type names the cause (e.g. SoftTimeLimitExceeded) without paths or messages.
+            logging.getLogger(__name__).warning("knowledge_export_failed", extra={
+                "knowledge_export": result, "error_type": type(error).__name__})
+            return result
+
+
+def get_guest_extractor():
+    """Construct lazily; only the classifier container holds Claude credentials."""
+    from guest_extractor import ClaudeGuestExtractor
+    return ClaudeGuestExtractor(SimpleNamespace(**dict(current_app.config)))
+
+
+@celery_app.task(name="tasks.extract_guests", queue="classification")
+def extract_guests():
+    with application_context():
+        from extensions import db
+        from guest_extractor import extract_pending_guests
+        counts = extract_pending_guests(session=db.session, extractor=get_guest_extractor(),
+            settings=SimpleNamespace(**dict(current_app.config)))
+        logging.getLogger(__name__).info("knowledge_guest_extraction", extra={"guest_extraction": counts})
+        return counts
+
+
 def _classification_phase(revision_id, phase, block_ordinal):
     from discovery_service import positive_id
     positive_id(revision_id)

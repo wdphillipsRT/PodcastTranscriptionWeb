@@ -7,6 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 import re
 from types import MappingProxyType
+import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -79,6 +80,37 @@ def normalize_public_url(value: str) -> str:
         return urlunsplit((parts.scheme.lower(), host, parts.path or "/", query, ""))
     except (TypeError, ValueError, UnicodeError):
         raise IngestionError("invalid_url") from None
+
+
+MAX_PERSON_NAME_CHARS = 300
+# Zero-width (non-)joiners spell real Persian and Indic names; other format
+# characters (bidi overrides, zero-width spaces) are dropped with the name.
+_NAME_JOINERS = frozenset("\u200c\u200d")
+
+
+def person_names(values, *, limit: int) -> tuple[str, ...]:
+    """Display names: whitespace collapsed, empty/oversized/control- or
+    format-character names dropped, case-insensitive duplicates removed, order
+    kept, bounded by a positive limit."""
+    if isinstance(values, (str, bytes)):
+        raise TypeError("person names must be an iterable of strings, not a string")
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("limit must be a positive integer")
+    result, seen = [], set()
+    for value in values or ():
+        if not isinstance(value, str):
+            raise TypeError("person names must be strings")
+        name = " ".join(value.split())
+        if (not name or len(name) > MAX_PERSON_NAME_CHARS
+                or any(unicodedata.category(char) in ("Cc", "Cf") and char not in _NAME_JOINERS
+                       for char in name)):
+            continue
+        if name.casefold() not in seen:
+            seen.add(name.casefold())
+            result.append(name)
+        if len(result) == limit:
+            break
+    return tuple(result)
 
 
 def redact_url(value: str) -> str:
@@ -158,9 +190,11 @@ class SourceDescriptor:
     description: str = ""
     image_url: str | None = None
     provider_metadata: Mapping = field(default_factory=dict)
+    hosts: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "canonical_url", normalize_public_url(self.canonical_url))
+        object.__setattr__(self, "hosts", person_names(self.hosts, limit=10))
         if self.image_url:
             object.__setattr__(self, "image_url", normalize_public_url(self.image_url))
         object.__setattr__(self, "provider_metadata", _freeze_metadata(self.provider_metadata))
@@ -192,9 +226,11 @@ class ItemDescriptor:
     duration_seconds: int | None = None
     requires_reacquisition: bool = False
     provider_metadata: Mapping = field(default_factory=dict)
+    guests: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "published_at", utc_datetime(self.published_at))
+        object.__setattr__(self, "guests", person_names(self.guests, limit=20))
         if self.guid and self.guid.lower().startswith(("http://", "https://")):
             try:
                 guid = normalize_public_url(self.guid)
@@ -221,9 +257,13 @@ class DiscoveryPage:
     # YouTube identities observed in this page but not currently usable. Keep
     # them separate from ItemDescriptor so no unavailable video can be queued.
     unavailable_ids: tuple[str, ...] = ()
+    # Hosts the source itself declares on this fetch; None when not reported.
+    source_hosts: tuple[str, ...] | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "items", tuple(self.items))
+        if self.source_hosts is not None:
+            object.__setattr__(self, "source_hosts", person_names(self.source_hosts, limit=10))
         object.__setattr__(self, "unavailable_ids", tuple(self.unavailable_ids))
 
 

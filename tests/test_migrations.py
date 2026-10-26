@@ -40,7 +40,8 @@ def test_initial_migration_upgrade_schema_and_downgrade(app_factory, tmp_path):
     expected = {"admins", "content_sources", "content_items", "source_items", "discovery_runs",
                 "discovery_candidates", "backfill_requests", "processing_jobs",
                 "classification_revisions", "classification_blocks", "segment_overrides",
-                "source_classification_rules", "classification_sweeps"}
+                "source_classification_rules", "classification_sweeps", "guest_extractions",
+                "knowledge_export_batches", "knowledge_item_exports"}
     with app.app_context():
         inspector = sa.inspect(db.engine)
         assert set(inspector.get_table_names()) == expected | {"alembic_version"}
@@ -54,7 +55,7 @@ def test_initial_migration_upgrade_schema_and_downgrade(app_factory, tmp_path):
             assert db.metadata.tables["content_items"].c.remote_media_url.type.compile(
                 dialect=dialect) == "VARCHAR(4096)"
         with db.engine.connect() as connection:
-            assert connection.scalar(sa.text("select version_num from alembic_version")) == "0002_commercial_classification"
+            assert connection.scalar(sa.text("select version_num from alembic_version")) == "0003_knowledge_export"
             retained = connection.execute(sa.text("SELECT status, transcript_s3_key, transcript_sha256, segments_s3_key, segments_sha256, active_classification_revision_id FROM content_items WHERE id = 1")).one()
             assert tuple(retained) == ("completed", "transcript.json", "a" * 64, "segments.json", "a" * 64, None)
             assert connection.scalar(sa.text("SELECT count(*) FROM source_items WHERE item_id = 1")) == 1
@@ -148,3 +149,58 @@ def test_migrated_storage_accepts_public_selectors_and_rejects_signed_bindings(a
         with pytest.raises(sa.exc.StatementError):
             db.session.execute(sa.update(m.ContentItem).where(m.ContentItem.id == episode.id).values(
                 remote_media_url="https://cdn.example.org/audio?X-Amz-Signature=secret"))
+
+
+def test_knowledge_export_migration_keeps_rows_and_reverses(app_factory, tmp_path):
+    importlib.import_module("models")
+    app = app_factory(SQLALCHEMY_DATABASE_URI=f"sqlite:///{tmp_path / 'knowledge.sqlite'}")
+    runner = app.test_cli_runner()
+    result = runner.invoke(args=["db", "upgrade", "0002_commercial_classification"])
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    with app.app_context(), db.engine.begin() as connection:
+        connection.execute(sa.text("INSERT INTO admins (id, email, password_hash) VALUES (1, 'owner@example.com', 'hash')"))
+        connection.execute(sa.text("""INSERT INTO content_sources
+            (id, admin_id, source_type, external_id, canonical_url, name, provider_metadata)
+            VALUES (1, 1, 'podcast_rss', 'feed', 'https://example.com/feed', 'Feed', '{}')"""))
+        connection.execute(sa.text("""INSERT INTO content_items
+            (id, admin_id, item_type, platform, external_id, canonical_url, title, status)
+            VALUES (1, 1, 'podcast_episode', 'podcast', 'episode', 'https://example.com/e', 'Episode', 'completed')"""))
+        connection.execute(sa.text("INSERT INTO source_items (source_id, item_id) VALUES (1, 1)"))
+    result = runner.invoke(args=["db", "upgrade"])
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    with app.app_context(), db.engine.connect() as connection:
+        assert connection.scalar(sa.text("select version_num from alembic_version")) == "0003_knowledge_export"
+        assert tuple(connection.execute(sa.text(
+            "SELECT feed_hosts, admin_hosts, hosts_updated_at FROM content_sources WHERE id = 1")).one()) == (None, None, None)
+        assert tuple(connection.execute(sa.text(
+            "SELECT title, feed_guests, admin_guests FROM content_items WHERE id = 1")).one()) == ("Episode", None, None)
+        assert connection.scalar(sa.text("SELECT count(*) FROM source_items WHERE item_id = 1")) == 1
+        context = MigrationContext.configure(connection, opts={"compare_type": True, "compare_server_default": True})
+        assert compare_metadata(context, db.metadata) == []
+    result = runner.invoke(args=["db", "downgrade", "0002_commercial_classification"])
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    with app.app_context(), db.engine.connect() as connection:
+        inspector = sa.inspect(connection)
+        assert not {"guest_extractions", "knowledge_export_batches", "knowledge_item_exports"} & set(inspector.get_table_names())
+        assert "feed_hosts" not in {column["name"] for column in inspector.get_columns("content_sources")}
+        assert "feed_guests" not in {column["name"] for column in inspector.get_columns("content_items")}
+        assert connection.scalar(sa.text("SELECT count(*) FROM source_items WHERE item_id = 1")) == 1
+        assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+
+
+def test_knowledge_export_migration_renders_postgresql():
+    path = Path(__file__).resolve().parents[1] / "migrations/versions/0003_knowledge_export.py"
+    specification = importlib.util.spec_from_file_location("knowledge_migration", path)
+    migration = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(migration)
+    assert (migration.revision, migration.down_revision) == ("0003_knowledge_export", "0002_commercial_classification")
+    sql = StringIO()
+    context = MigrationContext.configure(dialect_name="postgresql", opts={"as_sql": True, "output_buffer": sql})
+    with Operations.context(context):
+        migration.upgrade()
+        migration.downgrade()
+    statements = sql.getvalue()
+    assert "ALTER TABLE content_sources ADD COLUMN feed_hosts JSON" in statements
+    assert "ALTER TABLE content_items ADD COLUMN admin_guests JSON" in statements
+    assert statements.index("CREATE TABLE knowledge_export_batches") < statements.index("CREATE TABLE knowledge_item_exports")
+    assert statements.index("DROP TABLE knowledge_item_exports") < statements.index("DROP TABLE knowledge_export_batches")

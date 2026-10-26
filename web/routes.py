@@ -15,7 +15,7 @@ from sqlalchemy.orm import aliased
 from extensions import db
 from ingestion_types import SourceDescriptor, normalize_public_url
 from models import (BackfillRequest, ClassificationRevision, ContentItem, ContentSource, DiscoveryRun,
-                    ProcessingJob, SourceItem, SOURCE_TYPES, utc_now)
+                    GuestExtraction, ProcessingJob, SourceItem, SOURCE_TYPES, utc_now)
 from s3_utils import (get_s3_manager, parse_media_range, StorageRangeError, AUDIO_CONTENT_TYPES)
 from commercial_policy import LABELS, POLICY_VERSION
 from source_classifier import CHANNEL_ID, PLAYLIST_ID, classify_source_url, youtube_locator
@@ -40,6 +40,8 @@ CLASSIFICATION_FAILURES = {"claude_timeout": "Classifier timeout", "claude_unava
     "revision_budget_exhausted": "Classification budget reached", "dispatch_pending": "Awaiting dispatch"}
 CLASSIFICATION_TOTALS = ("included_segments", "excluded_segments", "uncertain_segments",
     "included_milliseconds", "excluded_milliseconds", "uncertain_milliseconds")
+PEOPLE_BASIS_LABELS = {"admin_set": "Set by the administrator", "feed_declared": "Declared by the feed or channel",
+    "inferred": "Inferred from the title and description"}
 
 
 def classification_view(latest=None, active=None):
@@ -131,7 +133,36 @@ def source_view(source):
                 canonical_url=source.canonical_url, enabled=source.enabled, item_count=count,
                 health="Needs attention" if source.error_category else "Healthy" if source.last_success_at else "Waiting for discovery",
                 discovery_state=run.state if run else "pending", last_success_at=source.last_success_at,
-                next_check_at=source.next_check_at)
+                next_check_at=source.next_check_at, **hosts_view(source))
+
+
+def hosts_view(source):
+    """Effective hosts; the form is prefilled only with administrator values."""
+    from integrations.knowledge.people import source_hosts
+    names, basis = source_hosts(source)
+    return dict(hosts=list(names), hosts_basis=PEOPLE_BASIS_LABELS.get(basis),
+                hosts_text="\n".join(source.admin_hosts or []))
+
+
+def item_people(row):
+    """Hosts of the classifying (else first) source and the effective guests."""
+    from integrations.knowledge.people import guest_input_sha256, item_guests
+    source_id = db.session.scalar(db.select(ClassificationRevision.source_id).where(
+        ClassificationRevision.id == row.active_classification_revision_id))
+    source = db.session.scalar(db.select(ContentSource).join(SourceItem).where(
+        SourceItem.item_id == row.id, ContentSource.admin_id == current_user.id)
+        .order_by((ContentSource.id == source_id).desc(), ContentSource.id).limit(1))
+    extraction = db.session.scalar(db.select(GuestExtraction).where(
+        GuestExtraction.item_id == row.id, GuestExtraction.input_sha256 == guest_input_sha256(row)))
+    guests = item_guests(row, extraction)
+    return guests, dict(hosts=hosts_view(source)["hosts"] if source else [],
+        guests=[dict(name=name, basis=PEOPLE_BASIS_LABELS[basis], inferred=basis == "inferred",
+                     confidence=confidence) for name, basis, confidence in guests],
+        guests_overridden=row.admin_guests is not None,
+        # Inferred guests are never prefilled: saving the form unchanged must not
+        # turn a model's guess into an administrator-set guest.
+        guests_text="\n".join(row.admin_guests if row.admin_guests is not None
+                              else [name for name, basis, _ in guests if basis != "inferred"]))
 
 
 def item_view(item, classification=None):
@@ -202,7 +233,8 @@ def add_source():
             raise ValueError
         # Keep only canonical normalized fields and the typed discovery metadata.
         canonical = SourceDescriptor(descriptor.source_type, descriptor.external_id, descriptor.canonical_url,
-                                     descriptor.title, descriptor.description, descriptor.image_url)
+                                     descriptor.title, descriptor.description, descriptor.image_url,
+                                     hosts=descriptor.hosts)
         if not isinstance(canonical.external_id, str) or not 0 < len(canonical.external_id) <= 1024:
             raise ValueError
         if not isinstance(canonical.title, str) or not 0 < len(canonical.title) <= 500:
@@ -219,7 +251,8 @@ def add_source():
     source = ContentSource(admin_id=current_user.id, source_type=canonical.source_type,
         external_id=canonical.external_id, canonical_url=canonical.canonical_url, name=canonical.title,
         description=canonical.description, image_url=canonical.image_url, provider_metadata=metadata,
-        initial_item_limit=25, next_check_at=utc_now())
+        initial_item_limit=25, next_check_at=utc_now(), feed_hosts=list(canonical.hosts) or None,
+        hosts_updated_at=utc_now() if canonical.hosts else None)
     try:
         db.session.add(source)
         db.session.flush()
@@ -352,7 +385,62 @@ def item(item_id):
     memberships = db.session.scalars(db.select(ContentSource).join(SourceItem).where(
         SourceItem.item_id == row.id, ContentSource.admin_id == current_user.id)).all()
     return render_template("item.html", item=view, memberships=[source_view(source) for source in memberships],
-                           citations=citation_views(row))
+                           citations=citation_views(row), people=item_people(row)[1])
+
+
+@workspace.post("/api/sources/<int:source_id>/hosts")
+@workspace.post("/sources/<int:source_id>/hosts")
+@login_required
+def update_source_hosts(source_id):
+    """Administrator hosts win over the feed; an empty list restores the feed."""
+    from integrations.knowledge.people import parse_admin_names, source_hosts
+    row = source_owned(source_id)
+    data = classification_payload({"hosts"})
+    try:
+        names = parse_admin_names(data.get("hosts"), limit=10)
+    except ValueError:
+        return failure("Enter up to 10 host names, one per line, each with letters or digits.")
+    # observed_at feeds the export facts hash: only a real change moves the timestamp.
+    if row.admin_hosts != (list(names) or None):
+        row.admin_hosts, row.hosts_updated_at = list(names) or None, utc_now()
+    db.session.commit()
+    hosts, basis = source_hosts(row)
+    return result(dict(id=row.id, hosts=list(hosts), basis=basis),
+                  location=url_for("workspace.source", source_id=row.id), message="Hosts saved.")
+
+
+@workspace.post("/api/items/<int:item_id>/guests")
+@workspace.post("/items/<int:item_id>/guests")
+@login_required
+def update_item_guests(item_id):
+    """Administrator guests win; an empty list records that there are none."""
+    from integrations.knowledge.people import parse_admin_names
+    row = item_owned(item_id)
+    data = classification_payload({"guests"})
+    try:
+        names = parse_admin_names(data.get("guests"), limit=20)
+    except ValueError:
+        return failure("Enter up to 20 guest names, one per line, each with letters or digits.")
+    if row.admin_guests != list(names):
+        row.admin_guests, row.guests_updated_at = list(names), utc_now()
+    db.session.commit()
+    return result(dict(id=row.id, guests=list(names)),
+                  location=url_for("workspace.item", item_id=row.id), message="Guests saved.")
+
+
+@workspace.post("/api/items/<int:item_id>/guests/reset")
+@workspace.post("/items/<int:item_id>/guests/reset")
+@login_required
+def reset_item_guests(item_id):
+    """Drop the administrator guest list so feed, then inferred, guests apply."""
+    row = item_owned(item_id)
+    classification_payload(set())
+    if row.admin_guests is not None:
+        row.admin_guests, row.guests_updated_at = None, utc_now()
+    db.session.commit()
+    guests = item_people(row)[0]
+    return result(dict(id=row.id, guests=[name for name, _, _ in guests]),
+                  location=url_for("workspace.item", item_id=row.id), message="Guests reset.")
 
 
 @workspace.get("/items/<int:item_id>/transcript")

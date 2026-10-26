@@ -12,6 +12,7 @@ from dateutil import parser as dtparse
 import requests
 
 from config import Settings
+from feed_people import FeedPeople, parse_feed_people
 from feed_resolver import bounded_chunks, fetch_body, http_response, parse_feed
 from ingestion_types import (DiscoveryPage, DownloadedMedia, IngestionError,
     ItemDescriptor, SourceDescriptor, TransientMediaLocator, has_sensitive_query,
@@ -41,7 +42,7 @@ def _duration(value):
         return None
 
 
-def _podcast_entries(source, parsed, feed_url):
+def _podcast_entries(source, parsed, feed_url, people=FeedPeople()):
     """Build safe descriptors; keep acquisition locators inside this boundary."""
     seen = set()
     for entry in parsed.entries:
@@ -76,7 +77,8 @@ def _podcast_entries(source, parsed, feed_url):
             published_at=_publication(entry), media_url=media_url, canonical_url=canonical_url,
             description=entry.get("summary", ""), guid=identity,
             creator_name=entry.get("author"), duration_seconds=_duration(entry.get("itunes_duration")),
-            requires_reacquisition=requires_reacquisition)
+            requires_reacquisition=requires_reacquisition,
+            guests=people.guests_by_guid.get(str(raw_guid).strip(), ()) if raw_guid else ())
         yield descriptor, raw_media
 
 
@@ -101,7 +103,8 @@ def discover_podcast_items(source, settings, session, *, limit=None,
         raise ValueError("invalid discovery cursor") from None
     body, feed_url = fetch_body(source.canonical_url, settings, session)
     parsed = parse_feed(body)
-    items = [descriptor for descriptor, _ in _podcast_entries(source, parsed, feed_url)]
+    people = parse_feed_people(body)
+    items = [descriptor for descriptor, _ in _podcast_entries(source, parsed, feed_url, people)]
     epoch = datetime.min.replace(tzinfo=timezone.utc)
     items.sort(key=lambda item: (item.published_at or epoch, item.external_id), reverse=True)
     if after is not None:
@@ -111,7 +114,7 @@ def discover_podcast_items(source, settings, session, *, limit=None,
     selected = items[offset:offset + limit]
     exhausted = offset + len(selected) >= len(items)
     return DiscoveryPage(items=selected, exhausted=exhausted,
-        next_cursor=None if exhausted else str(offset + len(selected)))
+        next_cursor=None if exhausted else str(offset + len(selected)), source_hosts=people.hosts)
 
 
 def reacquire_podcast_media(source, item_external_id, settings, session) -> TransientMediaLocator:

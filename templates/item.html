@@ -17,6 +17,20 @@
 {% if citations %}<section aria-labelledby="citations-heading"><h2 id="citations-heading">Source timestamps</h2>
 <ul>{% for citation in citations %}<li><a href="{{ citation.url }}" target="_blank" rel="noopener noreferrer">{{ citation.label }}</a></li>{% endfor %}</ul>
 </section>{% endif %}
+{% if people is defined %}<section aria-labelledby="people-heading"><h2 id="people-heading">People</h2>
+<p>Hosts: {% if people.hosts %}{{ people.hosts|join(', ') }}{% else %}none. This item is not exported until its source names a host.{% endif %}</p>
+{% if people.guests %}<ul>{% for guest in people.guests %}<li>{{ guest.name }} · {{ guest.basis }}{% if guest.inferred %} · confidence {{ '%.2f'|format(guest.confidence) }}{% endif %}</li>{% endfor %}</ul>
+{% else %}<p>No guests recorded.</p>{% endif %}
+<form method="post" action="{{ url_for('workspace.update_item_guests', item_id=item.id) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() if config.WTF_CSRF_ENABLED else '' }}">
+  <label for="guests">Guests, one per line. Saving an empty list records that the episode has no guests. Saving replaces feed and inferred guests with this list, even unchanged: feed guests become set by the administrator and the item is exported again.</label>
+  <textarea id="guests" name="guests" rows="3" maxlength="10000">{{ people.guests_text }}</textarea>
+  <button type="submit">Save guests</button>
+</form>
+{% if people.guests_overridden %}<form method="post" action="{{ url_for('workspace.reset_item_guests', item_id=item.id) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() if config.WTF_CSRF_ENABLED else '' }}">
+  <button type="submit">Use feed and inferred guests</button>
+</form>{% endif %}</section>{% endif %}
 {% if memberships %}<section aria-labelledby="membership-heading"><h2 id="membership-heading">Source memberships</h2>
 <ul>{% for source in memberships %}<li><a href="{{ url_for('workspace.source', source_id=source.id) }}">{{ source.name }}</a> · {{ source.source_type }}</li>{% endfor %}</ul></section>{% endif %}
 {% if item.status in ['failed', 'deferred', 'unavailable'] %}

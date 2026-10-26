@@ -37,6 +37,9 @@ def item_projection(item):
     value = {name: getattr(item, name) for name in names}
     value.update(canonical_url=item.canonical_url, remote_media_url=item.remote_media_url,
                  published_at=item.published_at.isoformat() if item.published_at else None)
+    if item.platform == "podcast" and item.guests:
+        # Carried to _accept so a newly created item has its feed guests at once.
+        value["guests"] = list(item.guests)
     return normalized_descriptor(value)
 
 
@@ -126,6 +129,31 @@ class DiscoveryService:
         self.continue_discovery(run_id)
         return run_id
 
+    def _record_feed_hosts(self, source, hosts):
+        """Refresh feed-declared hosts; only an effective change moves the timestamp."""
+        hosts = list(hosts) or None
+        if source.feed_hosts != hosts:
+            source.feed_hosts = hosts
+            if source.admin_hosts is None:
+                source.hosts_updated_at = utc_now()
+
+    def _record_feed_guests(self, items):
+        """Refresh <podcast:person> guests of already-created podcast items.
+
+        Items created by this run take their guests from the candidate
+        descriptor in _accept.
+        """
+        guests = {item.external_id: list(item.guests) or None for item in items if item.platform == "podcast"}
+        if not guests:
+            return
+        rows = self.session.query(ContentItem).filter(
+            ContentItem.platform == "podcast", ContentItem.external_id.in_(list(guests)))
+        for row in rows:
+            if row.feed_guests != guests[row.external_id]:
+                row.feed_guests = guests[row.external_id]
+                if row.admin_guests is None:
+                    row.guests_updated_at = utc_now()
+
     def _stage(self, run, items, unavailable_ids=()):
         for identity in unavailable_ids:
             _, created = self._unique(DiscoveryCandidate,
@@ -141,6 +169,7 @@ class DiscoveryService:
                 run.items_scanned += 1
             elif not candidate.was_available:
                 candidate.descriptor, candidate.was_available = item_projection(item), True
+        self._record_feed_guests(items)
 
     @staticmethod
     def _cursor(cursor):
@@ -251,6 +280,8 @@ class DiscoveryService:
                     self._cancel_disabled_run(run.id)
                 return False
             page = adapter.discover_page(descriptor, run.cursor)
+            if page.source_hosts is not None:
+                self._record_feed_hosts(source, page.source_hosts)
             cursor = self._cursor(page.next_cursor)
             if not page.exhausted and (cursor is None or cursor == run.cursor):
                 raise ValueError("nonadvancing discovery cursor")
@@ -370,6 +401,10 @@ class DiscoveryService:
     def _accept(self, source, candidate):
         values = dict(candidate.descriptor)
         values.pop("requires_reacquisition", None)
+        guests = values.pop("guests", None)
+        if guests and values["platform"] == "podcast":
+            # Existing items are refreshed while staging; this applies only on creation.
+            values.update(feed_guests=list(guests), guests_updated_at=utc_now())
         if values.get("published_at"):
             values["published_at"] = datetime.fromisoformat(values["published_at"])
         values["canonical_url"] = values.get("canonical_url") or source.canonical_url

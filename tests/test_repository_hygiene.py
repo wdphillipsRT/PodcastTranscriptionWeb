@@ -252,12 +252,13 @@ def test_operations_documents_classifier_authentication_and_current_schema():
         "docker compose exec classifier celery -A tasks.celery_app inspect --timeout 5 --destination",
     ):
         assert command in guide
-    assert "0002_commercial_classification" in guide
-    assert "seven-service stack" in guide and "all thirteen table" in guide
-    assert "six-service stack" not in guide and "all eight table" not in guide
+    assert "0003_knowledge_export" in guide
+    assert "seven-service stack" in guide and "all sixteen table" in guide
+    assert "six-service stack" not in guide and "all thirteen table" not in guide
     for table in ("admins", "content_sources", "content_items", "source_items", "backfill_requests",
                   "discovery_runs", "discovery_candidates", "processing_jobs", "classification_revisions",
-                  "classification_blocks", "segment_overrides", "source_classification_rules", "classification_sweeps"):
+                  "classification_blocks", "segment_overrides", "source_classification_rules", "classification_sweeps",
+                  "guest_extractions", "knowledge_export_batches", "knowledge_item_exports"):
         assert f"`{table}`" in guide
     assert "@anthropic-ai/claude-code@2.1.303" in guide
     assert "CLAUDE_CONFIG_HOST_PATH" in guide
@@ -344,3 +345,22 @@ esac
                             text=True, capture_output=True)
     assert (result.returncode == 0) == (expected == 0), result.stderr
     assert ("compose up -d" in log.read_text().splitlines()) == (expected == 0)
+
+
+def test_operations_documents_the_knowledge_exporter():
+    guide = (ROOT / "docs/operations.md").read_text()
+    section = guide[guide.index("## Knowledge intake export"):]
+    section = section[:section.index("\n## ", 1)]
+    for text in ("COMPOSE_PROFILES=knowledge docker compose up -d exporter",
+                 "getent group intake-podcast", "PODCAST_INTAKE_GID",
+                 "flask --app app:create_app knowledge export --since",
+                 "flask --app app:create_app knowledge seed-hosts",
+                 "flask --app app:create_app knowledge status",
+                 "GUEST_EXTRACTION_DAILY_BUDGET_USD", "load_active_learning_projection",
+                 # Enablement order and operator caveats.
+                 "before setting `GUEST_EXTRACTION_ENABLED=true`", "`awaiting_guests=`",
+                 "recreate `beat`, `classifier`, and `exporter` (if it is running)",
+                 "delay classification", "`sequence_exhausted`", "`write_failed`", "`contract_error`",
+                 "`source.uri`"):
+        assert text in section, text
+    assert "knowledge intake" in (ROOT / "README.md").read_text()

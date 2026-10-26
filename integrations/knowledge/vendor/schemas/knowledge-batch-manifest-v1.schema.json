@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema://bezalel/knowledge-batch-manifest/v1",
+  "title": "Knowledge batch manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "batch_id", "producer", "producer_version", "created_at", "record_count", "records_sha256", "blob_count"],
+  "properties": {
+    "schema_version": {"const": "knowledge-batch/v1"},
+    "batch_id": {"type": "string", "pattern": "^(podcast|issachar)-[0-9]{8}-[0-9]{3}(?!\\n)$"},
+    "producer": {"enum": ["podcast", "issachar"]},
+    "producer_version": {"type": "string", "minLength": 1, "maxLength": 100},
+    "created_at": {"type": "string", "format": "date-time"},
+    "record_count": {"type": "integer", "minimum": 1, "maximum": 10000},
+    "records_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}(?!\\n)$"},
+    "blob_count": {"type": "integer", "minimum": 0, "maximum": 10000}
+  }
+}

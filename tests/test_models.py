@@ -75,7 +75,8 @@ def test_schema_replaces_legacy_models(schema):
         "admins", "content_sources", "content_items", "source_items", "discovery_runs",
         "discovery_candidates", "backfill_requests", "processing_jobs",
         "classification_revisions", "classification_blocks", "segment_overrides",
-        "source_classification_rules", "classification_sweeps",
+        "source_classification_rules", "classification_sweeps", "guest_extractions",
+        "knowledge_export_batches", "knowledge_item_exports",
     }
     assert not hasattr(schema, "User")
 
