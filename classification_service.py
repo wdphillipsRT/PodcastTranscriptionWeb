@@ -52,6 +52,18 @@ def key_conflict(category, reason):
     return category == "model_config" and reason == "conflict"
 
 
+def soft_time_limit(error):
+    """Celery's SoftTimeLimitExceeded, matched by name so the service does not import Celery."""
+    return type(error).__name__ == "SoftTimeLimitExceeded"
+
+
+def _soft_time_limit_error():
+    # The block's call may still be generating under its key, which is kept.
+    error = ClassifierError("router_busy", reason="timeout", advance_key=False)
+    error.__cause__ = error.__context__ = None
+    return error
+
+
 SOURCE_SWEEP_RETRY_DELAY_SECONDS = 30
 SOURCE_SWEEP_RETRY_ERRORS = RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}
 _LOCK_NAMESPACE = 0x434C5346
@@ -780,6 +792,8 @@ class ClassificationService:
                 failure = ClassificationServiceError(error.category, advance_key=error.advance_key, reason=error.reason)
             elif isinstance(error, StorageTransientError):
                 failure = ClassificationServiceError("storage_transient")
+            elif soft_time_limit(error):
+                failure = ClassificationServiceError("router_busy", reason="timeout")
             else:
                 failure = ClassificationServiceError("invalid_policy")
             if failure.record:
@@ -805,6 +819,12 @@ class ClassificationService:
                 # A busy router is not a failure: the block waits to be retried as it is.
                 block.state = "pending" if failure.category == "router_busy" else "failed"
                 block.error_category = failure.category
+                token = claim.get("token") if claim else None
+                if (failure.category == "router_busy" and failure.reason in {"rate_limited", "proxy"}
+                        and token is not None and block.request_generation_started_at == token[1]):
+                    # A 429 (or Caddy's 502 with the router down) never reached the router's
+                    # idempotency store, so this claim's send did not start the key's clock.
+                    block.request_generation_started_at = None
                 if failure.advance_key or self._stuck_in_progress(failure, block):
                     # The router may have stored an outcome under the current key and would
                     # replay it forever (or holds the key in progress forever); the next call
@@ -961,8 +981,14 @@ class ClassificationService:
                 result = self.classifier.classify(window, examples=inputs.examples, request_key=request_key)
             except (ClassifierError, StorageError):
                 raise
-            except Exception:
-                _fail("model_config")
+            except Exception as error:
+                if not soft_time_limit(error):
+                    _fail("model_config")
+                busy = True
+            else:
+                busy = False
+            if busy:
+                raise _soft_time_limit_error()
             payload = {"schema": _BLOCK_SCHEMA, "revision_id": revision_id, "block_ordinal": block_ordinal,
                 "input_sha256": input_hash, "decisions": [asdict(d) for d in result.decisions],
                 "classifier": asdict(result.provenance), "cost_microusd": result.total_cost_microusd}

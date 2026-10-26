@@ -960,3 +960,59 @@ def test_only_a_key_conflict_makes_model_config_retryable(env, reason, retryable
     assert (block.state, block.error_category, block.request_generation) == ("failed", "model_config", generation)
     revision = db.session.get(m.ClassificationRevision, revision_id)
     assert (revision.state, revision.error_category) == (revision_state, "model_config")
+
+
+@pytest.mark.parametrize("reason", ["rate_limited", "proxy"])
+def test_a_rejected_send_does_not_start_the_key_clock(env, monkeypatch, reason):
+    # A 429 (or Caddy's 502 with the router down) never reaches the router's idempotency store, so
+    # it must not count as the key's first send: a later 202 for the real first send is not stuck.
+    from classification_service import IN_PROGRESS_SLACK_SECONDS
+    from router_client import READ_MARGIN_SECONDS
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = ClassifierError("router_busy", reason=reason, advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.state, block.request_generation, block.request_generation_started_at) == ("pending", 0, None)
+    later = m.utc_now() + timedelta(seconds=env.settings.CLASSIFIER_TIMEOUT_SECONDS + READ_MARGIN_SECONDS
+                                    + IN_PROGRESS_SLACK_SECONDS + 60)
+    monkeypatch.setattr(env.module, "utc_now", lambda: later)
+    env.classifier.error = ClassifierError("router_busy", reason="in_progress", advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    db.session.refresh(block)
+    assert (block.request_generation, block.request_generation_started_at) == (0, later)
+
+
+def test_a_rejected_send_keeps_an_earlier_real_send_as_the_key_clock(env):
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    env.classifier.error = ClassifierError("router_busy", reason="in_progress", advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    first = block.request_generation_started_at
+    env.classifier.error = ClassifierError("router_busy", reason="rate_limited", advance_key=False)
+    with pytest.raises(env.module.ClassificationServiceError):
+        env.service.run_block(revision_id, 1)
+    db.session.refresh(block)
+    assert first is not None and block.request_generation_started_at == first
+
+
+@pytest.mark.parametrize("where", ["classify", "storage"])
+def test_a_soft_time_limit_in_a_block_is_a_busy_timeout(env, monkeypatch, where):
+    from celery.exceptions import SoftTimeLimitExceeded
+    revision_id = env.service.ensure_revision(env.item.id, "backfill")
+    env.service.prepare_revision(revision_id)
+    if where == "classify":
+        env.classifier.error = SoftTimeLimitExceeded()
+    else:
+        def soft_limit(*args, **kwargs):
+            raise SoftTimeLimitExceeded()
+        monkeypatch.setattr(env.storage, "put_content_addressed", soft_limit)
+    with pytest.raises(env.module.ClassificationServiceError) as caught:
+        env.service.run_block(revision_id, 1)
+    assert (caught.value.category, caught.value.reason, caught.value.advance_key) == ("router_busy", "timeout", False)
+    block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
+    assert (block.state, block.error_category, block.request_generation) == ("pending", "router_busy", 0)

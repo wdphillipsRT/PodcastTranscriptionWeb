@@ -44,16 +44,27 @@ def classification_cli():
 def status():
     import sqlalchemy as sa
     from extensions import db
-    from models import ClassificationRevision, CLASSIFICATION_STATES
+    from datetime import timezone
+    from models import ClassificationBlock, ClassificationRevision, CLASSIFICATION_STATES
     from tasks import _missing_classification_query
     counts = {state: count for state, count in db.session.execute(sa.select(ClassificationRevision.state, sa.func.count())
         .group_by(ClassificationRevision.state))}
     review = db.session.scalar(sa.select(sa.func.count()).select_from(ClassificationRevision)
         .where(ClassificationRevision.review_required.is_(True)))
     missing = db.session.scalar(sa.select(sa.func.count()).select_from(_missing_classification_query().subquery()))
+    # Busy retries never end by design; these show how many wait and since when.
+    busy = db.session.scalar(sa.select(sa.func.count()).select_from(ClassificationRevision).where(
+        ClassificationRevision.state == "retrying", ClassificationRevision.error_category == "router_busy"))
+    sent, updated = db.session.execute(sa.select(sa.func.min(ClassificationBlock.request_generation_started_at),
+        sa.func.min(ClassificationBlock.updated_at)).where(ClassificationBlock.state == "pending",
+        ClassificationBlock.error_category == "router_busy")).one()
     db.session.commit()
+
+    def stamp(value):
+        return "none" if value is None else (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).isoformat()
     click.echo(" ".join(f"{state}={counts.get(state, 0)}" for state in CLASSIFICATION_STATES)
-        + f" review_required={review} missing_current_policy={missing}")
+        + f" review_required={review} missing_current_policy={missing}"
+        + f" router_busy={busy} oldest_busy_key_sent={stamp(sent)} oldest_busy_updated={stamp(updated)}")
 
 
 @classification_cli.command("enqueue-backlog")

@@ -6,6 +6,7 @@ import hashlib
 import logging
 import types
 import socket
+import ssl
 import threading
 import uuid
 
@@ -399,6 +400,46 @@ def test_a_soft_time_limit_is_a_busy_timeout_that_keeps_the_key(fake_router, mon
         monkeypatch.setattr(requests.models.Response, "iter_content", soft_limit)
     error = failure(fake_router)
     assert (error.category, error.reason, error.advance_key) == ("router_busy", "timeout", False)
+    assert error.__context__ is None and error.__cause__ is None
+    assert not token_reachable(error)
+
+
+def _verification_failure():
+    return ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+
+
+def _alert():
+    error = ssl.SSLError(1, "[SSL: TLSV13_ALERT_CERTIFICATE_REQUIRED] tlsv13 alert certificate required")
+    error.reason = "TLSV13_ALERT_CERTIFICATE_REQUIRED"
+    return error
+
+
+def _wrapped(inner):
+    # requests' SSLError wraps urllib3's MaxRetryError, whose reason wraps urllib3's SSLError around the ssl error.
+    import urllib3
+    retry = urllib3.exceptions.MaxRetryError(None, "/v1/model-tasks", urllib3.exceptions.SSLError(inner))
+    return retry
+
+
+@pytest.mark.parametrize("inner, expected", [
+    (_verification_failure, ("model_auth", "tls", True)),
+    (_alert, ("model_auth", "tls", True)),
+    (lambda: ssl.SSLEOFError(8, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol"),
+     ("router_busy", "transport", False)),
+    (lambda: ConnectionResetError(104, "Connection reset by peer"), ("router_busy", "transport", False)),
+    (lambda: ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number"), ("router_busy", "transport", False)),
+])
+@pytest.mark.parametrize("direct", [True, False])
+def test_only_certificate_and_alert_tls_failures_are_auth_errors(fake_router, monkeypatch, inner, expected,  # noqa: F811
+                                                                 direct):
+    import requests
+
+    def handshake_failure(*args, **kwargs):
+        cause = inner()
+        raise requests.exceptions.SSLError(cause if direct else _wrapped(cause))
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", handshake_failure)
+    error = failure(fake_router)
+    assert (error.category, error.reason, error.advance_key) == expected
     assert error.__context__ is None and error.__cause__ is None
     assert not token_reachable(error)
 

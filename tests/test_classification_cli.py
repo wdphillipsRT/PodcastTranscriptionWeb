@@ -121,3 +121,21 @@ def test_auth_smoke_uses_production_adapter_without_private_data_or_artifacts(wo
     else:
         assert result.exit_code == 0, result.output
         assert result.output.strip() == "cli=2.1.303 model=claude-sonnet-5-5 cost_microusd=25"
+
+
+def test_status_shows_busy_revisions_and_the_oldest_busy_block(worker):
+    from router_classifier import ClassifierError
+    from tests.test_classification_tasks import task
+    result = invoke(worker, "status")
+    assert "router_busy=0 oldest_busy_key_sent=none oldest_busy_updated=none" in result.output
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.env.classifier.error = ClassifierError("router_busy", reason="in_progress", advance_key=False)
+    task().run(identity, "block", 1)
+    block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+    sent, updated = block.request_generation_started_at, block.updated_at
+    db.session.commit()
+    result = invoke(worker, "status")
+    assert result.exit_code == 0, result.output
+    assert (f"router_busy=1 oldest_busy_key_sent={sent.isoformat()} oldest_busy_updated={updated.isoformat()}"
+            in result.output)

@@ -190,7 +190,8 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
         values[name] = value
     router_url = _nonempty(environment, "ROUTER_URL", Settings.ROUTER_URL)
     origin_error = "ROUTER_URL must be an https origin without credentials or a path"
-    if not re.fullmatch(r"https://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?/?", router_url):
+    label = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    if not re.fullmatch(rf"https://(?:{label}(?:\.{label})*|\[[0-9A-Fa-f:.]+\])(?::\d{{1,5}})?/?", router_url):
         raise ConfigError(origin_error)  # Also rejects '?', '#', whitespace and userinfo.
     try:
         parsed = urlsplit(router_url)

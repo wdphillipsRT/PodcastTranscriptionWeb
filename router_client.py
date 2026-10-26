@@ -45,6 +45,7 @@ response's prepared request is released before the outcome is examined.
 from dataclasses import dataclass
 import json
 import re
+import ssl
 import uuid
 from urllib.parse import urlsplit
 
@@ -116,6 +117,26 @@ def _fail(category, reason, *, advance_key=True):
     error = RouterError(category, reason=reason, advance_key=advance_key)
     error.__cause__ = error.__context__ = None
     raise error
+
+
+def _authentication_failure(error):
+    """Whether a requests SSLError is a certificate-verification failure or a TLS alert from the peer
+    (for example a rejected or missing client certificate). Anything else during the handshake, such
+    as an EOF or a connection reset, is a transport failure."""
+    pending, seen = [error], set()
+    while pending and len(seen) < 32:
+        value = pending.pop()
+        if not isinstance(value, BaseException) or id(value) in seen:
+            continue
+        seen.add(id(value))
+        if isinstance(value, ssl.SSLCertVerificationError):
+            return True
+        if isinstance(value, ssl.SSLError) and not isinstance(value, (ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+            reason = getattr(value, "reason", None)
+            if (isinstance(reason, str) and "ALERT" in reason.upper()) or "ALERT" in str(value).upper():
+                return True
+        pending.extend([value.__cause__, value.__context__, getattr(value, "reason", None), *value.args])
+    return False
 
 
 def _unexpected(error, otherwise):
@@ -301,8 +322,9 @@ class RouterClient:
                 response = session.post(self.base_url + "/v1/model-tasks", data=data, headers=headers,
                                         timeout=timeout, verify=self.verify, cert=self.cert,
                                         allow_redirects=False, stream=True)
-            except requests.exceptions.SSLError:
-                failure = ("model_auth", "tls", True)
+            except requests.exceptions.SSLError as error:
+                failure = ("model_auth", "tls", True) if _authentication_failure(error) else (
+                    "router_busy", "transport", False)
             except requests.Timeout:
                 failure = ("router_busy", "timeout", False)
             except requests.ConnectionError:
