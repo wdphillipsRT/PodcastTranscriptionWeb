@@ -28,8 +28,9 @@ have a different localhost; they are outside this stack. No tunnel credentials
 or DNS automation are included here. Do not publish the application port on
 all host interfaces: the app trusts one forwarding proxy.
 
-Phase 1 supports ingestion and transcription. Claude learning bundles and
-delivery to Lamad, Ebenezer, and Agent Factory are deferred to later phases.
+Phase 1 supports ingestion and transcription. Editorial knowledge reaches Lamad
+and Ebenezer only through the optional knowledge intake exporter below; Claude
+learning bundles and Agent Factory delivery are deferred to later phases.
 
 ## Filtered learning and delivery inputs
 
@@ -110,6 +111,129 @@ hash-validated canonical transcript and active policy, always with latest
 revision gating. No promotional artifact is stored in the revision, and the
 stored learning projection is not read for this research path. Neither path
 loads the full text artifact as a fallback.
+
+## Knowledge intake export
+
+The optional `exporter` service is the KNOWLEDGE-INTAKE-0001 producer
+`podcast`. Each night at 04:00 UTC it writes new and changed items as batches
+into the Platform spool inbox `/srv/bezalel/intake/podcast/inbox/`, which the
+Platform knowledge intake catalogs and delivers to Lamad and Ebenezer. Every
+batch is validated before publication with the vendored contract oracle and a
+real JSON Schema validator (`integrations/knowledge/vendor/`, pinned by `PIN`).
+
+An item is exported when it is completed, its active classification revision is
+completed, and its classifying source names a host. Each item becomes one
+`podcast.episode` record and one `podcast.segment` record per passage of
+consecutive editorial segments. A segment joins the current passage only while
+the passage stays within 60 seconds (from its first start to the latest segment
+end so far) and 6,000 characters; a single segment is never split, so a
+one-segment passage may exceed either limit. Transcript text is read only
+through `load_active_learning_projection`, so commercials, promotions,
+housekeeping, and uncertain segments never leave the application; a newer
+pending or failed revision postpones the item. Records name the show as
+`source.publisher` (the YouTube channel for videos), set
+`attributes.platform`, and list participants with their basis. A host or guest
+correction, or a new classification revision, emits a new record that
+supersedes the earlier one; record identifiers are never reused. Export state is
+kept in `knowledge_export_batches` and `knowledge_item_exports`.
+
+Hosts come from the feed (`<podcast:person role="host">`, else
+`<itunes:author>`, else `<itunes:owner>`) or the YouTube channel owner, and
+podcast feeds refresh them on every discovery run. The administrator can name
+hosts on the source page; administrator hosts win, and saving an empty list
+restores the feed's. A source without a host is flagged on its page and its
+items are not exported. Seed YouTube sources added before this feature once:
+
+```bash
+docker compose exec web flask --app app:create_app knowledge seed-hosts
+```
+
+Guests come from the administrator's list on the item page, else
+`<podcast:person role="guest">` tags, else (when enabled) a restricted Claude
+extraction over the title and description that runs on the classifier. The
+extraction keeps only names that appear as whole words in the title or, taken
+separately, in the description (compared after NFKC normalisation and case
+folding), stores them as that text spells them, and marks them `inferred` with
+a confidence; inferred guests below 0.5 are shown but not exported. The item
+page's guest form is prefilled only with declared guests (administrator or
+feed), never inferred ones, so saving it unchanged never turns a guess into an
+administrator guest; saving an empty list records that the episode has no
+guests. While extraction is enabled, an item without declared guests waits
+(`awaiting_guests`) until its current title and description have been
+extracted.
+
+Extraction runs every `GUEST_EXTRACTION_INTERVAL_SECONDS` (default and minimum
+3600: configuration validation rejects less, and `celeryconfig` refuses to load
+with it) for up to `GUEST_EXTRACTION_MAX_ITEMS_PER_RUN` items, each call capped
+by `GUEST_EXTRACTION_MAX_BUDGET_USD`. A PostgreSQL advisory lock keeps runs from
+overlapping (a run that finds one active stops as `busy`), and a run starts no
+call that could outlast its 10-minute deadline. Each title and description is
+extracted at most once. A call that times out or returns invalid output
+(including a reported cost above the cap) is recorded as `failed`, charged at
+the per-call cap or its higher reported cost, and never retried for that
+input; the run moves on. `claude_unavailable` (an outage or rate limit) is
+recorded the same way and then stops the run. Authentication, configuration
+(including a missing CLI), and model-mismatch errors stop the run without a
+record. Before each call the run re-reads today's (UTC) recorded spend and stops
+when that spend plus the per-call cap would exceed
+`GUEST_EXTRACTION_DAILY_BUDGET_USD`. Daily spend is therefore at most the daily
+budget, plus one unrecorded call per run that ends in such an environmental
+stop, each capped by the per-call budget (only a call whose reported cost
+exceeds its cap can push recorded spend past the daily budget, and it is
+recorded at that cost). Enable it with `GUEST_EXTRACTION_ENABLED=true` and
+recreate `beat` and `classifier`.
+
+To enable the export after the Platform has created the spool, find the
+numeric GID of `intake-podcast`, set it and `KNOWLEDGE_EXPORT_ENABLED=true` in
+`.env` (with `PODCAST_INTAKE_INBOX_HOST_PATH` if the inbox lives elsewhere),
+then recreate `beat` and start the exporter:
+
+```bash
+getent group intake-podcast
+docker compose up -d --force-recreate beat
+COMPOSE_PROFILES=knowledge docker compose up -d exporter
+docker compose exec exporter flask --app app:create_app knowledge status
+```
+
+Turn `KNOWLEDGE_EXPORT_ENABLED` (the beat schedule) and the `knowledge`
+Compose profile (the `exporter` worker, the only consumer of the `knowledge`
+queue) on and off together. With the schedule on and no exporter, beat queues
+one message a night that waits unconsumed in Redis and is discarded as expired
+(six hours) only when a worker finally receives it. `knowledge status` prints
+batch counts by state, the number of exported items, and the number of sources
+without a host.
+
+The exporter mounts only the inbox, joins `PODCAST_INTAKE_GID`, and writes with
+group read/write so the intake can claim batches. If the export is disabled,
+the inbox is missing, is not a setgid directory of one of the exporter's groups,
+is not writable, or its lock file cannot be opened, or another run holds the
+lock, the run is skipped (`disabled`, `inbox_missing`, `inbox_group`,
+`inbox_unwritable`, `busy`) with a `knowledge_export_skipped` warning and
+nothing is written; transcription and classification never wait on it. Each
+report counts the items it passed over by reason: `unchanged`, `no_host`,
+`publisher_unnamed`, `awaiting_guests`, `projection_unavailable`,
+`changed_during_export`, `too_large`, and `invalid_record` (an item whose
+records fail the contract; it is logged as `knowledge_export_invalid_record`
+and the rest of the batch is still written). A write error marks its batch
+`failed` and the run `failed` (`knowledge_export_failed`), except that a batch
+already renamed into the inbox before the error stays `pending`. At the start
+of every run a `pending` batch found in the inbox becomes `written`; any other
+becomes `abandoned` and its items are exported again. An unexpected error in the
+nightly task is logged as `knowledge_export_failed` with its `error_type`.
+
+To backfill the existing library in ordinary sequenced batches, run the export
+command; `--max-batches` defaults to 20 per run, independent of
+`KNOWLEDGE_EXPORT_MAX_BATCHES_PER_RUN` (default 5), which caps only the
+nightly run:
+
+```bash
+COMPOSE_PROFILES=knowledge docker compose run --rm exporter flask --app app:create_app knowledge export --since 2015-01-01 --until 2026-12-31 --max-batches 20
+```
+
+The window filters on publication date. Without `--since`/`--until` every
+eligible item is a candidate, including undated ones. Repeat until it reports
+`batches=0`. Stop `exporter` with the other writers during restores and
+upgrades (`docker compose stop exporter`).
 
 ## Commercial acceptance, evaluation, and observations
 
@@ -569,11 +693,12 @@ Use no existing application volume, Claude credential directory, or administrato
 Override the classifier's credential bind with a unique private disposable host
 directory (owned by 1000:1000, mode 700), even when testing its unauthenticated
 failure. Never reuse the deployed Claude mount. Verify migration head
-`0002_commercial_classification`, provision a temporary sole admin, and record
-all thirteen table counts: `admins`, `content_sources`, `content_items`,
+`0003_knowledge_export`, provision a temporary sole admin, and record
+all sixteen table counts: `admins`, `content_sources`, `content_items`,
 `source_items`, `backfill_requests`, `discovery_runs`, `discovery_candidates`,
 `processing_jobs`, `classification_revisions`, `classification_blocks`,
-`segment_overrides`, `source_classification_rules`, and `classification_sweeps`
+`segment_overrides`, `source_classification_rules`, `classification_sweeps`,
+`guest_extractions`, `knowledge_export_batches`, and `knowledge_item_exports`
 (plus Alembic's `alembic_version` metadata table). Perform ordinary project
 `down`/`up` without volume deletion, then compare counts. Without Claude
 authentication, confirm only the classifier fails closed and the media/web

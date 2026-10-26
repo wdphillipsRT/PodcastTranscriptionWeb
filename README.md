@@ -19,7 +19,7 @@ YouTube Data API key are required by startup checks.
 
 Phase 1 implements ingestion, transcription, and commercial-segment classification
 with an isolated Claude worker and owner review/corrections. Claude learning bundles and
-delivery to Lamad, Ebenezer, or Agent Factory are deferred to later phases.
+Agent Factory delivery are deferred to later phases.
 Their mandatory filtered-input gateway is implemented in `learning_projection.py`:
 future Phase 2 bundle extraction and Phase 3 publishers must call
 `load_active_learning_projection(session=..., storage=..., item_id=...)` and
@@ -28,7 +28,11 @@ The immutable result contains only exact canonical segments labeled `editorial`;
 commercials, promotions, housekeeping, and `uncertain` segments are ineligible.
 Missing, corrupt, stale, failed, or superseded inputs raise
 `LearningProjectionUnavailable`; there is no full-transcript fallback.
-This gateway does not publish to Lamad, Ebenezer, or Agent Factory.
+The optional `exporter` service is its first consumer: it writes nightly
+KNOWLEDGE-INTAKE-0001 batches of episode and editorial passage records, naming
+each show's hosts and each episode's guests, for the Platform knowledge intake,
+which delivers them to Lamad and Ebenezer. See
+[knowledge intake export](docs/operations.md#knowledge-intake-export).
 
 New bundle construction requires the latest revision by default, including
 when a newer revision is pending, retrying, running, or failed. An already
