@@ -189,14 +189,17 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
             raise ConfigError(f"{name} must be a pinned version")
         values[name] = value
     router_url = _nonempty(environment, "ROUTER_URL", Settings.ROUTER_URL)
-    parsed = urlsplit(router_url)
+    origin_error = "ROUTER_URL must be an https origin without credentials or a path"
+    if not re.fullmatch(r"https://[A-Za-z0-9.\-\[\]:]+(:\d{1,5})?/?", router_url):
+        raise ConfigError(origin_error)  # Also rejects '?', '#', whitespace and userinfo.
     try:
+        parsed = urlsplit(router_url)
         port_valid = parsed.port is None or parsed.port > 0
-    except ValueError:
-        port_valid = False
+    except ValueError:  # e.g. an unclosed IPv6 bracket or an out-of-range port
+        raise ConfigError(origin_error) from None
     if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
             or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or not port_valid):
-        raise ConfigError("ROUTER_URL must be an https origin without credentials or a path")
+        raise ConfigError(origin_error)
     values["ROUTER_URL"] = router_url.rstrip("/")
     model = _nonempty(environment, "ROUTER_EXPECTED_MODEL", Settings.ROUTER_EXPECTED_MODEL)
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}:(?!latest$)[a-z0-9][a-z0-9._-]{0,63}", model):

@@ -1,7 +1,9 @@
 """The router client against an in-process fake router; never the real router."""
 
+import gc
 import hashlib
 import logging
+import types
 import socket
 import uuid
 
@@ -241,6 +243,54 @@ def test_an_oversized_body_is_refused_before_sending(fake_router, monkeypatch): 
     assert failure(fake_router).category == "model_config" and not fake_router.requests
 
 
+_OPAQUE = (type, types.ModuleType, types.FunctionType, types.BuiltinFunctionType, types.MethodType,
+           types.CodeType, types.FrameType)
+
+
+def _children(value):
+    if isinstance(value, dict):
+        return [*value.keys(), *value.values()]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    own = getattr(value, "__dict__", None)
+    children = []
+    for referent in gc.get_referents(value):
+        children.extend(referent.values() if referent is own and isinstance(own, dict) else [referent])
+    return children
+
+
+def token_reachable(error, depth=6):
+    """Whether the token is reachable from any client frame of the traceback, following references.
+
+    Frames in this test module are skipped: they legitimately hold the fake router, which keeps the
+    requests it received. Object attributes count as one hop, so a response's request headers are
+    response -> request -> headers -> store -> (name, value) -> value.
+    """
+    needle, roots, traceback = TOKEN, [], error.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_filename != __file__:
+            roots.extend(traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+    roots.extend(vars(error).values())
+    seen, level = set(), roots
+    for _ in range(depth + 1):
+        following = []
+        for value in level:
+            if id(value) in seen or isinstance(value, _OPAQUE):
+                continue
+            seen.add(id(value))
+            if isinstance(value, str):
+                if needle in value:
+                    return True
+            elif isinstance(value, (bytes, bytearray)):
+                if needle.encode() in value:
+                    return True
+            elif not isinstance(value, (int, float, bool, type(None))):
+                following.extend(_children(value))
+        level = following
+    return False
+
+
 def frame_values(error):
     values, traceback = [], error.__traceback__
     while traceback is not None:
@@ -275,6 +325,54 @@ def test_transport_failures_carry_no_exception_chain_or_token(fake_router, scena
         error = failure(fake_router)
     assert error.__context__ is None and error.__cause__ is None
     assert TOKEN not in frame_values(error)
+
+
+@pytest.mark.parametrize("scenario", ["busy_503", "mismatch", "malformed_200", "missing_output", "timeout",
+                                      "adapter_type_error", "read_type_error"])
+def test_no_reference_from_a_client_frame_reaches_the_token(fake_router, monkeypatch, scenario):  # noqa: F811
+    import requests
+    options = {}
+    if scenario == "busy_503":
+        fake_router.reply(503, FakeRouter.error("MODEL_NO_ELIGIBLE_CANDIDATE"))
+    elif scenario == "mismatch":
+        fake_router.model = "qwen3:8b"
+    elif scenario == "malformed_200":
+        fake_router.reply(200, b"not json")
+    elif scenario == "missing_output":
+        fake_router.reply(200, {"status": "succeeded", "selected_model": MODEL})
+    elif scenario == "timeout":
+        fake_router.delay, options = 1.0, {"read_timeout": 0.2}
+    elif scenario == "adapter_type_error":
+        def broken_send(self, request, **kwargs):
+            raise TypeError("adapter bug")
+        monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", broken_send)
+    else:
+        def broken_iter(self, *args, **kwargs):
+            raise TypeError("decoder bug")
+        monkeypatch.setattr(requests.models.Response, "iter_content", broken_iter)
+    error = failure(fake_router, **options)
+    expected = {"adapter_type_error": ("model_config", "refused"),
+                "read_type_error": ("router_busy", "transport")}.get(scenario)
+    if expected:
+        assert (error.category, error.reason) == expected
+    assert error.__context__ is None and error.__cause__ is None
+    assert not token_reachable(error)
+
+
+def test_the_reference_walk_finds_a_token_held_by_a_response(fake_router):  # noqa: F811
+    import requests
+    session = requests.Session()
+    response = session.post(fake_router.url + "/v1/model-tasks", data=b"{}",
+                            headers={"Authorization": f"Bearer {TOKEN}"})
+    try:
+        raise RouterError("router_busy")
+    except RouterError as error:
+        held = error
+    held.__traceback__ = None
+    holder = types.SimpleNamespace(response=response)
+    held.holder = holder
+    assert token_reachable(held)
+    session.close()
 
 
 def test_environment_proxies_are_ignored(fake_router, monkeypatch):  # noqa: F811

@@ -257,6 +257,8 @@ def test_router_url_trailing_slash_is_dropped(valid_environment):
     ("ROUTER_URL", "http://192.168.68.200:18443"), ("ROUTER_URL", "https://user:secret@192.168.68.200:18443"),
     ("ROUTER_URL", "https://192.168.68.200:18443/v1"), ("ROUTER_URL", "https://192.168.68.200:18443?x=1"),
     ("ROUTER_URL", "https://192.168.68.200:99999"), ("ROUTER_URL", ""),
+    ("ROUTER_URL", "https://host?"), ("ROUTER_URL", "https://host#"), ("ROUTER_URL", "https://ho st"),
+    ("ROUTER_URL", "https://[::1"), ("ROUTER_URL", "https://host\t:8443"), ("ROUTER_URL", "https://host;x"),
     ("ROUTER_EXPECTED_MODEL", "bonsai2"), ("ROUTER_EXPECTED_MODEL", "bonsai2:latest"),
     ("ROUTER_EXPECTED_MODEL", "Bonsai2:27b"),
     ("ROUTER_TOKEN_FILE", "router/token"), ("ROUTER_CA_FILE", "/router/../etc/ca.crt"),

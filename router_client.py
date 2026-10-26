@@ -32,10 +32,12 @@ uses it where the category alone is not enough: a key whose 202 `in_progress`
 persists past the call's own time bound is stuck (the router restarted
 mid-generation and never expires in-progress keys), so the caller advances it.
 
-No RouterError carries an exception chain: `__cause__` and `__context__` are
-None, because a requests exception holds the prepared request, whose headers
-include the bearer token. The token is also dropped from the call's frame as
-soon as the request has been sent.
+A RouterError raised by this client itself carries no exception chain
+(`__cause__` and `__context__` are None), because a requests exception holds the
+prepared request, whose headers include the bearer token. Any unexpected
+exception from requests is mapped to a RouterError the same way. The token is
+dropped from the call's frame as soon as the request has been sent, and the
+response's prepared request is released before the outcome is examined.
 """
 
 from dataclasses import dataclass
@@ -283,7 +285,7 @@ class RouterClient:
                    "Content-Type": "application/json", "Accept": "application/json"}
         timeout = (CONNECT_TIMEOUT_SECONDS, self.read_timeout or deadline + READ_MARGIN_SECONDS)
         session = self._session()
-        response, failure, status, raw = None, None, None, None
+        response, failure, status, raw, replayed = None, None, None, None, False
         try:
             try:
                 response = session.post(self.base_url + "/v1/model-tasks", data=data, headers=headers,
@@ -295,36 +297,40 @@ class RouterClient:
                 failure = ("router_busy", "timeout", False)
             except requests.ConnectionError:
                 failure = ("router_busy", "transport", False)
-            except (requests.RequestException, OSError, ValueError):
+            except Exception:  # Any other requests or adapter failure: the request was not sent as built.
                 failure = ("model_config", "refused", True)
             finally:
                 del headers  # The token leaves this frame as soon as the request is sent.
             if response is not None:
                 try:
                     status = response.status_code
+                    replayed = response.headers.get("Idempotent-Replayed") == "true"
                     raw = _read(response)
                 except (requests.RequestException, OSError):
                     failure = ("router_busy", "transport", False)
-                except ValueError:
+                except ValueError:  # Oversized response.
                     failure = ("model_invalid_output", "malformed_output", True)
+                except Exception:  # Anything else while reading the body.
+                    failure = ("router_busy", "transport", False)
                 finally:
                     response.close()
+                    response.request = None  # The prepared request holds the Authorization header.
+                    response = None
         finally:
             session.close()
         if failure is not None:
             category, reason, advance_key = failure
             _fail(category, reason, advance_key=advance_key)
-        return self._outcome(status, _json_object(raw), response.headers)
+        return self._outcome(status, _json_object(raw), replayed)
 
-    def _outcome(self, status, body, headers):
+    def _outcome(self, status, body, replayed):
         if status == 200:
             if (not isinstance(body, dict) or body.get("status") != "succeeded"
                     or not isinstance(body.get("selected_model"), str) or "parsed_output" not in body):
                 _fail("model_invalid_output", "malformed_output")
             if body["selected_model"] != self.expected_model:
                 _fail("model_mismatch", "mismatch")
-            return RouterResult(body["parsed_output"], body["selected_model"], _usage(body.get("usage")),
-                                headers.get("Idempotent-Replayed") == "true")
+            return RouterResult(body["parsed_output"], body["selected_model"], _usage(body.get("usage")), replayed)
         code = _error_code(body)
         if status == 202:
             _fail("router_busy", "in_progress", advance_key=False)
