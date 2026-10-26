@@ -76,26 +76,31 @@ def test_commands_named_queues_beat_and_only_bounded_worker_tmpfs(compose):
     assert services["web"]["command"][-1] == "app:create_app()"
 
 
-def test_classifier_has_exclusive_credentials_queue_and_bounded_tmpfs(compose):
+def test_classifier_has_exclusive_router_credentials_queue_and_bounded_tmpfs(compose):
     services = compose["services"]
-    classifier = services.get("classifier", {})
-    assert classifier.get("entrypoint") == ["/app/scripts/start-classifier.sh"]
+    classifier = services["classifier"]
+    assert classifier["entrypoint"] == ["/app/scripts/start-classifier.sh"]
     assert classifier["command"] == [
         "celery", "-A", "tasks.celery_app", "worker", "--loglevel=info",
         "--queues", "classification", "--concurrency", "1", "--hostname", "classifier@%h",
     ]
-    assert classifier["environment"] == {
-        "CLAUDE_CONFIG_DIR": "/claude-config", "DISABLE_UPDATES": "1",
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-    }
-    assert classifier["volumes"] == ["${CLAUDE_CONFIG_HOST_PATH:-./.runtime/claude}:/claude-config"]
+    assert "environment" not in classifier
+    assert classifier["volumes"] == [{"type": "bind", "source": "${ROUTER_CREDENTIALS_HOST_PATH:-./.runtime/router}",
+                                      "target": "/router", "read_only": True, "bind": {"create_host_path": False}}]
     assert classifier["tmpfs"] == ["/tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1770"]
     for name, service in services.items():
         if name != "classifier":
             assert "classification" not in repr(service.get("command", []))
-            assert not service.get("environment", {}).get("CLAUDE_CONFIG_DIR")
-            assert "claude" not in repr(service.get("volumes", [])).lower()
+            assert "router" not in repr(service.get("volumes", []))
             assert "classifier" not in service.get("depends_on", {})
+    assert "claude" not in repr(compose).lower()
+
+
+def test_the_default_network_is_pinned_to_the_firewalled_podcast_subnet(compose):
+    assert compose["networks"] == {"default": {"ipam": {"config": [
+        {"subnet": "192.168.144.0/20", "gateway": "192.168.144.1"}]}}}
+    for service in compose["services"].values():
+        assert "networks" not in service and service.get("network_mode") is None
 
 
 def test_deployment_has_no_prohibited_services_credentials_or_host_mounts(compose):
@@ -130,17 +135,21 @@ def test_image_uses_exact_deno_stage_nonroot_owned_copy_and_minimal_apt():
     assert "build-essential" not in dockerfile and "curl" not in dockerfile
 
 
-def test_image_copies_only_pinned_claude_and_node_into_final_nonroot_runtime():
+def test_image_carries_no_claude_cli_node_or_package_manager():
     dockerfile = (ROOT / "Dockerfile").read_text()
-    assert "FROM node:22-bookworm-slim AS claude" in dockerfile
-    builder, runtime = dockerfile.split("FROM python:3.11-slim", 1)
-    assert re.search(r"npm install --global @anthropic-ai/claude-code@2\.1\.303(?:\s|$)", builder)
-    assert "COPY --from=claude /usr/local/bin/node /usr/local/bin/node" in runtime
-    assert "COPY --from=claude /usr/local/lib/node_modules/@anthropic-ai/claude-code /usr/local/lib/node_modules/@anthropic-ai/claude-code" in runtime
-    assert "ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude" in runtime
-    assert not re.search(r"\b(?:npm|npx|corepack)\b", runtime)
-    assert "DISABLE_UPDATES=1" in runtime
-    assert [line for line in runtime.splitlines() if line.startswith("USER ")] == ["USER 1000:1000"]
+    assert "@anthropic-ai" not in dockerfile and "FROM node" not in dockerfile and "claude-code" not in dockerfile
+    assert not re.search(r"\b(?:npm|npx|corepack)\b", dockerfile)
+    assert "RUN test ! -e /usr/local/bin/claude && test ! -e /usr/local/bin/node" in dockerfile
+    assert [line for line in dockerfile.splitlines() if line.startswith("USER ")] == ["USER 1000:1000"]
+
+
+def test_env_example_names_router_settings_and_no_retired_one():
+    from config import RETIRED_SETTINGS
+    keys = {line.split("=", 1)[0] for line in (ROOT / ".env.example").read_text().splitlines()
+            if "=" in line and not line.startswith("#")}
+    assert {"ROUTER_URL", "ROUTER_EXPECTED_MODEL", "CLASSIFIER_TIMEOUT_SECONDS",
+            "GUEST_EXTRACTION_MAX_CALLS_PER_DAY"} <= keys
+    assert not keys & set(RETIRED_SETTINGS) and not any(key.startswith("CLAUDE") for key in keys)
 
 
 def test_direct_python_runtime_and_dev_requirements_are_pinned():
@@ -232,7 +241,7 @@ def test_dockerignore_excludes_sensitive_and_local_material_but_ships_app_assets
     patterns = [line for line in path.read_text().splitlines() if line and not line.startswith("#")]
     def excluded(name):
         return any(fnmatch.fnmatch(name, pattern) or name.startswith(pattern.rstrip("/") + "/") for pattern in patterns)
-    for name in (".env", ".env.prod", ".aws/credentials", ".runtime/claude/config.json", "credentials.json", "secret.pem", ".git/config", ".worktrees/other/app.py", ".venv/lib/pkg.py", "tests/test_auth.py", ".pytest_cache/v/cache", "__pycache__/app.pyc", "data/database.sqlite", ".superpowers/sdd/task.md"):
+    for name in (".env", ".env.prod", ".aws/credentials", ".runtime/router/client.key", "credentials.json", "secret.pem", ".git/config", ".worktrees/other/app.py", ".venv/lib/pkg.py", "tests/test_auth.py", ".pytest_cache/v/cache", "__pycache__/app.pyc", "data/database.sqlite", ".superpowers/sdd/task.md"):
         assert excluded(name), name
     for name in ("migrations/env.py", "migrations/versions/0001_media_foundation.py", "templates/index.html", "static/app.css", "scripts/start-web.sh", "scripts/start-worker.sh", "scripts/start-beat.sh", "scripts/start-classifier.sh"):
         assert not excluded(name), name

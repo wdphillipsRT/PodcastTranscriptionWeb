@@ -233,8 +233,8 @@ def test_backup_files_are_ignored_by_git_and_docker():
     assert "backups" in patterns and "*.dump" in patterns
 
 
-def test_claude_runtime_credentials_are_ignored_by_git_and_docker():
-    paths = (".runtime/claude/.credentials.json", ".runtime/claude/settings.json", ".runtime/other/private")
+def test_router_credentials_are_ignored_by_git_and_docker():
+    paths = (".runtime/router/token", ".runtime/router/client.key", ".runtime/other/private")
     checked = subprocess.run(["git", "check-ignore", "--no-index", "--stdin"],
                              input="\n".join(paths) + "\n", cwd=ROOT,
                              text=True, capture_output=True, check=False)
