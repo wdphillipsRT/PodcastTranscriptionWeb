@@ -53,7 +53,7 @@ def test_backfill_respects_the_batch_cap(cli):
     assert result.output.strip() == "status=completed reason=- batches=1 items=1 records=2"
 
 
-@pytest.mark.parametrize("args", [("--since", "2026-13-01"), ("--until", "yesterday"), ("--max-batches", "0"),
+@pytest.mark.parametrize("args", [("--since", "2026-13-01"), ("--until", "yesterday"), ("--since", "2026-W01-1"), ("--until", "9999-12-31"), ("--max-batches", "0"),
                                   ("--max-batches", "1000"), ("--since", "2026-02-01", "--until", "2026-01-01")])
 def test_invalid_options_fail_without_echoing_input(cli, args):
     result = invoke(cli, "export", *args)

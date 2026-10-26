@@ -2,6 +2,7 @@
 
 from collections import Counter
 from functools import wraps
+import re
 
 import click
 from flask.cli import with_appcontext
@@ -66,9 +67,13 @@ def _date(value):
     if value is None:
         return None
     try:
-        if not isinstance(value, str) or len(value) != 10:
+        # fromisoformat also takes week dates (2026-W01-1); the window end adds a day.
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
             raise ValueError
-        return date.fromisoformat(value)
+        parsed = date.fromisoformat(value)
+        if parsed == date.max:
+            raise ValueError
+        return parsed
     except ValueError:
         raise click.ClickException("Dates must be YYYY-MM-DD") from None
 
