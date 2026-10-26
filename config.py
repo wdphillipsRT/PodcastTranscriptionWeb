@@ -58,6 +58,15 @@ class Settings:
     CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD: Decimal = Decimal("5.00")
     CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS: int = 7200
     CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES: int = 2_097_152
+    ROUTER_URL: str = "https://192.168.68.200:18443"
+    ROUTER_EXPECTED_MODEL: str = "bonsai2:27b-pq2_0"
+    ROUTER_TOKEN_FILE: str = "/router/token"
+    ROUTER_CA_FILE: str = "/router/router-ca.crt"
+    ROUTER_CLIENT_CERT_FILE: str = "/router/client.crt"
+    ROUTER_CLIENT_KEY_FILE: str = "/router/client.key"
+    CLASSIFIER_TIMEOUT_SECONDS: int = 540
+    CLASSIFIER_MAX_REVISION_SECONDS: int = 14_400
+    CLASSIFIER_MAX_OUTPUT_BYTES: int = 2_097_152
     CLASSIFICATION_ENABLED: bool = False
     CLASSIFICATION_RECONCILE_INTERVAL_SECONDS: int = 300
     CLASSIFICATION_RECONCILE_BATCH_SIZE: int = 100
@@ -68,6 +77,7 @@ class Settings:
     GUEST_EXTRACTION_DAILY_BUDGET_USD: Decimal = Decimal("1.00")
     GUEST_EXTRACTION_MAX_ITEMS_PER_RUN: int = 25
     GUEST_EXTRACTION_INTERVAL_SECONDS: int = 3600
+    GUEST_EXTRACTION_MAX_CALLS_PER_DAY: int = 200
     KNOWLEDGE_EXPORT_ENABLED: bool = False
     KNOWLEDGE_EXPORT_INBOX: str = "/spool/podcast/inbox"
     KNOWLEDGE_EXPORT_MAX_BATCHES_PER_RUN: int = 5
@@ -178,6 +188,33 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
         if not re.fullmatch(pattern, value):
             raise ConfigError(f"{name} must be a pinned version")
         values[name] = value
+    router_url = _nonempty(environment, "ROUTER_URL", Settings.ROUTER_URL)
+    parsed = urlsplit(router_url)
+    try:
+        port_valid = parsed.port is None or parsed.port > 0
+    except ValueError:
+        port_valid = False
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or not port_valid):
+        raise ConfigError("ROUTER_URL must be an https origin without credentials or a path")
+    values["ROUTER_URL"] = router_url.rstrip("/")
+    model = _nonempty(environment, "ROUTER_EXPECTED_MODEL", Settings.ROUTER_EXPECTED_MODEL)
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}:(?!latest$)[a-z0-9][a-z0-9._-]{0,63}", model):
+        raise ConfigError("ROUTER_EXPECTED_MODEL must be a pinned model tag")
+    values["ROUTER_EXPECTED_MODEL"] = model
+    for name in ("ROUTER_TOKEN_FILE", "ROUTER_CA_FILE", "ROUTER_CLIENT_CERT_FILE", "ROUTER_CLIENT_KEY_FILE"):
+        path = _nonempty(environment, name, getattr(Settings, name))
+        if not path.startswith("/") or "\x00" in path or "/../" in path + "/":
+            raise ConfigError(f"{name} must be an absolute path")
+        values[name] = path
+    if not 5 <= values["CLASSIFIER_TIMEOUT_SECONDS"] <= 900:
+        raise ConfigError("CLASSIFIER_TIMEOUT_SECONDS must be between 5 and 900")
+    if values["CLASSIFIER_MAX_REVISION_SECONDS"] < values["CLASSIFIER_TIMEOUT_SECONDS"]:
+        raise ConfigError("CLASSIFIER_MAX_REVISION_SECONDS must cover the per-call timeout")
+    if values["CLASSIFIER_MAX_OUTPUT_BYTES"] > 2_097_152:
+        raise ConfigError("CLASSIFIER_MAX_OUTPUT_BYTES must not exceed 2097152")
+    if values["GUEST_EXTRACTION_MAX_CALLS_PER_DAY"] > 2400:
+        raise ConfigError("GUEST_EXTRACTION_MAX_CALLS_PER_DAY must not exceed 2400")
     enabled = environment.get("CLASSIFICATION_ENABLED", "false").strip().lower()
     if enabled not in {"true", "false"}:
         raise ConfigError("CLASSIFICATION_ENABLED must be true or false")

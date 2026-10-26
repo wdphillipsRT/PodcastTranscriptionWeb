@@ -304,3 +304,17 @@ def test_the_context_estimate_matches_the_pinned_router_formula():
         provider_messages(messages, SCHEMA)) + 8192
     assert estimated_context_tokens(messages[1:], SCHEMA, 64) == estimate_tokens(
         provider_messages(messages[1:], SCHEMA)) + 64
+
+
+def test_from_settings_uses_the_configured_router_and_credential_paths():
+    from config import load_settings
+    settings = load_settings({"SECRET_KEY": "test-only-key-do-not-use-in-production-" + "s" * 32,
+                              "DATABASE_URL": "postgresql+psycopg2://podcasts:test@postgres:5432/podcasts",
+                              "REDIS_URL": "redis://redis:6379/0", "AWS_REGION": "us-east-1",
+                              "AWS_S3_BUCKET_NAME": "podcast-transcriptions-web-2025",
+                              "YOUTUBE_API_KEY": "test-only-youtube-key",
+                              "ROUTER_URL": "https://router.internal:8443"})
+    built = RouterClient.from_settings(settings)
+    assert (built.base_url, built.token_file, built.expected_model, built.verify, built.cert) == (
+        "https://router.internal:8443", "/router/token", "bonsai2:27b-pq2_0", "/router/router-ca.crt",
+        ("/router/client.crt", "/router/client.key"))

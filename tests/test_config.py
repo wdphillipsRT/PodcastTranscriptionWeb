@@ -235,3 +235,37 @@ def test_classifier_revision_limits_cover_one_call(valid_environment, name, valu
     valid_environment[name] = value
     with pytest.raises(ConfigError, match=match):
         load_settings(valid_environment)
+
+
+def test_router_defaults(valid_environment):
+    settings = load_settings(valid_environment)
+    assert (settings.ROUTER_URL, settings.ROUTER_EXPECTED_MODEL) == ("https://192.168.68.200:18443", "bonsai2:27b-pq2_0")
+    assert (settings.ROUTER_TOKEN_FILE, settings.ROUTER_CA_FILE, settings.ROUTER_CLIENT_CERT_FILE,
+            settings.ROUTER_CLIENT_KEY_FILE) == ("/router/token", "/router/router-ca.crt", "/router/client.crt",
+                                                 "/router/client.key")
+    assert (settings.CLASSIFIER_TIMEOUT_SECONDS, settings.CLASSIFIER_MAX_REVISION_SECONDS,
+            settings.CLASSIFIER_MAX_OUTPUT_BYTES, settings.GUEST_EXTRACTION_MAX_CALLS_PER_DAY) == (
+        540, 14_400, 2_097_152, 200)
+
+
+def test_router_url_trailing_slash_is_dropped(valid_environment):
+    valid_environment["ROUTER_URL"] = "https://router.internal:8443/"
+    assert load_settings(valid_environment).ROUTER_URL == "https://router.internal:8443"
+
+
+@pytest.mark.parametrize("name,value", [
+    ("ROUTER_URL", "http://192.168.68.200:18443"), ("ROUTER_URL", "https://user:secret@192.168.68.200:18443"),
+    ("ROUTER_URL", "https://192.168.68.200:18443/v1"), ("ROUTER_URL", "https://192.168.68.200:18443?x=1"),
+    ("ROUTER_URL", "https://192.168.68.200:99999"), ("ROUTER_URL", ""),
+    ("ROUTER_EXPECTED_MODEL", "bonsai2"), ("ROUTER_EXPECTED_MODEL", "bonsai2:latest"),
+    ("ROUTER_EXPECTED_MODEL", "Bonsai2:27b"),
+    ("ROUTER_TOKEN_FILE", "router/token"), ("ROUTER_CA_FILE", "/router/../etc/ca.crt"),
+    ("ROUTER_CLIENT_CERT_FILE", ""), ("ROUTER_CLIENT_KEY_FILE", "relative.key"),
+    ("CLASSIFIER_TIMEOUT_SECONDS", "4"), ("CLASSIFIER_TIMEOUT_SECONDS", "901"),
+    ("CLASSIFIER_MAX_REVISION_SECONDS", "539"), ("CLASSIFIER_MAX_OUTPUT_BYTES", "2097153"),
+    ("GUEST_EXTRACTION_MAX_CALLS_PER_DAY", "2401"), ("GUEST_EXTRACTION_MAX_CALLS_PER_DAY", "0"),
+])
+def test_router_settings_are_validated(valid_environment, name, value):
+    valid_environment[name] = value
+    with pytest.raises(ConfigError, match=name):
+        load_settings(valid_environment)
