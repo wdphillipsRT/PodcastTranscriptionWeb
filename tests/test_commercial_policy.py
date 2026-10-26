@@ -307,3 +307,15 @@ def test_policy_rejects_duration_that_overflows_bounded_milliseconds(sample):
         last_segment_id=segment.id, start=segment.start, end=segment.end)
     with pytest.raises(ValueError):
         policy_for(sample, transcript=transcript, classifications=[classification])
+
+
+def test_model_is_a_decision_source_and_claude_era_artifacts_stay_valid():
+    from commercial_policy import DECISION_SOURCES, PolicyValidationError
+    identity = "seg-000001-" + "a" * 16
+    assert DECISION_SOURCES[:2] == ("claude", "model")
+    for source in ("claude", "model"):
+        ClassificationRange(identity, identity, 0.0, 1.0, "editorial", True, 0.9, ("substantive_content",), (),
+                            source, (), None)
+    with pytest.raises(PolicyValidationError):
+        ClassificationRange(identity, identity, 0.0, 1.0, "editorial", True, 0.9, ("substantive_content",), (),
+                            "router", (), None)

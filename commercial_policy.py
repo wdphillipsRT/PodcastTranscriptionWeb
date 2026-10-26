@@ -36,7 +36,8 @@ REASON_CODES = ("substantive_content", "sponsor_transition", "return_to_program"
 SIGNAL_CODES = ("sponsor_transition", "return_to_program", "purchase_instruction",
                 "discount_or_affiliate", "promotional_url", "creator_offer",
                 "other_show_promo", "routine_housekeeping", "repeated_block")
-DECISION_SOURCES = ("claude", "exact_override", "source_rule", "uncertain_threshold")
+# "claude" stays valid for artifacts written before the Platform Model Router.
+DECISION_SOURCES = ("claude", "model", "exact_override", "source_rule", "uncertain_threshold")
 MAX_INTEGER = 2**63 - 1
 MAX_RULE_IDS = 100
 

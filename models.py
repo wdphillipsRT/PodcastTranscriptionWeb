@@ -494,6 +494,10 @@ class ClassificationBlock(Timestamps, db.Model):
     ordinal = db.Column(db.Integer, nullable=False)
     state = db.Column(db.String(32), nullable=False, default="pending", server_default="pending", index=True)
     attempts = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    # Router idempotency-key generation; advances only after a stored router outcome.
+    request_generation = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+    # When the current generation's key was first sent; a 202 long after it means a stuck key.
+    request_generation_started_at = db.Column(UTCDateTime())
     target_first_segment_id = db.Column(db.String(27), nullable=False)
     target_last_segment_id = db.Column(db.String(27), nullable=False)
     input_sha256 = db.Column(db.String(64), nullable=False)
