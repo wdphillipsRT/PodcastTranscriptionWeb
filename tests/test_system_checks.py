@@ -129,6 +129,9 @@ def test_database_requires_connectivity_and_exact_migration_head(checks, tmp_pat
     assert checks._check_database(config) is False
     with engine.begin() as connection:
         connection.execute(text("UPDATE alembic_version SET version_num = '0002_commercial_classification'"))
+    assert checks._check_database(config) is False
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE alembic_version SET version_num = '0003_knowledge_export'"))
     assert checks._check_database(config) is True
     engine.dispose()
 

@@ -30,6 +30,8 @@ CLASSIFICATION_REASONS = ("transcript_completed", "backfill", "override", "polic
 RULE_SCAN_STATES = ("pending", "running", "completed", "failed")
 CLASSIFICATION_BLOCK_STATES = ("pending", "running", "completed", "failed", "superseded")
 CLASSIFICATION_LABELS = ("editorial", "paid_commercial", "self_promotion", "cross_promotion", "housekeeping", "uncertain")
+GUEST_EXTRACTION_STATES = ("completed", "failed")
+KNOWLEDGE_BATCH_STATES = ("pending", "written", "abandoned", "failed")
 
 
 def utc_now():
@@ -190,6 +192,11 @@ class ContentSource(Timestamps, db.Model):
     last_success_at = db.Column(UTCDateTime())
     next_check_at = db.Column(UTCDateTime())
     error_category = db.Column(db.String(64))
+    # Knowledge export people: lists of display names. The feed (or YouTube
+    # channel owner) seeds feed_hosts; a non-null admin_hosts always wins.
+    feed_hosts = db.Column(db.JSON(none_as_null=True))
+    admin_hosts = db.Column(db.JSON(none_as_null=True))
+    hosts_updated_at = db.Column(UTCDateTime())
     admin = db.relationship("Admin", back_populates="sources")
     items = db.relationship("SourceItem", back_populates="source", cascade="all, delete-orphan", passive_deletes=True)
     discovery_runs = db.relationship("DiscoveryRun", back_populates="source", cascade="all, delete-orphan", passive_deletes=True)
@@ -239,6 +246,11 @@ class ContentItem(Timestamps, db.Model):
     active_classification_revision_id = db.Column(db.Integer, db.ForeignKey(
         "classification_revisions.id", name="fk_content_items_active_classification_revision",
         ondelete="SET NULL", use_alter=True), index=True)
+    # Guests named by <podcast:person role="guest">; a non-null admin_guests
+    # (possibly empty) always wins over feed and inferred guests.
+    feed_guests = db.Column(db.JSON(none_as_null=True))
+    admin_guests = db.Column(db.JSON(none_as_null=True))
+    guests_updated_at = db.Column(UTCDateTime())
     active_classification_revision = db.relationship("ClassificationRevision",
         foreign_keys=[active_classification_revision_id], post_update=True)
     classification_revisions = db.relationship("ClassificationRevision", back_populates="item",
@@ -557,4 +569,74 @@ class ClassificationSweep(Timestamps, db.Model):
         enum_check("state", RULE_SCAN_STATES, "ck_classification_sweeps_state"),
         sa.CheckConstraint("items_scanned >= 0 AND items_queued >= 0", name="ck_classification_sweeps_counters"),
         sa.CheckConstraint("cursor_item_id IS NULL OR cursor_item_id > 0", name="ck_classification_sweeps_cursor"),
+    )
+
+
+class GuestExtraction(db.Model):
+    """One restricted Claude guest extraction over an item's title and description."""
+
+    __tablename__ = "guest_extractions"
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey("content_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    input_sha256 = db.Column(db.String(64), nullable=False)
+    state = db.Column(db.String(16), nullable=False)
+    guests = db.Column(db.JSON(none_as_null=True))
+    error_category = db.Column(db.String(64))
+    model = db.Column(db.String(128), nullable=False)
+    cost_microusd = db.Column(db.BigInteger, nullable=False, default=0, server_default="0")
+    created_at = db.Column(UTCDateTime(), nullable=False, default=utc_now, server_default=sa.func.now(), index=True)
+    item = db.relationship("ContentItem")
+    __table_args__ = (
+        sa.UniqueConstraint("item_id", "input_sha256", name="uq_guest_extractions_item_input"),
+        enum_check("state", GUEST_EXTRACTION_STATES, "ck_guest_extractions_state"),
+        sa.CheckConstraint("cost_microusd >= 0", name="ck_guest_extractions_cost"),
+        sa.CheckConstraint("(state = 'completed' AND guests IS NOT NULL AND error_category IS NULL) OR "
+            "(state = 'failed' AND error_category IS NOT NULL)", name="ck_guest_extractions_outcome"),
+    )
+
+
+class KnowledgeExportBatch(Timestamps, db.Model):
+    """One knowledge batch reserved, then written, into the podcast spool inbox."""
+
+    __tablename__ = "knowledge_export_batches"
+    id = db.Column(db.Integer, primary_key=True)
+    batch_id = db.Column(db.String(32), nullable=False)
+    run_date = db.Column(db.String(8), nullable=False)
+    sequence = db.Column(db.Integer, nullable=False)
+    state = db.Column(db.String(16), nullable=False, default="pending", server_default="pending", index=True)
+    record_count = db.Column(db.Integer, nullable=False)
+    blob_count = db.Column(db.Integer, nullable=False)
+    error_category = db.Column(db.String(64))
+    written_at = db.Column(UTCDateTime())
+    items = db.relationship("KnowledgeItemExport", back_populates="batch", cascade="all, delete-orphan", passive_deletes=True)
+    __table_args__ = (
+        sa.UniqueConstraint("batch_id", name="uq_knowledge_export_batches_batch_id"),
+        sa.UniqueConstraint("run_date", "sequence", name="uq_knowledge_export_batches_run_sequence"),
+        enum_check("state", KNOWLEDGE_BATCH_STATES, "ck_knowledge_export_batches_state"),
+        sa.CheckConstraint("sequence BETWEEN 1 AND 999", name="ck_knowledge_export_batches_sequence"),
+        sa.CheckConstraint("record_count BETWEEN 1 AND 10000 AND blob_count >= 0", name="ck_knowledge_export_batches_counts"),
+    )
+
+
+class KnowledgeItemExport(db.Model):
+    """The episode record (and its passages) one batch carries for one item."""
+
+    __tablename__ = "knowledge_item_exports"
+    id = db.Column(db.Integer, primary_key=True)
+    export_batch_id = db.Column(db.Integer, db.ForeignKey("knowledge_export_batches.id", ondelete="CASCADE"), nullable=False, index=True)
+    item_id = db.Column(db.Integer, db.ForeignKey("content_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    # A historical identifier embedded in record IDs, deliberately not a foreign key.
+    classification_revision_id = db.Column(db.Integer, nullable=False)
+    generation = db.Column(db.Integer, nullable=False)
+    episode_record_id = db.Column(db.String(512), nullable=False)
+    payload_sha256 = db.Column(db.String(64), nullable=False)
+    passage_count = db.Column(db.Integer, nullable=False)
+    supersedes_record_id = db.Column(db.String(512))
+    created_at = db.Column(UTCDateTime(), nullable=False, default=utc_now, server_default=sa.func.now())
+    batch = db.relationship("KnowledgeExportBatch", back_populates="items")
+    item = db.relationship("ContentItem")
+    __table_args__ = (
+        sa.UniqueConstraint("episode_record_id", name="uq_knowledge_item_exports_episode_record_id"),
+        sa.UniqueConstraint("item_id", "classification_revision_id", "generation", name="uq_knowledge_item_exports_generation"),
+        sa.CheckConstraint("generation > 0 AND passage_count >= 0", name="ck_knowledge_item_exports_counts"),
     )
