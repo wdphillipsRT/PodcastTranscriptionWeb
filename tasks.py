@@ -1047,6 +1047,87 @@ def _classification_step(service, revision_id, phase, ordinal=None, *, handoff_s
     return None, None, None
 
 
+RECLASSIFY_QUEUED = "reclassify_queued"
+_RECLASSIFY_RELEASE_LOCK = 0x5243_4C53_0000_0001
+
+
+def _not_held():
+    import sqlalchemy as sa
+    from models import ClassificationRevision
+    return sa.or_(ClassificationRevision.error_category.is_(None),
+                  ClassificationRevision.error_category != RECLASSIFY_QUEUED)
+
+
+def queue_reclassification(*, limit=None):
+    """Hold a new revision for every completed item the current classifier has not classified, newest first.
+
+    Held revisions (`pending` with error category `reclassify_queued`) are never
+    published by the reconciler; `release_reclassification` dispatches them one at a time.
+    """
+    import sqlalchemy as sa
+    from classification_service import ClassificationServiceError
+    from extensions import db
+    from models import ClassificationRevision, ContentItem
+    from router_classifier import expected_provenance
+    service = get_classification_service()
+    provenance = expected_provenance(service.settings)
+    current = sa.exists().where(ClassificationRevision.item_id == ContentItem.id,
+        ClassificationRevision.transcript_sha256 == ContentItem.transcript_sha256,
+        ClassificationRevision.requested_model == provenance.requested_model,
+        ClassificationRevision.classifier_cli_version == provenance.cli_version,
+        ClassificationRevision.prompt_sha256 == provenance.prompt_sha256,
+        ClassificationRevision.state.in_(("pending", "running", "retrying", "completed")))
+    query = (sa.select(ContentItem.id).where(ContentItem.status == "completed", ~current)
+             .order_by(ContentItem.published_at.desc().nulls_last(), ContentItem.id.desc()))
+    if limit is not None:
+        query = query.limit(limit)
+    candidates = list(db.session.scalars(query))
+    db.session.commit()
+    counts = dict(candidates=len(candidates), queued=0, busy=0, failed=0)
+    for item_id in candidates:
+        with _item_lock(item_id) as acquired:
+            if not acquired:
+                counts["busy"] += 1
+                continue
+            try:
+                request = service.prepare_revision_request(item_id)
+                transcript_sha256 = db.session.get(ContentItem, item_id).transcript_sha256
+                key = f"reclassify:{provenance.prompt_sha256[:12]}:{transcript_sha256[:16]}"
+                revision_id = service.ensure_revision(item_id, "policy_upgrade", idempotency_key=key,
+                                                      prepared_request=request, commit=False)
+                revision = db.session.get(ClassificationRevision, revision_id)
+                if (revision.state == "pending" and revision.started_at is None
+                        and revision.error_category == "dispatch_pending"):
+                    revision.error_category = RECLASSIFY_QUEUED
+                db.session.commit()
+                counts["queued"] += 1
+            except ClassificationServiceError:
+                db.session.rollback()
+                counts["failed"] += 1
+    return counts
+
+
+def release_reclassification():
+    """Dispatch the oldest held revision once no other revision is pending, running or retrying."""
+    import sqlalchemy as sa
+    from extensions import db
+    from models import ClassificationRevision
+    if db.engine.dialect.name == "postgresql":
+        db.session.execute(sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": _RECLASSIFY_RELEASE_LOCK})
+    in_flight = db.session.scalar(sa.select(sa.func.count()).select_from(ClassificationRevision).where(
+        ClassificationRevision.state.in_(("pending", "running", "retrying")), _not_held()))
+    held = None if in_flight else db.session.scalar(sa.select(ClassificationRevision).where(
+        ClassificationRevision.state == "pending", ClassificationRevision.error_category == RECLASSIFY_QUEUED)
+        .order_by(ClassificationRevision.id).limit(1))
+    if held is None:
+        db.session.commit()
+        return None
+    held.error_category = "dispatch_pending"
+    dispatch = _revision_dispatch(held)
+    db.session.commit()
+    return dispatch
+
+
 @celery_app.task(name="tasks.classify_item", queue="classification")
 def classify_item(revision_id, phase, block_ordinal=None):
     _classification_phase(revision_id, phase, block_ordinal)
@@ -1071,6 +1152,9 @@ def classify_item(revision_id, phase, block_ordinal=None):
                 return
             dispatch, countdown, category = _classification_step(get_classification_service(), revision_id, phase, block_ordinal)
         _publish_classification(dispatch, countdown=countdown, restore_category=category)
+        if dispatch is None:
+            # A chain ended (completed, failed or superseded): start the next held reclassification.
+            _publish_classification(release_reclassification())
 
 
 def _missing_classification_query():
@@ -1164,7 +1248,7 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
             sa.func.coalesce(ClassificationBlock.heartbeat_at, ClassificationBlock.started_at) < cutoff)
         candidates = list(db.session.execute(sa.select(ClassificationRevision.id, ClassificationRevision.item_id).where(
             ClassificationRevision.id > after_revision_id,
-            ClassificationRevision.state.in_(("pending", "running", "retrying")),
+            ClassificationRevision.state.in_(("pending", "running", "retrying")), _not_held(),
             sa.or_(ClassificationRevision.error_category == "dispatch_pending", stale_running, stale_delivery, stale_block))
             .order_by(ClassificationRevision.id).limit(bound)))
         db.session.commit()
@@ -1213,6 +1297,7 @@ def reconcile_classifications(after_revision_id=0, after_item_id=0):
         counts = reconcile_classification_batch(after_revision_id=after_revision_id, after_item_id=after_item_id)
         if current_app.config["CLASSIFICATION_ENABLED"]:
             _reconcile_source_sweeps()
+            _publish_classification(release_reclassification())
         if (current_app.config["CLASSIFICATION_ENABLED"] and counts["scanned"]
                 == min(current_app.config["CLASSIFICATION_RECONCILE_BATCH_SIZE"], 100)):
             try:

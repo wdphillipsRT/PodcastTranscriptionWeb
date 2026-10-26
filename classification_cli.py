@@ -58,13 +58,16 @@ def status():
     sent, updated = db.session.execute(sa.select(sa.func.min(ClassificationBlock.request_generation_started_at),
         sa.func.min(ClassificationBlock.updated_at)).where(ClassificationBlock.state == "pending",
         ClassificationBlock.error_category == "router_busy")).one()
+    queued = db.session.scalar(sa.select(sa.func.count()).select_from(ClassificationRevision).where(
+        ClassificationRevision.state == "pending", ClassificationRevision.error_category == "reclassify_queued"))
     db.session.commit()
 
     def stamp(value):
         return "none" if value is None else (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).isoformat()
     click.echo(" ".join(f"{state}={counts.get(state, 0)}" for state in CLASSIFICATION_STATES)
         + f" review_required={review} missing_current_policy={missing}"
-        + f" router_busy={busy} oldest_busy_key_sent={stamp(sent)} oldest_busy_updated={stamp(updated)}")
+        + f" router_busy={busy} oldest_busy_key_sent={stamp(sent)} oldest_busy_updated={stamp(updated)}"
+        + f" reclassify_queued={queued}")
 
 
 @classification_cli.command("enqueue-backlog")
@@ -154,6 +157,19 @@ def compare(sample, seed, max_blocks):
     except ClassifierError as error:
         raise click.ClickException(f"Comparison stopped: {error.category}") from None
     click.echo(json.dumps(report, sort_keys=True, indent=2))
+
+
+@classification_cli.command("reclassify-all")
+@click.option("--limit", default=None, metavar="1-100000")
+@_safe
+def reclassify_all(limit):
+    """Queue every completed item without a current-classifier revision, newest first; the classifier works one at a time."""
+    from tasks import _publish_classification, queue_reclassification, release_reclassification
+    bound = _integer(limit, maximum=100_000) if limit is not None else None
+    counts = queue_reclassification(limit=bound)
+    released = _publish_classification(release_reclassification())
+    click.echo(" ".join(f"{name}={counts[name]}" for name in ("candidates", "queued", "busy", "failed"))
+               + f" released={int(released)}")
 
 
 def _wrong_client_cert_smoke(settings, window):
