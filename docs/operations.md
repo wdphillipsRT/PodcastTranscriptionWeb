@@ -651,18 +651,30 @@ without a revision from the current classifier, including episodes already
 exported. Old revisions stay for history. New revisions wait as `pending` with
 error category `reclassify_queued`. The reconciler never publishes them. The
 classifier releases the oldest one whenever no other revision is pending,
-running or retrying. Rerunning queues nothing twice. It prints
-`candidates= queued= busy= failed= released=`.
+running or retrying. Rerunning queues nothing twice: an episode that already
+has its reclassification revision, in any state, is not a candidate, so reruns
+and `--limit` move on to episodes not yet queued. It prints
+`candidates= queued= existing= busy= failed= released=`; `queued` counts only
+revisions newly held by this run, and `existing` counts candidates that were
+classified or queued by something else while the command waited for them.
 
 ```bash
 docker compose exec classifier flask --app app:create_app classification reclassify-all
 docker compose exec classifier flask --app app:create_app classification status
 ```
 
-`status` shows `reclassify_queued=<n>` counting down. While an episode waits,
-the exporter skips it (`projection_unavailable`). When its new revision
+`status` shows `reclassify_queued=<n>` counting down, and `in_flight=<n>`
+with `oldest_in_flight_updated=` for the revisions that are pending, running
+or retrying and not held (normally the one being worked on). While an episode
+waits, the exporter skips it (`projection_unavailable`). When its new revision
 completes, the nightly export sends it as a replacement that supersedes the
 earlier record.
+
+A reclassification that fails (`failed` in `status`) is not queued again by
+`reclassify-all`, and the classifier moves on to the next held episode. Until
+it is retried, that episode cannot be exported (the exporter needs its latest
+revision), while the record already exported for it stays live. Retry it with
+`classification retry --item-id <id>`.
 
 ### Upgrading from Claude classification
 

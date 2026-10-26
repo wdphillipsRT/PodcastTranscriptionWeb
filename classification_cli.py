@@ -58,6 +58,10 @@ def status():
     sent, updated = db.session.execute(sa.select(sa.func.min(ClassificationBlock.request_generation_started_at),
         sa.func.min(ClassificationBlock.updated_at)).where(ClassificationBlock.state == "pending",
         ClassificationBlock.error_category == "router_busy")).one()
+    flight = sa.and_(ClassificationRevision.state.in_(("pending", "running", "retrying")),
+        sa.or_(ClassificationRevision.error_category.is_(None), ClassificationRevision.error_category != "reclassify_queued"))
+    in_flight, oldest_flight = db.session.execute(sa.select(sa.func.count(), sa.func.min(
+        sa.func.coalesce(ClassificationRevision.updated_at, ClassificationRevision.created_at))).where(flight)).one()
     queued = db.session.scalar(sa.select(sa.func.count()).select_from(ClassificationRevision).where(
         ClassificationRevision.state == "pending", ClassificationRevision.error_category == "reclassify_queued"))
     db.session.commit()
@@ -67,7 +71,7 @@ def status():
     click.echo(" ".join(f"{state}={counts.get(state, 0)}" for state in CLASSIFICATION_STATES)
         + f" review_required={review} missing_current_policy={missing}"
         + f" router_busy={busy} oldest_busy_key_sent={stamp(sent)} oldest_busy_updated={stamp(updated)}"
-        + f" reclassify_queued={queued}")
+        + f" in_flight={in_flight} oldest_in_flight_updated={stamp(oldest_flight)} reclassify_queued={queued}")
 
 
 @classification_cli.command("enqueue-backlog")
@@ -168,7 +172,7 @@ def reclassify_all(limit):
     bound = _integer(limit, maximum=100_000) if limit is not None else None
     counts = queue_reclassification(limit=bound)
     released = _publish_classification(release_reclassification())
-    click.echo(" ".join(f"{name}={counts[name]}" for name in ("candidates", "queued", "busy", "failed"))
+    click.echo(" ".join(f"{name}={counts[name]}" for name in ("candidates", "queued", "existing", "busy", "failed"))
                + f" released={int(released)}")
 
 

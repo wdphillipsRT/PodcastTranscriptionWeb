@@ -1039,12 +1039,36 @@ def _classification_step(service, revision_id, phase, ordinal=None, *, handoff_s
     if result.next_dispatch is not None:
         return _prepare_classification_publication(result.next_dispatch), None, None
     if result.state == "superseded" and handoff_superseded:
+        if _active_revision_is_current(service, item_id):
+            # A newer revision from the current classifier already completed for
+            # these inputs (for example while a reclassification was held).
+            db.session.commit()
+            return None, None, None
         identity = service.ensure_revision(item_id, "policy_upgrade")
         current = db.session.get(ClassificationRevision, identity)
         dispatch = _revision_dispatch(current)
         db.session.commit()
         return dispatch, None, None
     return None, None, None
+
+
+def _active_revision_is_current(service, item_id):
+    """The item's active revision completed for its current transcript, inputs and classifier."""
+    from extensions import db
+    from models import ClassificationRevision, ContentItem
+    from router_classifier import expected_provenance
+    item = db.session.get(ContentItem, item_id, populate_existing=True)
+    active = (db.session.get(ClassificationRevision, item.active_classification_revision_id, populate_existing=True)
+              if item is not None and item.active_classification_revision_id else None)
+    provenance = expected_provenance(service.settings)
+    if (active is None or active.state != "completed" or active.transcript_sha256 != item.transcript_sha256
+            or (active.requested_model, active.classifier_cli_version, active.prompt_sha256)
+            != (provenance.requested_model, provenance.cli_version, provenance.prompt_sha256)):
+        db.session.commit()
+        return False
+    db.session.commit()
+    # Overrides or source rules changed since then still need a new revision.
+    return service.prepare_revision_request(item_id)._identity == active.input_identity_sha256
 
 
 RECLASSIFY_QUEUED = "reclassify_queued"
@@ -1063,6 +1087,11 @@ def queue_reclassification(*, limit=None):
 
     Held revisions (`pending` with error category `reclassify_queued`) are never
     published by the reconciler; `release_reclassification` dispatches them one at a time.
+    An item that already has this classifier's reclassification revision for its
+    transcript, in any state, is not a candidate: a failed one is retried with
+    `classification retry --item-id`, so reruns and `--limit` move on to new items.
+    `queued` counts revisions newly held by this run; `existing` counts candidates
+    found already classified or queued once their item lock was held.
     """
     import sqlalchemy as sa
     from classification_service import ClassificationServiceError
@@ -1071,36 +1100,46 @@ def queue_reclassification(*, limit=None):
     from router_classifier import expected_provenance
     service = get_classification_service()
     provenance = expected_provenance(service.settings)
+    prefix = f"reclassify:{provenance.prompt_sha256[:12]}:"
     current = sa.exists().where(ClassificationRevision.item_id == ContentItem.id,
         ClassificationRevision.transcript_sha256 == ContentItem.transcript_sha256,
         ClassificationRevision.requested_model == provenance.requested_model,
         ClassificationRevision.classifier_cli_version == provenance.cli_version,
         ClassificationRevision.prompt_sha256 == provenance.prompt_sha256,
         ClassificationRevision.state.in_(("pending", "running", "retrying", "completed")))
-    query = (sa.select(ContentItem.id).where(ContentItem.status == "completed", ~current)
-             .order_by(ContentItem.published_at.desc().nulls_last(), ContentItem.id.desc()))
+    requested = sa.exists().where(ClassificationRevision.item_id == ContentItem.id,
+        ClassificationRevision.idempotency_key == sa.literal(prefix) + sa.func.substr(ContentItem.transcript_sha256, 1, 16))
+    eligible = sa.select(ContentItem.id).where(ContentItem.status == "completed", ~current, ~requested)
+    query = eligible.order_by(ContentItem.published_at.desc().nulls_last(), ContentItem.id.desc())
     if limit is not None:
         query = query.limit(limit)
     candidates = list(db.session.scalars(query))
     db.session.commit()
-    counts = dict(candidates=len(candidates), queued=0, busy=0, failed=0)
+    counts = dict(candidates=len(candidates), queued=0, existing=0, busy=0, failed=0)
     for item_id in candidates:
         with _item_lock(item_id) as acquired:
             if not acquired:
                 counts["busy"] += 1
                 continue
             try:
+                # Recheck under the lock: the item may have been classified or queued meanwhile.
+                still = db.session.scalar(eligible.where(ContentItem.id == item_id))
+                db.session.commit()
+                if still is None:
+                    counts["existing"] += 1
+                    continue
                 request = service.prepare_revision_request(item_id)
                 transcript_sha256 = db.session.get(ContentItem, item_id).transcript_sha256
-                key = f"reclassify:{provenance.prompt_sha256[:12]}:{transcript_sha256[:16]}"
-                revision_id = service.ensure_revision(item_id, "policy_upgrade", idempotency_key=key,
+                revision_id = service.ensure_revision(item_id, "policy_upgrade",
+                                                      idempotency_key=prefix + transcript_sha256[:16],
                                                       prepared_request=request, commit=False)
                 revision = db.session.get(ClassificationRevision, revision_id)
-                if (revision.state == "pending" and revision.started_at is None
-                        and revision.error_category == "dispatch_pending"):
+                fresh = (revision.state == "pending" and revision.started_at is None
+                         and revision.error_category == "dispatch_pending")
+                if fresh:
                     revision.error_category = RECLASSIFY_QUEUED
                 db.session.commit()
-                counts["queued"] += 1
+                counts["queued" if fresh else "existing"] += 1
             except ClassificationServiceError:
                 db.session.rollback()
                 counts["failed"] += 1
