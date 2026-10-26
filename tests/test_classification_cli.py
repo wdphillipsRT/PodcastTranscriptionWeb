@@ -54,10 +54,8 @@ def test_retry_appends_idempotently_and_can_retry_later_failure(worker):
     assert row.attempts == 5 and row.state == "failed"
 
 
-@pytest.mark.parametrize("arguments", [("auth-smoke",), ("smoke", "--item-id", "1"),
-    ("smoke", "--acknowledge-claude-cost"),
-    ("smoke", "--item-id", "1", "--oldest-completed", "--acknowledge-claude-cost")])
-def test_smokes_require_acknowledgement_and_exactly_one_selection(worker, arguments):
+@pytest.mark.parametrize("arguments", [("smoke",), ("smoke", "--item-id", "1", "--oldest-completed")])
+def test_smoke_requires_exactly_one_selection(worker, arguments):
     result = invoke(worker, *arguments)
     assert result.exit_code != 0 and not worker.env.classifier.calls
 
@@ -67,9 +65,9 @@ def test_one_item_smoke_runs_synchronously_while_disabled(worker, selector):
     add_item(worker.env, external_id="unselected")
     worker.app.config["CLASSIFICATION_ENABLED"] = False
     arguments = ["--item-id", str(worker.env.item.id)] if selector == "item" else ["--oldest-completed"]
-    result = invoke(worker, "smoke", *arguments, "--acknowledge-claude-cost")
+    result = invoke(worker, "smoke", *arguments)
     assert result.exit_code == 0, result.output
-    assert "state=completed" in result.output and "cost_microusd=25" in result.output
+    assert "state=completed" in result.output and "cost" not in result.output
     assert m.ClassificationRevision.query.count() == 1
     assert not worker.sent and len(worker.env.classifier.calls) == 1
     assert worker.env.transcript.segments[0].text not in result.output
@@ -79,48 +77,96 @@ def test_cli_failure_suppresses_private_exception(worker, monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("PRIVATE transcript https://secret.example/key")
     monkeypatch.setattr(worker.env.service, "ensure_revision", fail)
-    result = invoke(worker, "smoke", "--oldest-completed", "--acknowledge-claude-cost")
+    result = invoke(worker, "smoke", "--oldest-completed")
     assert result.exit_code != 0 and "PRIVATE" not in result.output and "https:" not in result.output
 
 
-@pytest.mark.parametrize("failure", [None, "auth", "model"])
-def test_auth_smoke_uses_production_adapter_without_private_data_or_artifacts(worker, monkeypatch, tmp_path, failure):
+from tests.router_fake import FakeRouter, fake_router  # noqa: E402,F401
+
+
+@pytest.mark.parametrize("failure", [None, "auth", "model", "not_ready", "wrong_cert"])
+def test_router_smoke_sends_one_synthetic_request_through_the_production_adapter(worker, fake_router, monkeypatch,
+                                                                                 failure):  # noqa: F811
     import json
-    import os
-    import claude_classifier as adapter
-    from tests.test_claude_classifier import PipeChild
-    calls, children = [], []
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-    worker.app.config["CLASSIFICATION_ENABLED"] = False
-    def factory(argv, **kwargs):
-        calls.append((argv, kwargs))
-        output = {"structured_output": {"ranges": [{"first_segment_id": "seg-000001-aaaaaaaaaaaaaaaa",
-            "last_segment_id": "seg-000001-aaaaaaaaaaaaaaaa", "label": "editorial", "confidence": 1,
-            "reason_codes": ["substantive_content"]}]}, "total_cost_usd": .000025,
-            "modelUsage": {"wrong-model" if failure == "model" else "claude-sonnet-5-5": {}}}
-        child = PipeChild(json.dumps(output).encode(), stderr=b"OAuth private credential" if failure == "auth" else b"",
-            returncode=1 if failure == "auth" else 0)
-        children.append(child)
-        return child
-    monkeypatch.setattr(os, "killpg", lambda *args: [child.killed.set() for child in children])
-    original = adapter.ClaudeClassifier.__init__
-    def initialize(self, settings):
-        original(self, settings, popen_factory=factory)
-    monkeypatch.setattr(adapter.ClaudeClassifier, "__init__", initialize)
-    result = invoke(worker, "auth-smoke", "--acknowledge-claude-cost")
-    assert len(calls) == 1, result.output
-    argv, options = calls[0]
-    assert argv[:7] == ["claude", "--restricted", "--safe-mode", "-p", "--tools", "", "--disallowedTools"]
-    assert "--no-session-persistence" in argv and "--strict-mcp-config" in argv
-    assert options["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path)
-    assert not set(options["env"]) & {"AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "YOUTUBE_API_KEY"}
-    assert worker.env.transcript.segments[0].text.encode() not in children[0].input
-    assert m.ClassificationRevision.query.count() == 0 and not worker.env.storage.reads and not worker.env.storage.puts
-    if failure:
-        assert result.exit_code != 0 and "private credential" not in result.output
+    import socket
+    # The worker fixture forbids socket connections; the fake router listens on loopback only.
+    monkeypatch.delattr(socket.socket, "connect")
+    worker.app.config.update(ROUTER_URL=fake_router.url, ROUTER_TOKEN_FILE=fake_router.token_file,
+                             ROUTER_CA_FILE="", ROUTER_CLIENT_CERT_FILE="", ROUTER_CLIENT_KEY_FILE="")
+    identity = "seg-000001-" + "a" * 16
+    fake_router.output = {"ranges": [{"first_segment_id": identity, "last_segment_id": identity, "label": "editorial",
+                                      "confidence": 1, "reason_codes": ["substantive_content"]}]}
+    arguments = ("router-smoke",)
+    if failure == "auth":
+        fake_router.reply(401, FakeRouter.error("MODEL_UNAUTHORIZED"))
+    elif failure == "model":
+        fake_router.model = "other:1b"
+    elif failure == "not_ready":
+        fake_router.ready = False
+    elif failure == "wrong_cert":
+        import router_client
+        used = []
+        def refuse(self, *args, **kwargs):
+            used.append(self.cert)
+            raise router_client.RouterError("model_auth", reason="tls")
+        monkeypatch.setattr(router_client.RouterClient, "run", refuse)
+        arguments = ("router-smoke", "--wrong-client-cert")
+    result = invoke(worker, *arguments)
+    posts = [request for request in fake_router.requests if request[0] == "POST"]
+    assert m.ClassificationRevision.query.count() == 0
+    assert not worker.env.storage.reads and not worker.env.storage.puts
+    if failure == "not_ready":
+        assert result.exit_code != 0 and "Router is not ready" in result.output and not posts
+    elif failure == "wrong_cert":
+        assert result.exit_code == 0, result.output
+        assert result.output == "wrong-client-cert=model_auth reason=tls\n"
+        # A throwaway pair was used in place of the configured one, then removed.
+        import os
+        assert len(used) == 1 and used[0] is not None and not any(os.path.exists(path) for path in used[0])
+    elif failure:
+        assert result.exit_code != 0
+        assert ("model_auth" if failure == "auth" else "model_mismatch") in result.output
     else:
         assert result.exit_code == 0, result.output
-        assert result.output.strip() == "cli=2.1.303 model=claude-sonnet-5-5 cost_microusd=25"
+        assert result.output.startswith("ready=1 model=bonsai2:27b-pq2_0 label=editorial seconds=")
+        assert len(posts) == 1 and posts[0][3]["route"] == "podcast.classification"
+        assert worker.env.transcript.segments[0].text not in json.dumps(posts[0][3])
+
+
+@pytest.mark.parametrize("category,reason", [(None, None), ("model_auth", "token"), ("router_busy", "transport")])
+def test_wrong_client_cert_smoke_fails_unless_refused_as_tls_auth(worker, fake_router, monkeypatch, category,
+                                                                    reason):  # noqa: F811
+    import socket
+    import router_client
+    monkeypatch.delattr(socket.socket, "connect")
+    worker.app.config.update(ROUTER_URL=fake_router.url, ROUTER_TOKEN_FILE=fake_router.token_file,
+                             ROUTER_CA_FILE="", ROUTER_CLIENT_CERT_FILE="", ROUTER_CLIENT_KEY_FILE="")
+    identity = "seg-000001-" + "a" * 16
+    fake_router.output = {"ranges": [{"first_segment_id": identity, "last_segment_id": identity, "label": "editorial",
+                                      "confidence": 1, "reason_codes": ["substantive_content"]}]}
+    if category is not None:
+        def refuse(self, *args, **kwargs):
+            raise router_client.RouterError(category, reason=reason)
+        monkeypatch.setattr(router_client.RouterClient, "run", refuse)
+    result = invoke(worker, "router-smoke", "--wrong-client-cert")
+    assert result.exit_code != 0
+    assert "wrong-client-cert" in result.output and "BEGIN" not in result.output
+
+
+def test_throwaway_client_certificate_is_a_matching_self_signed_pair(tmp_path):
+    import shutil
+    import ssl
+    import subprocess
+    from classification_cli import _write_throwaway_client_certificate
+    certificate, key = tmp_path / "client.crt", tmp_path / "client.key"
+    _write_throwaway_client_certificate(certificate, key)
+    assert oct(key.stat().st_mode & 0o777) == "0o600"
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_cert_chain(str(certificate), str(key))  # Raises unless the key matches the certificate.
+    if shutil.which("openssl"):
+        verified = subprocess.run(["openssl", "verify", "-CAfile", str(certificate), str(certificate)],
+                                  capture_output=True, text=True, timeout=30)
+        assert verified.returncode == 0, verified.stdout + verified.stderr
 
 
 def test_status_shows_busy_revisions_and_the_oldest_busy_block(worker):

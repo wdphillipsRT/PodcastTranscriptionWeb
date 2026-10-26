@@ -1113,16 +1113,18 @@ def _reconcile_revision(revision_id, item_id, cutoff):
         dispatch = _revision_dispatch(revision)
         category, countdown = None, None
         if revision.state == "retrying":
-            from classification_service import RETRYABLE_CLASSIFICATION_ERRORS
-            if revision.error_category in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
-                category = revision.error_category
+            from classification_service import RETRYABLE_CLASSIFICATION_ERRORS, current_error_category
+            # Claude-era rows keep their stored names; map them so they keep their retry semantics.
+            if current_error_category(revision.error_category) in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
+                category = current_error_category(revision.error_category)
             # Block failures retain their category while the revision's sole
             # error field is used by the outbox. Prepare/finalize cannot recover
             # the original category after an unknown send; the next call will.
             failed = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id,
                 ordinal=dispatch.block_ordinal, state="failed").one_or_none() if dispatch.phase == "block" else None
-            if category is None and failed is not None and failed.error_category in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}:
-                category = failed.error_category
+            if (category is None and failed is not None
+                    and current_error_category(failed.error_category) in RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}):
+                category = current_error_category(failed.error_category)
             countdown = _classification_delay(revision.attempts) if revision.attempts else None
         # Pending and retrying deliveries did not execute a failed checkpoint.
         # Re-arm the stable outbox without consuming the worker-attempt budget;
@@ -1275,12 +1277,12 @@ def _publish_source_sweep(sweep_id):
     import sqlalchemy as sa
     from extensions import db
     from models import ClassificationSweep, utc_now
-    from classification_service import SOURCE_SWEEP_RETRY_ERRORS, source_sweep_retry_at
+    from classification_service import SOURCE_SWEEP_RETRY_ERRORS, current_error_category, source_sweep_retry_at
     if not current_app.config["CLASSIFICATION_ENABLED"]:
         return False
     sweep = db.session.get(ClassificationSweep, sweep_id, populate_existing=True)
     if (sweep is None or sweep.state not in {"pending", "running"}
-            or sweep.error_category not in SOURCE_SWEEP_RETRY_ERRORS | {"dispatch_pending"}):
+            or current_error_category(sweep.error_category) not in SOURCE_SWEEP_RETRY_ERRORS | {"dispatch_pending"}):
         db.session.commit()
         return False
     retry_at = source_sweep_retry_at(sweep)
@@ -1325,12 +1327,12 @@ def _reconcile_source_sweeps():
     import celeryconfig
     from extensions import db
     from models import ClassificationSweep, utc_now
-    from classification_service import SOURCE_SWEEP_RETRY_DELAY_SECONDS, SOURCE_SWEEP_RETRY_ERRORS
+    from classification_service import SOURCE_SWEEP_RETRY_DELAY_SECONDS, SOURCE_SWEEP_RETRY_STORED_ERRORS
     now = utc_now()
     cutoff = now - timedelta(seconds=celeryconfig.task_time_limit + 300)
     retry_cutoff = now - timedelta(seconds=SOURCE_SWEEP_RETRY_DELAY_SECONDS)
     aged_delivery = sa.and_(ClassificationSweep.error_category.is_(None), ClassificationSweep.updated_at < cutoff)
-    retry_ready = sa.and_(ClassificationSweep.error_category.in_(SOURCE_SWEEP_RETRY_ERRORS),
+    retry_ready = sa.and_(ClassificationSweep.error_category.in_(sorted(SOURCE_SWEEP_RETRY_STORED_ERRORS)),
         ClassificationSweep.updated_at <= retry_cutoff)
     identities = list(db.session.scalars(sa.select(ClassificationSweep.id).where(
         ClassificationSweep.state.in_(("pending", "running")),

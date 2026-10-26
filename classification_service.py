@@ -37,9 +37,16 @@ RETRYABLE_CLASSIFICATION_ERRORS = frozenset({"router_busy", "model_invalid_outpu
     "storage_transient", "dispatch_pending", "worker_timeout"})
 PERMANENT_CLASSIFICATION_ERRORS = frozenset({"model_auth", "model_config", "model_mismatch",
     "invalid_canonical", "invalid_policy", "revision_budget_exhausted"})
-# Claude-era rows keep these stored names; they are displayed, never produced.
+# Claude-era rows keep these stored names; they are displayed, never produced. Retry
+# decisions read them through current_error_category, so a row that was retrying
+# under Claude keeps retrying under its router-era equivalent.
 LEGACY_CLASSIFICATION_ERRORS = {"claude_timeout": "router_busy", "claude_unavailable": "router_busy",
     "claude_invalid_output": "model_invalid_output", "claude_auth": "model_auth", "claude_config": "model_config"}
+
+
+def current_error_category(category):
+    """A stored error category in router-era terms (Claude-era names mapped, others unchanged)."""
+    return LEGACY_CLASSIFICATION_ERRORS.get(category, category)
 # A 202 in_progress this long after the key's first send (beyond the call's own
 # deadline + read margin) means the router lost the generation: it restarted and
 # never expires in-progress keys. The key then advances.
@@ -66,6 +73,9 @@ def _soft_time_limit_error():
 
 SOURCE_SWEEP_RETRY_DELAY_SECONDS = 30
 SOURCE_SWEEP_RETRY_ERRORS = RETRYABLE_CLASSIFICATION_ERRORS - {"dispatch_pending"}
+# Stored names (current and Claude-era) that a source sweep retries; for SQL filters.
+SOURCE_SWEEP_RETRY_STORED_ERRORS = SOURCE_SWEEP_RETRY_ERRORS | {
+    legacy for legacy, current in LEGACY_CLASSIFICATION_ERRORS.items() if current in SOURCE_SWEEP_RETRY_ERRORS}
 _LOCK_NAMESPACE = 0x434C5346
 _BLOCK_SCHEMA = "commercial-block-decisions/v1"
 _ITEM_FIELDS = ("id", "admin_id", "platform", "external_id", "transcript_s3_key",
@@ -166,6 +176,7 @@ class ClassificationServiceError(RuntimeError):
     """A closed category, never an exception, transcript, or storage payload."""
 
     def __init__(self, category, *, record=True, advance_key=False, reason=None):
+        category = current_error_category(category)
         self.category = category if category in RETRYABLE_CLASSIFICATION_ERRORS | PERMANENT_CLASSIFICATION_ERRORS else "invalid_policy"
         self.reason = reason if reason in ROUTER_REASONS else None
         self.retryable = self.category in RETRYABLE_CLASSIFICATION_ERRORS or key_conflict(self.category, self.reason)
@@ -184,7 +195,7 @@ def _hash(value):
 
 def source_sweep_retry_at(sweep):
     """The last committed retryable failure starts a durable fixed delay."""
-    if sweep.error_category in SOURCE_SWEEP_RETRY_ERRORS:
+    if current_error_category(sweep.error_category) in SOURCE_SWEEP_RETRY_ERRORS:
         return sweep.updated_at + timedelta(seconds=SOURCE_SWEEP_RETRY_DELAY_SECONDS)
     return None
 
@@ -956,8 +967,8 @@ class ClassificationService:
                     return BlockResult(revision_id, block_ordinal, "completed", total, self._dispatch(revision, blocks))
                 if block.state == "running" or any(b.ordinal < block_ordinal and b.state != "completed" for b in blocks):
                     _fail("worker_timeout", record=False)
-                # Only generation counts: a completed block's span is its successful call,
-                # because started_at is reset at every claim. Busy waits and queueing do not count.
+                # Only generation counts: a completed block's span runs from its last claim to
+                # completion, because started_at is reset at every claim. Busy waits and queueing do not count.
                 generated = sum(max(0.0, (b.completed_at - b.started_at).total_seconds()) for b in blocks
                                 if b.state == "completed" and b.started_at and b.completed_at)
                 if (len(blocks) > MAX_BLOCKS_PER_REVISION

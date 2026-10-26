@@ -1016,3 +1016,18 @@ def test_a_soft_time_limit_in_a_block_is_a_busy_timeout(env, monkeypatch, where)
     assert (caught.value.category, caught.value.reason, caught.value.advance_key) == ("router_busy", "timeout", False)
     block = db.session.scalar(sa.select(m.ClassificationBlock).where(m.ClassificationBlock.revision_id == revision_id))
     assert (block.state, block.error_category, block.request_generation) == ("pending", "router_busy", 0)
+
+
+@pytest.mark.parametrize("legacy,current,retryable", [
+    ("claude_timeout", "router_busy", True), ("claude_unavailable", "router_busy", True),
+    ("claude_invalid_output", "model_invalid_output", True), ("claude_auth", "model_auth", False),
+    ("claude_config", "model_config", False)])
+def test_claude_era_categories_keep_their_retry_semantics(legacy, current, retryable):
+    import classification_service as service
+    assert service.current_error_category(legacy) == current
+    assert service.current_error_category("storage_transient") == "storage_transient"
+    assert service.current_error_category(None) is None
+    error = service.ClassificationServiceError(legacy)
+    assert (error.category, error.retryable) == (current, retryable)
+    sweep = SimpleNamespace(error_category=legacy, updated_at=m.utc_now())
+    assert (service.source_sweep_retry_at(sweep) is not None) is retryable

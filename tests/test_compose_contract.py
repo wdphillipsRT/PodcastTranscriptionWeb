@@ -157,6 +157,7 @@ def test_direct_python_runtime_and_dev_requirements_are_pinned():
     ("start-worker.sh", "database,redis,s3,transcribe,youtube,yt_dlp,deno"),
     ("start-beat.sh", "database,redis,beat"),
     ("start-exporter.sh", "database,redis,s3"),
+    ("start-classifier.sh", "database,redis,s3,claude_absent,router"),
 ])
 def test_startup_scripts_fail_closed_and_preserve_exec_arguments(script, selection, tmp_path):
     path = ROOT / "scripts" / script
@@ -188,9 +189,10 @@ def test_startup_scripts_fail_closed_and_preserve_exec_arguments(script, selecti
     assert "SYSTEM_CHECK_SERVICES" not in content
 
 
-def test_worker_startup_pins_app_pythonpath_for_prefork_lazy_imports(tmp_path):
+@pytest.mark.parametrize("name", ["start-worker.sh", "start-classifier.sh"])
+def test_worker_startup_pins_app_pythonpath_for_prefork_lazy_imports(tmp_path, name):
     """Celery's console loader must not leave child imports dependent on cwd."""
-    script = ROOT / "scripts" / "start-worker.sh"
+    script = ROOT / "scripts" / name
     fake = tmp_path / "flask"
     fake.write_text('#!/bin/sh\nprintf "guard:%s\\n" "$PYTHONPATH"\n')
     fake.chmod(0o755)
@@ -212,93 +214,11 @@ def test_worker_startup_pins_app_pythonpath_for_prefork_lazy_imports(tmp_path):
     assert result.stdout.splitlines() == ["guard:/app", "child:/app"]
 
 
-@pytest.fixture
-def classifier_startup(tmp_path):
-    path = ROOT / "scripts" / "start-classifier.sh"
-    for name, body in {
-        "claude": '''case "$*" in
-  --version) printf 'version:%s\\n' "$PYTHONPATH" >> "$STARTUP_EVENTS"
-    printf '%s\\n' "$FAKE_VERSION"; printf 'private-version-diagnostic\\n' >&2
-    exit "${VERSION_EXIT:-0}" ;;
-  'auth status') printf 'auth:%s\\n' "$PYTHONPATH" >> "$STARTUP_EVENTS"
-    printf 'private-auth-stdout\\n'; printf 'private-auth-stderr\\n' >&2
-    exit "${AUTH_EXIT:-0}" ;;
-  *) exit 99 ;;
-esac
-''',
-        "flask": '''printf 'flask:%s:%s\\n' "$PYTHONPATH" "$*" >> "$STARTUP_EVENTS"
-exit "${GUARD_EXIT:-0}"
-''',
-        "celery": '''printf 'celery:%s\\n' "$PYTHONPATH" >> "$STARTUP_EVENTS"
-printf '%s\\n' "$@"
-exit "${CELERY_EXIT:-0}"
-''',
-    }.items():
-        executable = tmp_path / name
-        executable.write_text("#!/bin/sh\n" + body)
-        executable.chmod(0o755)
-    events = tmp_path / "events"
-    environment = {
-        **os.environ, "PATH": str(tmp_path) + ":" + os.environ["PATH"],
-        "PYTHONPATH": "/tmp/untrusted-shadow-path", "STARTUP_EVENTS": str(events),
-        "FAKE_VERSION": "2.1.303 (Claude Code)", "CLAUDE_EXPECTED_VERSION": "2.1.303",
-        "AUTH_EXIT": "0", "VERSION_EXIT": "0", "GUARD_EXIT": "0", "CELERY_EXIT": "0",
-    }
-    return path, environment, events
-
-
-def run_classifier_startup(fixture, **overrides):
-    path, environment, events = fixture
-    assert path.is_file(), "classifier startup guard must exist"
-    assert os.access(path, os.X_OK)
-    content = path.read_text()
-    assert content.startswith("#!/bin/sh\nset -eu\n")
-    assert 'exec "$@"' in content and "eval " not in content and "set -x" not in content
-    assert subprocess.run(["sh", "-n", str(path)], capture_output=True).returncode == 0
-    result = subprocess.run(
-        [str(path), "celery", "literal $(echo injected-secret)", "argument with spaces"],
-        env={**environment, **overrides}, capture_output=True, text=True, timeout=3,
-    )
-    assert "private-" not in result.stdout + result.stderr
-    return result, events.read_text().splitlines()
-
-
-@pytest.mark.parametrize("expected", ["2.1.303", "12.34.567"])
-def test_classifier_startup_checks_in_order_pins_pythonpath_and_executes_literal_argv(classifier_startup, expected):
-    result, events = run_classifier_startup(
-        classifier_startup, CLAUDE_EXPECTED_VERSION=expected,
-        FAKE_VERSION=expected + " (Claude Code)", CELERY_EXIT="17",
-        SYSTEM_CHECK_SERVICES="redis; echo injected-secret",
-    )
-    assert result.returncode == 17
-    assert events == ["version:/app", "auth:/app",
-                      "flask:/app:--app app:create_app system check --services database,redis,s3", "celery:/app"]
-    assert result.stdout == "literal $(echo injected-secret)\nargument with spaces\n"
-
-
-@pytest.mark.parametrize("overrides,events", [
-    ({"FAKE_VERSION": "2.1.302 (Claude Code)"}, ["version:/app"]),
-    ({"FAKE_VERSION": "2.1.303 (Claude Code) extra"}, ["version:/app"]),
-    ({"VERSION_EXIT": "1"}, ["version:/app"]),
-    ({"CLAUDE_EXPECTED_VERSION": "$(echo injected-secret)"}, ["version:/app"]),
-    ({"AUTH_EXIT": "1"}, ["version:/app", "auth:/app"]),
-    ({"GUARD_EXIT": "1"}, ["version:/app", "auth:/app",
-                            "flask:/app:--app app:create_app system check --services database,redis,s3"]),
-])
-def test_classifier_failures_stop_before_celery_without_auth_or_version_output(classifier_startup, overrides, events):
-    result, actual = run_classifier_startup(classifier_startup, **overrides)
-    assert result.returncode != 0
-    assert result.stdout == ""
-    assert "injected-secret" not in result.stderr
-    assert actual == events
-
-
-def test_web_readiness_remains_independent_of_claude_auth(app, monkeypatch):
+def test_web_readiness_never_probes_the_router(app, monkeypatch):
     import system_checks
 
     components = ("database", "redis", "s3", "transcribe", "youtube", "yt_dlp", "deno", "worker", "beat")
     called = []
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setattr(system_checks, "_run_isolated", lambda component, config: called.append(component) or True)
     response = app.test_client().get("/readyz")
     assert response.status_code == 200

@@ -4,7 +4,6 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -51,13 +50,6 @@ class Settings:
     RATELIMIT_DEFAULT: str = ""
     RATELIMIT_LOGIN: str = "5 per minute"
     LOG_LEVEL: str = "INFO"
-    CLAUDE_CLASSIFIER_MODEL: str = "claude-sonnet-5-5"
-    CLAUDE_EXPECTED_VERSION: str = "2.1.303"
-    CLAUDE_CLASSIFIER_TIMEOUT_SECONDS: int = 180
-    CLAUDE_CLASSIFIER_MAX_BUDGET_USD: Decimal = Decimal("0.50")
-    CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD: Decimal = Decimal("5.00")
-    CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS: int = 7200
-    CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES: int = 2_097_152
     ROUTER_URL: str = "https://192.168.68.200:18443"
     ROUTER_EXPECTED_MODEL: str = "bonsai2:27b-pq2_0"
     ROUTER_TOKEN_FILE: str = "/router/token"
@@ -71,10 +63,7 @@ class Settings:
     CLASSIFICATION_RECONCILE_INTERVAL_SECONDS: int = 300
     CLASSIFICATION_RECONCILE_BATCH_SIZE: int = 100
     GUEST_EXTRACTION_ENABLED: bool = False
-    CLAUDE_GUEST_MODEL: str = "claude-sonnet-5-5"
     GUEST_EXTRACTION_TIMEOUT_SECONDS: int = 120
-    GUEST_EXTRACTION_MAX_BUDGET_USD: Decimal = Decimal("0.05")
-    GUEST_EXTRACTION_DAILY_BUDGET_USD: Decimal = Decimal("1.00")
     GUEST_EXTRACTION_MAX_ITEMS_PER_RUN: int = 25
     GUEST_EXTRACTION_INTERVAL_SECONDS: int = 3600
     GUEST_EXTRACTION_MAX_CALLS_PER_DAY: int = 200
@@ -94,6 +83,14 @@ _DEVELOPMENT_SECRETS = {
     "development", "development-secret", "development-secret-key",
     "dev-key-change-in-production",
 }
+# Settings retired with the Claude CLI. Present in the environment, they stop startup, so a
+# stale .env cannot leave a Claude model or a dollar budget configured that nothing enforces.
+RETIRED_SETTINGS = (
+    "CLAUDE_CLASSIFIER_MODEL", "CLAUDE_EXPECTED_VERSION", "CLAUDE_CLASSIFIER_TIMEOUT_SECONDS",
+    "CLAUDE_CLASSIFIER_MAX_BUDGET_USD", "CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD",
+    "CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS", "CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES", "CLAUDE_GUEST_MODEL",
+    "CLAUDE_CONFIG_HOST_PATH", "GUEST_EXTRACTION_MAX_BUDGET_USD", "GUEST_EXTRACTION_DAILY_BUDGET_USD",
+)
 
 
 def _nonempty(environment: Mapping[str, str], name: str, default: str = "") -> str:
@@ -122,6 +119,9 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
     caller, so test execution never silently weakens production configuration.
     """
     environment = os.environ if environment is None else environment
+    retired = sorted(name for name in RETIRED_SETTINGS if name in environment)
+    if retired:
+        raise ConfigError("Retired settings must be removed from the environment: " + ", ".join(retired))
     values = {name: _nonempty(environment, name) for name in _REQUIRED}
     if values["SECRET_KEY"].lower() in _DEVELOPMENT_SECRETS:
         raise ConfigError("SECRET_KEY must not be a known development secret")
@@ -153,8 +153,6 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
     if values["YOUTUBE_MAX_ITEMS_PER_BACKFILL_TASK"] > values["BACKFILL_REQUEST_MAX_ITEMS"]:
         raise ConfigError("YOUTUBE_MAX_ITEMS_PER_BACKFILL_TASK must not exceed BACKFILL_REQUEST_MAX_ITEMS")
 
-    if values["CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES"] > 2_097_152:
-        raise ConfigError("CLAUDE_CLASSIFIER_MAX_OUTPUT_BYTES must not exceed 2097152")
     if values["CLASSIFICATION_RECONCILE_BATCH_SIZE"] > 500:
         raise ConfigError("CLASSIFICATION_RECONCILE_BATCH_SIZE must not exceed 500")
     if values["GUEST_EXTRACTION_MAX_ITEMS_PER_RUN"] > 100:
@@ -163,31 +161,6 @@ def load_settings(environment: Mapping[str, str] | None = None) -> Settings:
         raise ConfigError("GUEST_EXTRACTION_TIMEOUT_SECONDS must be between 5 and 600")
     if values["GUEST_EXTRACTION_INTERVAL_SECONDS"] < 3600:
         raise ConfigError("GUEST_EXTRACTION_INTERVAL_SECONDS must be at least 3600")
-    for name in ("CLAUDE_CLASSIFIER_MAX_BUDGET_USD", "CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD",
-                 "GUEST_EXTRACTION_MAX_BUDGET_USD", "GUEST_EXTRACTION_DAILY_BUDGET_USD"):
-        try:
-            raw = environment.get(name, str(getattr(Settings, name))).strip()
-            if not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", raw):
-                raise ValueError
-            value = Decimal(raw)
-            if not value.is_finite() or value <= 0:
-                raise ValueError
-        except (InvalidOperation, ValueError):
-            raise ConfigError(f"{name} must be a positive finite decimal") from None
-        values[name] = value
-    if values["CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD"] < values["CLAUDE_CLASSIFIER_MAX_BUDGET_USD"]:
-        raise ConfigError("CLAUDE_CLASSIFIER_MAX_REVISION_BUDGET_USD must cover the per-call budget")
-    if values["GUEST_EXTRACTION_DAILY_BUDGET_USD"] < values["GUEST_EXTRACTION_MAX_BUDGET_USD"]:
-        raise ConfigError("GUEST_EXTRACTION_DAILY_BUDGET_USD must cover the per-call budget")
-    if values["CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS"] < values["CLAUDE_CLASSIFIER_TIMEOUT_SECONDS"]:
-        raise ConfigError("CLAUDE_CLASSIFIER_MAX_REVISION_SECONDS must cover the per-call timeout")
-    for name, pattern in (("CLAUDE_EXPECTED_VERSION", r"[0-9]+\.[0-9]+\.[0-9]+"),
-                          ("CLAUDE_CLASSIFIER_MODEL", r"claude-(?!latest-)[a-z]+-[0-9]+-[0-9]+(?:-[0-9]{8})?"),
-                          ("CLAUDE_GUEST_MODEL", r"claude-(?!latest-)[a-z]+-[0-9]+-[0-9]+(?:-[0-9]{8})?")):
-        value = _nonempty(environment, name, getattr(Settings, name))
-        if not re.fullmatch(pattern, value):
-            raise ConfigError(f"{name} must be a pinned version")
-        values[name] = value
     router_url = _nonempty(environment, "ROUTER_URL", Settings.ROUTER_URL)
     origin_error = "ROUTER_URL must be an https origin without credentials or a path"
     label = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"

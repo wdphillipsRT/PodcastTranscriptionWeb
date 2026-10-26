@@ -76,7 +76,7 @@ def test_worker_import_never_loads_app_settings_or_connects_to_services():
              patch.object(socket.socket, 'connect', forbidden), \\
              patch.object(Engine, 'connect', forbidden):
             tasks = importlib.import_module('tasks')
-            assert 'claude_classifier' not in sys.modules
+            assert 'router_classifier' not in sys.modules and 'router_client' not in sys.modules
             importlib.import_module('discovery_service')
             assert tasks.celery_app.main == 'podcast_transcription'
     """)

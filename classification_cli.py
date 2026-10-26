@@ -104,35 +104,150 @@ def retry(item_id):
     click.echo(f"requested=1 published={int(published)}")
 
 
-@classification_cli.command("auth-smoke")
-@click.option("--acknowledge-claude-cost", is_flag=True)
+@classification_cli.command("router-smoke")
+@click.option("--wrong-client-cert", is_flag=True,
+              help="Send the request with a throwaway client certificate; pass only if it is refused as model_auth.")
 @_safe
-def auth_smoke(acknowledge_claude_cost):
-    if not acknowledge_claude_cost:
-        raise click.ClickException("Claude cost acknowledgement required")
-    from claude_classifier import ClaudeClassifier
+def router_smoke(wrong_client_cert):
+    """One small synthetic request on podcast.classification; touches no database or storage data."""
+    import time
     from commercial_signals import ClassifierWindow
+    from router_classifier import ClassifierError, RouterClassifier
+    from router_client import RouterClient
     from transcripts import TranscriptSegment
     settings = SimpleNamespace(**dict(current_app.config))
+    client = RouterClient.from_settings(settings)
+    if not client.ready():
+        raise click.ClickException("Router is not ready (GET /readyz did not answer ready)")
     # This fixture is compiled in and has no connection to database/storage data.
     segment = TranscriptSegment("seg-000001-aaaaaaaaaaaaaaaa", "a" * 64, 0.0, 1.0,
         "This synthetic example explains how rain forms from clouds.", "https://example.com/synthetic#t=0,1")
     window = ClassifierWindow(1, (segment,), (), (), ())
-    result = ClaudeClassifier(settings).classify(window)
-    click.echo(f"cli={result.provenance.cli_version} model={result.provenance.resolved_model} "
-        f"cost_microusd={result.total_cost_microusd}")
+    if wrong_client_cert:
+        _wrong_client_cert_smoke(settings, window)
+        return
+    started = time.monotonic()
+    try:
+        result = RouterClassifier(settings, client=client).classify(window)
+    except ClassifierError as error:
+        raise click.ClickException(f"Router smoke failed: {error.category}") from None
+    click.echo(f"ready=1 model={result.provenance.resolved_model} label={result.decisions[0].label} "
+               f"seconds={time.monotonic() - started:.1f}")
+
+
+def _wrong_client_cert_smoke(settings, window):
+    """The suite never exercises TLS, so this proves against the real router that a client certificate
+    it did not issue is refused and mapped to model_auth. Prints only the category and reason."""
+    import os
+    import shutil
+    import tempfile
+    from router_classifier import ClassifierError, RouterClassifier
+    from router_client import RouterClient
+    directory = tempfile.mkdtemp(prefix="router-smoke-")  # mode 0700
+    try:
+        certificate, key = os.path.join(directory, "client.crt"), os.path.join(directory, "client.key")
+        _write_throwaway_client_certificate(certificate, key)
+        wrong = RouterClient.from_settings(SimpleNamespace(**{**vars(settings), "ROUTER_CLIENT_CERT_FILE": certificate,
+                                                              "ROUTER_CLIENT_KEY_FILE": key}))
+        category = reason = None
+        try:
+            RouterClassifier(settings, client=wrong).classify(window)
+        except ClassifierError as error:
+            category, reason = error.category, error.reason
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    line = f"wrong-client-cert={category or 'accepted'} reason={reason or 'none'}"
+    # "tls" when the TLS layer refuses the certificate; unauthorized/forbidden if a proxy answers instead.
+    if category != "model_auth" or reason not in {"tls", "unauthorized", "forbidden"}:
+        raise click.ClickException(line)
+    click.echo(line)
+
+
+def _der(tag, body):
+    if len(body) < 0x80:
+        return bytes((tag, len(body))) + body
+    size = len(body).to_bytes((len(body).bit_length() + 7) // 8, "big")
+    return bytes((tag, 0x80 | len(size))) + size + body
+
+
+def _der_integer(value):
+    return _der(0x02, value.to_bytes(value.bit_length() // 8 + 1, "big"))
+
+
+def _probable_prime(bits):
+    import secrets
+    small = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97)
+    while True:
+        candidate = secrets.randbits(bits) | (3 << (bits - 2)) | 1
+        if any(candidate % prime == 0 for prime in small) or candidate % 65537 == 1:
+            continue
+        odd, twos = candidate - 1, 0
+        while odd % 2 == 0:
+            odd, twos = odd // 2, twos + 1
+        for _ in range(32):
+            value = pow(secrets.randbelow(candidate - 3) + 2, odd, candidate)
+            if value in (1, candidate - 1):
+                continue
+            for _ in range(twos - 1):
+                value = pow(value, 2, candidate)
+                if value == candidate - 1:
+                    break
+            else:
+                break
+        else:
+            return candidate
+
+
+def _write_throwaway_client_certificate(certificate_path, key_path):
+    """Write a fresh self-signed RSA-2048 certificate and PKCS#1 key (pure Python: the image has neither
+    the openssl CLI nor a crypto library). No router trusts it; it exists only to be refused."""
+    import base64
+    import hashlib
+    import os
+    import secrets
+    from datetime import datetime, timedelta, timezone
+    exponent = 65537
+    while True:
+        p, q = _probable_prime(1024), _probable_prime(1024)
+        if p != q and (p * q).bit_length() == 2048:
+            break
+    modulus, phi = p * q, (p - 1) * (q - 1)
+    private = pow(exponent, -1, phi)
+    sha256_rsa = _der(0x30, _der(0x06, bytes.fromhex("2a864886f70d01010b")) + b"\x05\x00")
+    rsa = _der(0x30, _der(0x06, bytes.fromhex("2a864886f70d010101")) + b"\x05\x00")
+    name = _der(0x30, _der(0x31, _der(0x30, _der(0x06, bytes.fromhex("550403"))
+                                      + _der(0x0c, b"router-smoke wrong client certificate"))))
+    now = datetime.now(timezone.utc)
+    validity = _der(0x30, b"".join(_der(0x17, moment.strftime("%y%m%d%H%M%SZ").encode())
+                                  for moment in (now - timedelta(hours=1), now + timedelta(days=1))))
+    public = _der(0x30, rsa + _der(0x03, b"\x00" + _der(0x30, _der_integer(modulus) + _der_integer(exponent))))
+    tbs = _der(0x30, _der_integer(secrets.randbits(63) + 1) + sha256_rsa + name + validity + name + public)
+    digest_info = bytes.fromhex("3031300d060960864801650304020105000420") + hashlib.sha256(tbs).digest()
+    padded = b"\x00\x01" + b"\xff" * (256 - 3 - len(digest_info)) + b"\x00" + digest_info
+    signature = pow(int.from_bytes(padded, "big"), private, modulus).to_bytes(256, "big")
+    certificate = _der(0x30, tbs + sha256_rsa + _der(0x03, b"\x00" + signature))
+    key = _der(0x30, b"".join(_der_integer(value) for value in (
+        0, modulus, exponent, private, p, q, private % (p - 1), private % (q - 1), pow(q, -1, p))))
+
+    def pem(label, der):
+        lines = [base64.b64encode(der[start:start + 48]).decode() for start in range(0, len(der), 48)]
+        return "\n".join([f"-----BEGIN {label}-----", *lines, f"-----END {label}-----", ""])
+
+    descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+        handle.write(pem("RSA PRIVATE KEY", key))
+    with open(certificate_path, "x", encoding="ascii") as handle:
+        handle.write(pem("CERTIFICATE", certificate))
 
 
 @classification_cli.command("smoke")
 @click.option("--item-id")
 @click.option("--oldest-completed", is_flag=True)
-@click.option("--acknowledge-claude-cost", is_flag=True)
 @_safe
-def smoke(item_id, oldest_completed, acknowledge_claude_cost):
-    if not acknowledge_claude_cost:
-        raise click.ClickException("Claude cost acknowledgement required")
+def smoke(item_id, oldest_completed):
     if (item_id is not None) == oldest_completed:
         raise click.ClickException("Select exactly one completed item")
+    import time
     from extensions import db
     from models import ContentItem, ClassificationRevision
     from commercial_policy import MAX_BLOCKS_PER_REVISION
@@ -157,13 +272,15 @@ def smoke(item_id, oldest_completed, acknowledge_claude_cost):
         for _ in range(MAX_BLOCKS_PER_REVISION + 2):
             if dispatch is None:
                 break
-            dispatch, _, _ = _classification_step(service, revision_id, dispatch.phase,
+            dispatch, countdown, _ = _classification_step(service, revision_id, dispatch.phase,
                 dispatch.block_ordinal, handoff_superseded=False)
+            if dispatch is not None and countdown:
+                time.sleep(min(countdown, 600))  # A busy router: wait as the worker would.
         revision = db.session.get(ClassificationRevision, revision_id, populate_existing=True)
         if revision.state not in {"completed", "failed", "superseded"}:
             db.session.commit()
             raise click.ClickException("Classification smoke did not complete")
         output = (f"state={revision.state} included={revision.included_segments} excluded={revision.excluded_segments} "
-            f"uncertain={revision.uncertain_segments} cost_microusd={revision.total_cost_microusd}")
+            f"uncertain={revision.uncertain_segments}")
         db.session.commit()
     click.echo(output)

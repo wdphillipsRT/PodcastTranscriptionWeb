@@ -505,3 +505,25 @@ def test_a_key_conflict_that_then_succeeds_completes_the_revision(worker):
     task().run(identity, "finalize")
     revision = db.session.get(m.ClassificationRevision, identity)
     assert (revision.state, revision.attempts) == ("completed", 1)
+
+
+@pytest.mark.parametrize("legacy,current", [("claude_timeout", "router_busy"),
+                                            ("claude_invalid_output", "model_invalid_output")])
+@pytest.mark.parametrize("phase", ["prepare", "block"])
+def test_aged_claude_era_retry_replays_with_its_current_category(worker, legacy, current, phase):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    if phase == "block":
+        task().run(identity, "prepare")
+    revision = db.session.get(m.ClassificationRevision, identity)
+    revision.state, revision.attempts, revision.error_category = "retrying", 2, legacy
+    revision.heartbeat_at = revision.updated_at = m.utc_now() - timedelta(days=7)
+    if phase == "block":
+        # The block keeps the Claude-era category; the revision's own field is not retryable.
+        revision.error_category = "invalid_policy"
+        block = m.ClassificationBlock.query.one()
+        block.state, block.error_category = "failed", legacy
+    db.session.commit()
+    worker.sent.clear()
+    reconcile()
+    assert (revision.state, revision.attempts, revision.error_category) == ("retrying", 2, current)
+    assert len(worker.sent) == 1 and worker.sent[-1][2]["countdown"] > 0

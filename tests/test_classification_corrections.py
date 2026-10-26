@@ -486,3 +486,18 @@ def test_retry_publication_cleanup_preserves_faster_failure_at_the_same_cursor(w
     assert sweep.error_category == "storage_transient" and sweep.updated_at == now[0]
     assert sweep.celery_task_id == task_id and sweep.items_scanned == 0
     assert tasks._publish_source_sweep(correction.sweep_id) is False
+
+
+@pytest.mark.parametrize("legacy,republished", [("claude_unavailable", True), ("claude_auth", False)])
+def test_claude_era_sweep_failure_keeps_its_retry_semantics(worker, monkeypatch, legacy, republished):
+    env = worker.env
+    active, _ = finish(env)
+    correction = record(env, active, 1)
+    monkeypatch.setattr(env.storage, "get_bytes", lambda *a, **kw: (_ for _ in ()).throw(StorageTransientError("private")))
+    tasks.scan_source_rule.run(correction.sweep_id)
+    sweep = db.session.get(m.ClassificationSweep, correction.sweep_id)
+    sweep.error_category, sweep.updated_at = legacy, m.utc_now() - timedelta(minutes=5)
+    db.session.commit()
+    worker.sent.clear()
+    tasks._reconcile_source_sweeps()
+    assert bool(worker.sent) is republished
