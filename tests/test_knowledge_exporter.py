@@ -168,6 +168,18 @@ def test_unavailable_projection_skips_the_item_without_reading_raw_text(ready):
     assert not any(key.endswith(".txt") for key, _ in ready.storage.reads)
 
 
+@pytest.mark.parametrize("artifact, old, new", [("projection_s3_key", b"First editorial", b"Tampered editorial"),
+                                                 ("policy_s3_key", b'"paid_commercial"', b'"editorial"')])
+def test_tampered_stored_artifacts_fail_closed_and_nothing_is_exported(ready, artifact, old, new):
+    revision = db.session.get(m.ContentItem, ready.item.id).active_classification_revision
+    key = getattr(revision, artifact)
+    assert old in ready.storage.objects[key]
+    ready.storage.objects[key] = ready.storage.objects[key].replace(old, new)
+    report = export(ready)
+    assert report.skipped == {"projection_unavailable": 1} and report.batches == []
+    assert [path.name for path in ready.inbox.iterdir()] == [".podcast-knowledge-export.lock"]
+
+
 def test_large_exports_split_into_sequenced_batches_capped_per_run(ready):
     for number in range(4):
         add_classified(ready, f"episode-{number}")
@@ -267,7 +279,7 @@ def test_exporter_reads_transcripts_only_through_the_gateway():
     assert {path.name for path in modules} >= {"exporter.py", "records.py", "people.py", "contract.py"}
     assert forbidden_artifact_references(root) == []
     source = (root / "integrations/knowledge/exporter.py").read_text()
-    assert "load_active_learning_projection" in source
+    assert "load_active_knowledge_projection" in source and "load_active_learning_projection" not in source
     assert not any(name in path.read_text() for path in modules for name in ("get_bytes", "s3_key", "boto3"))
 
 
@@ -402,3 +414,32 @@ def test_a_pending_batch_claimed_by_the_intake_is_abandoned_and_re_exported(read
     second = batch_records(ready, "podcast-20261022-002")[0]
     assert first["record_id"].endswith("/e1") and second["record_id"].endswith("/e2")
     assert db.session.get(m.KnowledgeExportBatch, 1).state == "abandoned"
+
+
+def test_release_check_no_excluded_segment_leaves_and_every_uncertain_one_is_marked(ready):
+    texts = ("Editorial opening", "Uncertain bridge", "Editorial lesson", "Paid PRIVATE-AD read",
+             "Self PRIVATE-PROMO plug", "Cross PRIVATE-XPROMO plug", "Housekeeping PRIVATE-HK note", "Uncertain coda")
+    labels = ("editorial", "uncertain", "editorial", "paid_commercial", "self_promotion", "cross_promotion",
+              "housekeeping", "uncertain")
+    ready.item, ready.transcript = add_item(ready, external_id="release", texts=texts)
+    ready.classifier.labels.update({s.id: (label, 1.0) for s, label in zip(ready.transcript.segments, labels)})
+    finish(ready)
+    report = export(ready)
+    assert report.status == "completed"
+    raw = b"".join(path.read_bytes() for batch in report.batches for path in (ready.inbox / batch).rglob("*")
+                   if path.is_file())
+    for marker in (b"PRIVATE-AD", b"PRIVATE-PROMO", b"PRIVATE-XPROMO", b"PRIVATE-HK"):
+        assert marker not in raw
+    assert b"Uncertain bridge" in raw and b"Uncertain coda" in raw
+    records = [record for batch in report.batches for record in batch_records(ready, batch)]
+    episode = next(r for r in records if r["kind"] == "podcast.episode" and r["attributes"]["item_id"] == ready.item.id)
+    passages = [r for r in records if r["kind"] == "podcast.segment"
+                and r["relations"] == [{"type": "part_of", "target_record_id": episode["record_id"]}]]
+    expected = {s.id for s, label in zip(ready.transcript.segments, labels) if label == "uncertain"}
+    marked = {i for p in passages for i in p["attributes"]["uncertain_segment_ids"]}
+    exported = {i for p in passages for i in p["attributes"]["segment_ids"]}
+    assert marked == expected and marked <= exported
+    assert exported == {s.id for s, label in zip(ready.transcript.segments, labels) if label in {"editorial", "uncertain"}}
+    assert all(set(p["attributes"]["uncertain_segment_ids"]) <= set(p["attributes"]["segment_ids"]) for p in passages)
+    assert [p["attributes"]["label"] for p in passages] == ["mixed", "uncertain"]
+    assert episode["attributes"]["uncertain_segments"] == 2
