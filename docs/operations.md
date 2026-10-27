@@ -797,7 +797,7 @@ docker compose down --remove-orphans   # never -v
 (umask 077 && tar -C .runtime -xzf ~/PodcastTranscriptionWeb-backups/claude-runtime-<stamp>.tar.gz)
 ```
 
-After either rollback, upgrading again recreates `request_generation` as 0 for every block, so keys
+After rolling back past `0004`, upgrading again recreates `request_generation` as 0 for every block, so keys
 from generation `g0` repeat and the router may replay the outcome it stored for
 them earlier; a replayed failure advances the key and counts as one attempt.
 
