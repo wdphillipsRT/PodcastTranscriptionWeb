@@ -609,7 +609,10 @@ flight.
 Busy retries end only for one case: a block on which the model itself fails
 slowly three times (`classification_blocks.provider_failures`) fails as
 `model_unavailable`, so one bad input cannot stall the queue or keep tripping the
-shared Forge circuit breaker. Otherwise they never end by design: a revision
+shared Forge circuit breaker. The 60-second rule is a heuristic: a call that fails fast is
+treated as an outage and stays busy, while a Forge outage that fails after 60 seconds or more
+counts against the block too; after the outage, recover the item with
+`classification retry --item-id <id>`. Otherwise they never end by design: a revision
 waiting on a busy router stays `retrying` with `router_busy` until the router answers. To spot them, run
 `docker compose exec classifier flask --app app:create_app classification status`
 and read `router_busy=<count>`, `oldest_busy_key_sent=` and
@@ -759,7 +762,8 @@ router-classified episodes fail validation on the review page and in the
 exporter. The previous code has no command that reclassifies an episode whose
 active revision the router produced. The documented rollback is therefore to
 restore the PostgreSQL backup taken before the upgrade (the upgrade script
-writes it to `~/PodcastTranscriptionWeb-backups/postgres-<stamp>-*.dump`),
+writes it to `~/PodcastTranscriptionWeb-backups/postgres-<stamp>-*.dump`; use the
+dump from the router upgrade, not the one named `-pre7c-`),
 losing every change since. In this order:
 
 1. Stop the writers.
@@ -786,12 +790,16 @@ docker compose stop web worker beat classifier exporter
 docker compose run --rm --no-deps migrate flask --app app:create_app db downgrade 0003_knowledge_export
 # Restore the pre-upgrade backup, then:
 git checkout <previous revision>
-docker image inspect podcast-transcription:pre-router &&
+docker image inspect podcast-transcription:pre-router >/dev/null &&
   docker tag podcast-transcription:pre-router podcast-transcription:local ||
   docker compose build
 docker compose down --remove-orphans   # never -v
 (umask 077 && tar -C .runtime -xzf ~/PodcastTranscriptionWeb-backups/claude-runtime-<stamp>.tar.gz)
 ```
+
+After either rollback, upgrading again recreates `request_generation` as 0 for every block, so keys
+from generation `g0` repeat and the router may replay the outcome it stored for
+them earlier; a replayed failure advances the key and counts as one attempt.
 
 ### Rolling back Plan 7c
 
@@ -805,10 +813,6 @@ pre-7c backup (the 7c upgrade script writes
 the 7b revision and rebuild, or tag the saved image with
 `docker tag podcast-transcription:pre-7c podcast-transcription:local`; then
 start the services.
-
-Upgrading again recreates `request_generation` as 0 for every block, so keys
-from generation `g0` repeat and the router may replay the outcome it stored for
-them earlier; a replayed failure advances the key and counts as one attempt.
 
 ## Build, migrate, start, and provision the administrator
 
