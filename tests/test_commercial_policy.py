@@ -330,6 +330,14 @@ def thresholded(sample, source="model"):
     return policy_for(sample)
 
 
+def test_an_implied_signalled_editorial_decision_is_thresholded_to_uncertain(sample):
+    from router_classifier import IMPLIED_SIGNALLED_CONFIDENCE
+    ranges = sample[1]
+    ranges[0] = replace(ranges[0], label="editorial", confidence=IMPLIED_SIGNALLED_CONFIDENCE, decision_source="model")
+    first = policy_for(sample).ranges[0]
+    assert (first.label, first.decision_source, first.model_label) == ("uncertain", "uncertain_threshold", "editorial")
+
+
 @pytest.mark.parametrize("source", ["model", "claude"])
 def test_thresholding_keeps_the_model_label_it_overrode(sample, source):
     policy = thresholded(sample, source)

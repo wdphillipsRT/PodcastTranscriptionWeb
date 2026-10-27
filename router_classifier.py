@@ -3,8 +3,10 @@
 The quoted window and the few-shot examples travel as one canonical JSON user
 message under the fixed system prompt. Under prompt v2 the model lists only the
 target segments that are not plain editorial, as ranges; every unlisted target
-segment becomes an editorial decision at EDITORIAL_AUTO_THRESHOLD (stored v1
-provenance from the Claude era, where every target was decided, stays valid).
+segment becomes an editorial decision at EDITORIAL_AUTO_THRESHOLD, or at the
+lower IMPLIED_SIGNALLED_CONFIDENCE inside a signal's range, so the policy
+thresholds it to uncertain. Stored v1 provenance from the Claude era, where
+every target was decided, stays valid.
 The route answers with OUTPUT_SCHEMA, which uses only the router's schema
 subset. The checks that subset cannot express are made here and fail as
 model_invalid_output: segment ID format, IDs inside the window, unique reason
@@ -212,12 +214,26 @@ def fitted_messages(window, examples):
 
 
 IMPLIED_EDITORIAL_CONFIDENCE = EDITORIAL_AUTO_THRESHOLD  # passes the threshold, claims nothing more
+# Below EDITORIAL_AUTO_THRESHOLD, so the policy's threshold makes it uncertain and keeps model_label editorial.
+IMPLIED_SIGNALLED_CONFIDENCE = 0.5
 IMPLIED_EDITORIAL_REASONS = ("substantive_content",)
 
 
 def _implied_editorial(window, first, last):
-    return BlockDecision(window.target_segments[first].id, window.target_segments[last].id, "editorial",
-                         IMPLIED_EDITORIAL_CONFIDENCE, IMPLIED_EDITORIAL_REASONS)
+    """Editorial decisions for the omitted target indexes first..last; runs inside a signal's range are not auto-accepted."""
+    signalled = set()
+    for signal in window.signals:  # A signal may touch context segments; ordinals are consecutive across the window.
+        start, end = int(signal.first_segment_id[4:10]), int(signal.last_segment_id[4:10])
+        signalled.update(index for index, segment in enumerate(window.target_segments)
+                         if start <= int(segment.id[4:10]) <= end)
+    runs, run_start = [], first
+    for index in range(first, last + 2):
+        if index > last or (index in signalled) != (run_start in signalled):
+            runs.append((run_start, index - 1))
+            run_start = index
+    return [BlockDecision(window.target_segments[a].id, window.target_segments[b].id, "editorial",
+                          IMPLIED_SIGNALLED_CONFIDENCE if a in signalled else IMPLIED_EDITORIAL_CONFIDENCE,
+                          IMPLIED_EDITORIAL_REASONS) for a, b in runs]
 
 
 def _decisions(parsed, window):
@@ -249,12 +265,12 @@ def _decisions(parsed, window):
                     or len(set(reasons)) != len(reasons)):
                 _fail()
             if first > cursor:
-                decisions.append(_implied_editorial(window, cursor, first - 1))
+                decisions.extend(_implied_editorial(window, cursor, first - 1))
             decisions.append(BlockDecision(entry["first_segment_id"], entry["last_segment_id"], label,
                                            float(confidence), tuple(reasons)))
             cursor = last + 1
         if cursor < len(window.target_segments):
-            decisions.append(_implied_editorial(window, cursor, len(window.target_segments) - 1))
+            decisions.extend(_implied_editorial(window, cursor, len(window.target_segments) - 1))
         return tuple(decisions)
     except ClassifierError:
         raise
