@@ -37,6 +37,7 @@ CLASSIFICATION_FAILURES = {"router_busy": "Model router busy", "model_invalid_ou
     "model_mismatch": "Classifier configuration", "storage_transient": "Storage unavailable",
     "worker_timeout": "Worker timeout", "invalid_canonical": "Transcript unavailable",
     "invalid_policy": "Policy unavailable", "revision_budget_exhausted": "Classification budget reached",
+    "model_unavailable": "Model failed on this input",
     "dispatch_pending": "Awaiting dispatch", "reclassify_queued": "Queued for reclassification",
     # Claude-era categories stay readable on stored rows.
     "claude_timeout": "Classifier timeout", "claude_unavailable": "Classifier unavailable",
@@ -59,12 +60,15 @@ def classification_view(latest=None, active=None):
 
 
 def classification_views(items):
-    """Two bounded revision joins for an entire item page, not one query per row."""
+    """Two bounded revision joins for an entire item page, not one query per row.
+
+    The state shown is the newest non-superseded revision: a cancelled reclassification must not hide the live one.
+    """
     if not items:
         return {}
     latest, active = aliased(ClassificationRevision), aliased(ClassificationRevision)
     newest = db.select(db.func.max(ClassificationRevision.id)).where(
-        ClassificationRevision.item_id == ContentItem.id,
+        ClassificationRevision.item_id == ContentItem.id, ClassificationRevision.state != "superseded",
         ClassificationRevision.transcript_sha256 == ContentItem.transcript_sha256).correlate(ContentItem).scalar_subquery()
     rows = db.session.execute(db.select(ContentItem.id, latest, active).select_from(ContentItem)
         .outerjoin(latest, latest.id == newest)

@@ -19,7 +19,7 @@ from integrations.knowledge.contract import ContractError, canonical_json, perso
 GUEST_PROMPT_VERSION = "episode-guest-extraction/v1"
 INFERRED_GUEST_MIN_CONFIDENCE = 0.5
 MAX_PARTICIPANTS = 50
-# An input the router itself failed on (reason router_failure) is retried on later runs
+# An input the router itself failed on (reason router_failure or provider_unavailable) is retried on later runs
 # and abandoned after this many recorded router failures.
 MAX_ROUTER_FAILURES = 3
 MAX_ADMIN_TEXT_CHARS = 10_000

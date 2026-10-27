@@ -1,15 +1,17 @@
 """Router classification: subset schema, Python-side checks, fitting and provenance; offline."""
 
+from dataclasses import replace
 from hashlib import sha256
 import json
 
 import pytest
 
-from commercial_policy import PROMPT_VERSION
+from commercial_policy import (EDITORIAL_AUTO_THRESHOLD, PROMPT_VERSION, ClassifierProvenance,
+                               PolicyValidationError)
 from commercial_signals import ClassifierWindow, Signal
 from config import load_settings
 import router_classifier
-from router_classifier import (OUTPUT_SCHEMA, SYSTEM_PROMPT, ClassifierError, ClassifierExample,
+from router_classifier import (IMPLIED_SIGNALLED_CONFIDENCE, OUTPUT_SCHEMA, SYSTEM_PROMPT, ClassifierError, ClassifierExample,
                                RouterClassifier, expected_provenance, fitted_messages)
 from router_client import CLASSIFICATION_CONTEXT_TOKENS, RouterClient, estimated_context_tokens
 from tests.router_fake import MODEL, FakeRouter, fake_router  # noqa: F401
@@ -26,10 +28,11 @@ def segment(index, text="Quoted transcript text"):
 
 def window(targets=(2, 3), before=(1,), after=(4,), texts=None):
     texts = texts or {}
+    # The signal ends at the second target: signals longer than 3 segments are rejected.
     target = tuple(segment(i, texts.get(i, "Quoted transcript text")) for i in targets)
     return ClassifierWindow(1, target, tuple(segment(i, texts.get(i, "Context text")) for i in before),
                             tuple(segment(i, texts.get(i, "Context text")) for i in after),
-                            (Signal("sponsor_transition", target[0].id, target[-1].id),))
+                            (Signal("sponsor_transition", target[0].id, target[:2][-1].id),))
 
 
 def entry(first, last, label="editorial", confidence=0.99, reasons=("substantive_content",)):
@@ -52,15 +55,23 @@ def test_output_schema_uses_only_the_router_subset():
     validate_schema(OUTPUT_SCHEMA)
     win = window()
     validate_instance({"ranges": [entry(win.target_segments[0].id, win.target_segments[-1].id)]}, OUTPUT_SCHEMA)
+    validate_instance({"ranges": []}, OUTPUT_SCHEMA)
     rendered = json.dumps(OUTPUT_SCHEMA)
     assert "pattern" not in rendered and "uniqueItems" not in rendered
     with pytest.raises(PinnedRouterError):
         validate_schema({"type": "string", "pattern": "^seg-[0-9]{6}-[a-f0-9]{16}$"})
 
 
-def test_the_system_prompt_and_prompt_version_are_the_claude_era_ones():
-    assert PROMPT_VERSION == "commercial-segment-classifier/v1"
-    assert sha256(SYSTEM_PROMPT.encode()).hexdigest() == "a31a17d2009232d861f122987e76b765be38964c63c28ecfb7b5ab3e4531b4f4"
+def test_the_prompt_asks_for_non_editorial_ranges_only_under_v2():
+    assert PROMPT_VERSION == "commercial-segment-classifier/v2"
+    assert "not plain editorial" in SYSTEM_PROMPT and "is editorial" in SYSTEM_PROMPT
+    assert OUTPUT_SCHEMA["properties"]["ranges"]["minItems"] == 0
+
+
+def test_claude_era_v1_provenance_stays_valid():
+    ClassifierProvenance("2.1.0", "claude-x", "claude-x", "commercial-segment-classifier/v1", "a" * 64)
+    with pytest.raises(PolicyValidationError):
+        ClassifierProvenance("2.1.0", "claude-x", "claude-x", "commercial-segment-classifier/v0", "a" * 64)
 
 
 def test_classify_sends_one_structured_task_and_returns_router_provenance(fake_router, classifier, settings):  # noqa: F811
@@ -89,7 +100,8 @@ def _bad_outputs():
         {"ranges": [entry("seg-00000x-aaaaaaaaaaaaaaaa", t3)]},
         {"ranges": [entry(segment(9).id, t3)]},
         {"ranges": [entry(t2, t3, reasons=("substantive_content", "substantive_content"))]},
-        {"ranges": [entry(t2, t2)]},
+        {"ranges": [entry(t3, t2)]},
+        {"ranges": [entry(t2, segment(4).id)]},
         {"ranges": [entry(t2, t3), entry(t3, t3)]},
         {"ranges": [entry(t3, t3), entry(t2, t2)]},
     ]
@@ -102,6 +114,55 @@ def test_checks_the_subset_cannot_express_fail_as_invalid_output(fake_router, cl
         classifier.classify(window())
     assert (caught.value.category, caught.value.reason, caught.value.advance_key) == (
         "model_invalid_output", "output_invalid", True)
+
+
+def _implied(first, last, confidence=EDITORIAL_AUTO_THRESHOLD):
+    return (first, last, "editorial", confidence, ("substantive_content",))
+
+
+def _rows(result):
+    return [(d.first_segment_id, d.last_segment_id, d.label, d.confidence, d.reason_codes) for d in result.decisions]
+
+
+def test_unlisted_target_segments_are_implied_editorial(fake_router, classifier):  # noqa: F811
+    win = window(targets=(2, 3, 4, 5, 6), before=(1,), after=(7,))
+    ids = [s.id for s in win.target_segments]
+    fake_router.output = {"ranges": [entry(ids[1], ids[2], "paid_commercial", 0.97, ("sponsor_transition",))]}
+    assert _rows(classifier.classify(win)) == [
+        _implied(ids[0], ids[0], IMPLIED_SIGNALLED_CONFIDENCE),  # inside the helper's signal (targets 1-2)
+        (ids[1], ids[2], "paid_commercial", 0.97, ("sponsor_transition",)),
+        _implied(ids[3], ids[4])]
+
+
+def test_omitted_targets_inside_a_signal_are_implied_at_the_below_threshold_confidence(fake_router, classifier):  # noqa: F811
+    win = window(targets=(2, 3, 4, 5, 6), before=(1,), after=(7,))
+    ids = [s.id for s in win.target_segments]
+    # The helper's signal covers targets 2-3; a second one runs from the context into target 6.
+    win = replace(win, signals=(*win.signals, Signal("sponsor_transition", segment(6).id, segment(7).id)))
+    fake_router.output = {"ranges": [entry(ids[1], ids[1], "paid_commercial", 0.97, ("sponsor_transition",))]}
+    rows = _rows(classifier.classify(win))
+    assert rows == [
+        (ids[0], ids[0], "editorial", IMPLIED_SIGNALLED_CONFIDENCE, ("substantive_content",)),
+        (ids[1], ids[1], "paid_commercial", 0.97, ("sponsor_transition",)),
+        (ids[2], ids[3], "editorial", EDITORIAL_AUTO_THRESHOLD, ("substantive_content",)),
+        (ids[4], ids[4], "editorial", IMPLIED_SIGNALLED_CONFIDENCE, ("substantive_content",))]
+    assert IMPLIED_SIGNALLED_CONFIDENCE < EDITORIAL_AUTO_THRESHOLD
+
+
+def test_an_empty_list_means_the_whole_block_is_editorial(fake_router, classifier):  # noqa: F811
+    win = window(targets=(2, 3, 4), after=(5,))
+    fake_router.output = {"ranges": []}
+    ids = [s.id for s in win.target_segments]
+    assert _rows(classifier.classify(win)) == [_implied(ids[0], ids[1], IMPLIED_SIGNALLED_CONFIDENCE), _implied(ids[2], ids[2])]
+
+
+def test_explicit_editorial_ranges_and_full_coverage_still_work(fake_router, classifier):  # noqa: F811
+    win = window()
+    t2, t3 = (s.id for s in win.target_segments)
+    fake_router.output = {"ranges": [entry(t2, t2), entry(t3, t3, "housekeeping", 0.96, ("routine_housekeeping",))]}
+    assert _rows(classifier.classify(win)) == [
+        (t2, t2, "editorial", 0.99, ("substantive_content",)),
+        (t3, t3, "housekeeping", 0.96, ("routine_housekeeping",))]
 
 
 def test_examples_are_trimmed_until_the_request_fits():

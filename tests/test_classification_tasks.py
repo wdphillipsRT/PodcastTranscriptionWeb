@@ -114,16 +114,24 @@ def test_fast_worker_cannot_be_overwritten_by_publication_cleanup(worker, monkey
     assert revision.celery_task_id.endswith("-finalize")
 
 
-@pytest.mark.parametrize("category", ["model_invalid_output", "storage_transient"])
-def test_transient_errors_exhaust_at_five_persisted_failures(worker, category):
+def test_invalid_model_output_gets_two_attempts_because_temperature_zero_replays_it(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.env.classifier.error = ClassifierError("model_invalid_output", advance_key=True)
+    task().run(identity, "block", 1)
+    assert db.session.get(m.ClassificationRevision, identity).state == "retrying"
+    task().run(identity, "block", 1)
+    revision = db.session.get(m.ClassificationRevision, identity)
+    assert (revision.state, revision.error_category, revision.attempts) == ("failed", "model_invalid_output", 2)
+
+
+def test_transient_errors_exhaust_at_five_persisted_failures(worker):
+    category = "storage_transient"
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
     worker.sent.clear()
-    if category == "storage_transient":
-        from s3_utils import StorageTransientError
-        worker.env.classifier.error = StorageTransientError("private storage payload")
-    else:
-        worker.env.classifier.error = ClassifierError(category)
+    from s3_utils import StorageTransientError
+    worker.env.classifier.error = StorageTransientError("private storage payload")
     for attempt in range(1, 6):
         task().run(identity, "block", 1)
         revision = db.session.get(m.ClassificationRevision, identity)
@@ -349,7 +357,8 @@ def test_queued_message_delivered_during_disabled_rollout_remains_recoverable(wo
 def test_fast_retry_same_task_id_cannot_lose_new_outbox(worker, monkeypatch):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
-    worker.env.classifier.error = ClassifierError("model_invalid_output")
+    from s3_utils import StorageTransientError
+    worker.env.classifier.error = StorageTransientError("private storage payload")
     sending = []
     def fast(name, *, args, **options):
         worker.send(name, args=args, **options)
@@ -440,6 +449,98 @@ def test_aged_queued_retry_replays_without_consuming_fifth_attempt(worker, phase
     assert 241 <= worker.sent[-1][2]["countdown"] <= 270
     reconcile()
     assert len(worker.sent) == 1 and revision.attempts == 4
+
+
+def test_slow_provider_failures_on_one_block_fail_the_revision_on_the_third(worker, monkeypatch):
+    monkeypatch.setattr(tasks, "INPUT_FAILURE_MIN_SECONDS", 0)
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.env.classifier.error = ClassifierError("router_busy", reason="provider_unavailable", advance_key=True)
+    for attempt in (1, 2, 3):
+        task().run(identity, "block", 1)
+        revision = db.session.get(m.ClassificationRevision, identity)
+        block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+        assert block.provider_failures == attempt
+        if attempt < 3:
+            assert (revision.state, revision.attempts, block.state) == ("retrying", 0, "pending")
+    assert (revision.state, revision.error_category, revision.attempts) == ("failed", "model_unavailable", 1)
+    assert (block.state, block.error_category) == ("failed", "model_unavailable")
+    prefix = f"podcast.classification:rev-{identity}:block-1:g"
+    assert worker.env.classifier.keys == [prefix + "0", prefix + "1", prefix + "2"]
+
+
+def test_the_real_60_second_rule_counts_a_provider_failure_after_a_61_second_call(worker, monkeypatch):
+    assert tasks.INPUT_FAILURE_MIN_SECONDS == 60
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    offset = [timedelta(0)]
+    real_now = m.utc_now
+    monkeypatch.setattr(m, "utc_now", lambda: real_now() + offset[0])  # tasks imports it per call
+    # The claim token includes started_at, so the clock moves instead of the stored timestamp.
+    worker.env.classifier.on_call = lambda: offset.__setitem__(0, timedelta(seconds=61))
+    worker.env.classifier.error = ClassifierError("router_busy", reason="provider_unavailable", advance_key=True)
+    task().run(identity, "block", 1)
+    block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+    assert block.provider_failures == 1
+
+
+def test_a_revision_created_under_the_previous_prompt_is_superseded_and_handed_off(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    db.session.execute(sa.update(m.ClassificationRevision).where(m.ClassificationRevision.id == identity)
+        .values(prompt_version="commercial-segment-classifier/v1", prompt_sha256="1" * 64))
+    db.session.commit()
+    sent = len(worker.sent)
+    task().run(identity, "prepare")
+    assert db.session.get(m.ClassificationRevision, identity).state == "superseded"
+    handoff = m.ClassificationRevision.query.filter(m.ClassificationRevision.id > identity).one()
+    assert handoff.request_reason == "policy_upgrade" and handoff.prompt_sha256 != "1" * 64
+    assert worker.sent[sent][1] == [handoff.id, "prepare", None]
+
+
+def test_fast_provider_failures_stay_busy_and_are_not_counted(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.env.classifier.error = ClassifierError("router_busy", reason="provider_unavailable", advance_key=True)
+    for _ in range(5):
+        task().run(identity, "block", 1)
+    revision = db.session.get(m.ClassificationRevision, identity)
+    block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+    assert (revision.state, revision.error_category, block.provider_failures) == ("retrying", "router_busy", 0)
+
+
+@pytest.mark.parametrize("reason", ["rate_limited", "in_progress", "timeout", "transport", "proxy", "no_candidate", "router_failure"])
+def test_other_busy_outcomes_never_count_as_provider_failures(worker, monkeypatch, reason):
+    monkeypatch.setattr(tasks, "INPUT_FAILURE_MIN_SECONDS", 0)
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.env.classifier.error = ClassifierError("router_busy", reason=reason)
+    for _ in range(4):
+        task().run(identity, "block", 1)
+    block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+    assert block.provider_failures == 0
+    assert db.session.get(m.ClassificationRevision, identity).state == "retrying"
+
+
+def test_a_stale_claims_provider_failure_changes_nothing(worker, monkeypatch):
+    monkeypatch.setattr(tasks, "INPUT_FAILURE_MIN_SECONDS", 0)
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    error = ClassifierError("router_busy", reason="provider_unavailable", advance_key=True)
+
+    def superseded(*args, **kwargs):
+        # Another claim takes the block mid-call, so this claim's token no longer matches.
+        block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+        block.attempts += 1
+        db.session.commit()
+        raise error
+
+    monkeypatch.setattr(worker.env.classifier, "classify", superseded)
+    worker.sent.clear()
+    task().run(identity, "block", 1)
+    revision = db.session.get(m.ClassificationRevision, identity)
+    block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+    assert block.provider_failures == 0
+    assert revision.state not in {"failed", "retrying"} and block.state == "running" and not worker.sent
 
 
 def test_a_busy_router_retries_the_same_block_with_doubling_back_off(worker):

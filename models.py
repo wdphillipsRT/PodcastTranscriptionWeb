@@ -498,6 +498,9 @@ class ClassificationBlock(Timestamps, db.Model):
     request_generation = db.Column(db.Integer, nullable=False, default=0, server_default="0")
     # When the current generation's key was first sent; a 202 long after it means a stuck key.
     request_generation_started_at = db.Column(UTCDateTime())
+    # Router-stored MODEL_PROVIDER_UNAVAILABLE outcomes that arrived after the claim ran at
+    # least tasks.INPUT_FAILURE_MIN_SECONDS on this input.
+    provider_failures = db.Column(db.Integer, nullable=False, default=0, server_default="0")
     target_first_segment_id = db.Column(db.String(27), nullable=False)
     target_last_segment_id = db.Column(db.String(27), nullable=False)
     input_sha256 = db.Column(db.String(64), nullable=False)
@@ -595,7 +598,7 @@ class GuestExtraction(db.Model):
     error_category = db.Column(db.String(64))
     model = db.Column(db.String(128), nullable=False)
     cost_microusd = db.Column(db.BigInteger, nullable=False, default=0, server_default="0")
-    # Recorded router failures (reason router_failure) for this input; it is retried below the limit.
+    # Recorded router failures (reason router_failure or provider_unavailable) for this input; it is retried below the limit.
     router_failures = db.Column(db.Integer, nullable=False, default=0, server_default="0")
     # When the latest call was recorded: a retried input's row is re-stamped; a completed row never changes.
     created_at = db.Column(UTCDateTime(), nullable=False, default=utc_now, server_default=sa.func.now(), index=True)

@@ -67,6 +67,22 @@ def test_review_is_authenticated_escaped_and_private(review, app):
     assert "First editorial insight" not in api and review.item.transcript_sha256 not in api
 
 
+def test_the_item_list_shows_the_newest_non_superseded_revision(review):
+    active = db.session.get(m.ClassificationRevision, review.active)
+    assert review.item.active_classification_revision_id == active.id and active.state == "completed"
+    columns = {c.name: getattr(active, c.name) for c in m.ClassificationRevision.__table__.columns if c.name != "id"}
+    db.session.add(m.ClassificationRevision(**{**columns, "revision": active.revision + 1, "state": "superseded",
+        "previous_revision_id": active.id, "idempotency_key": "reclassify:cancelled", "policy_s3_key": None,
+        "policy_sha256": None, "projection_s3_key": None, "projection_sha256": None}))
+    db.session.commit()
+    from web.routes import classification_views
+    with review.client.application.test_request_context():
+        from flask_login import login_user
+        login_user(review.owner)
+        view = classification_views([review.item])[review.item.id]
+    assert view["state"] == "Completed" and view["available"]
+
+
 def test_items_without_active_policy_do_not_offer_empty_review_page(review):
     failed = m.ContentItem(admin_id=review.owner.id, platform="podcast", item_type="podcast_episode",
         external_id="failed-media", canonical_url="https://example.com/failed", title="Failed", status="failed")

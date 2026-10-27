@@ -21,9 +21,9 @@ retried for that input, and the run moves on. A busy router (`router_busy`: in
 progress, rate limited, a timeout, a dropped connection, the proxy, no eligible
 candidate) stops the run without a record, so the item is tried again next run.
 A router failure with the router's own error body (`router_busy` with reason
-`router_failure`: 504 MODEL_TIMEOUT for an input the model never finishes, 502
-for an unavailable provider, 500) is recorded as failed (`router_busy`) and
-then stops the run. Such an input is retried on later runs, after every input
+`router_failure` or `provider_unavailable`: 504 MODEL_TIMEOUT for an input the
+model never finishes, 502 MODEL_PROVIDER_UNAVAILABLE, 500) is recorded as
+failed (`router_busy`) and then stops the run. Such an input is retried on later runs, after every input
 never tried, so it cannot block them, and is abandoned after
 MAX_ROUTER_FAILURES recorded router failures; its one row is updated in place.
 Environmental failures (authentication, configuration, a model other than the
@@ -298,7 +298,7 @@ def _extract(session, extractor, settings, clock, monotonic, counts):
             result = extractor.extract(show=entry["show"], hosts=entry["hosts"], title=entry["title"],
                                        description=entry["description"], request_key=key)
         except RouterError as error:
-            router_failure = error.category == "router_busy" and error.reason == "router_failure"
+            router_failure = error.category == "router_busy" and error.reason in {"router_failure", "provider_unavailable"}
             if error.category in ENVIRONMENTAL or (error.category == "router_busy" and not router_failure):
                 counts["stopped"] = error.category
                 break

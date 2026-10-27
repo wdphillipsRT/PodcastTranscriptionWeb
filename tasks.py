@@ -963,6 +963,16 @@ def _classification_delay(attempts):
     return min(3600, 30 * 2 ** (attempts - 1)) + random.uniform(1, 30)
 
 
+# A router-stored 5xx MODEL_PROVIDER_UNAVAILABLE (reason provider_unavailable)
+# after the model ran this long is attributed to the block's input; a Forge
+# outage fails faster and stays busy.
+INPUT_FAILURE_MIN_SECONDS = 60
+MAX_BLOCK_PROVIDER_FAILURES = 3
+MAX_CLASSIFICATION_ATTEMPTS = 5
+# Temperature 0: a new key regenerates the same invalid answer, so one confirmation is enough.
+MAX_INVALID_OUTPUT_ATTEMPTS = 2
+
+
 def _busy_delay(block_attempts):
     """30 seconds, doubling per busy claim of the block, capped at 10 minutes."""
     return min(600, 30 * 2 ** (min(max(block_attempts, 1), 6) - 1))
@@ -971,10 +981,20 @@ def _busy_delay(block_attempts):
 def _classification_failed(revision_id, phase, ordinal, category, reason=None):
     """Caller holds the item lock; revision attempts count failed calls only.
 
+    A revision gets MAX_CLASSIFICATION_ATTEMPTS counted failures, but an invalid
+    output fails the revision once its counted failures reach
+    MAX_INVALID_OUTPUT_ATTEMPTS (the counter is shared across categories):
+    calls run at temperature 0, so a new key replays the same invalid answer.
+
     A busy router is not a failure: the attempt budget is untouched, the block
     returns to pending, and the same block is retried after a back-off that
     doubles from 30 seconds to 10 minutes. A key conflict (`model_config` with
     reason `conflict`) is a counted failure retried under the block's next key.
+
+    A `router_busy` with reason `provider_unavailable` (MODEL_PROVIDER_UNAVAILABLE) that arrives after the claim ran
+    at least INPUT_FAILURE_MIN_SECONDS is counted on the block; the third becomes
+    the permanent `model_unavailable`, which counts one attempt and fails the
+    revision and block without a retry. Faster failures stay busy and uncounted.
     """
     from classification_service import (RETRYABLE_CLASSIFICATION_ERRORS, PERMANENT_CLASSIFICATION_ERRORS,
                                          key_conflict)
@@ -986,10 +1006,18 @@ def _classification_failed(revision_id, phase, ordinal, category, reason=None):
     if revision.state in {"completed", "superseded"}:
         db.session.commit()
         return None, None, None
+    if category == "router_busy" and reason == "provider_unavailable" and ordinal is not None:
+        counted = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id, ordinal=ordinal).one_or_none()
+        if (counted is not None and counted.started_at is not None
+                and (utc_now() - counted.started_at).total_seconds() >= INPUT_FAILURE_MIN_SECONDS):
+            counted.provider_failures += 1
+            if counted.provider_failures >= MAX_BLOCK_PROVIDER_FAILURES:
+                category = "model_unavailable"
     busy = category == "router_busy"
     if not busy:
         revision.attempts += 1
-    retry = busy or (category in RETRYABLE_CLASSIFICATION_ERRORS or key_conflict(category, reason)) and revision.attempts < 5
+    limit = MAX_INVALID_OUTPUT_ATTEMPTS if category == "model_invalid_output" else MAX_CLASSIFICATION_ATTEMPTS
+    retry = busy or (category in RETRYABLE_CLASSIFICATION_ERRORS or key_conflict(category, reason)) and revision.attempts < limit
     revision.state = "retrying" if retry else "failed"
     revision.error_category = "dispatch_pending" if retry else category
     revision.heartbeat_at = utc_now()
@@ -1160,6 +1188,29 @@ def release_reclassification():
     dispatch = _revision_dispatch(held)
     db.session.commit()
     return dispatch
+
+
+def cancel_reclassification():
+    """Supersede every held reclassification revision in one transaction; returns how many.
+
+    Only held revisions change (`pending`, `reclassify_queued`, never started). They were never
+    prepared, so they have no blocks and nothing in flight, and they are never an item's active
+    revision, so items keep what they export and show. Released, running and finished revisions
+    are untouched. Under the same classifier provenance a cancelled item is not queued again:
+    its superseded revision still carries the key `queue_reclassification` checks. A new model pin,
+    router route or prompt gives a new key prefix, which makes every cancelled item a candidate again.
+    """
+    import sqlalchemy as sa
+    from extensions import db
+    from models import ClassificationRevision, utc_now
+    if db.engine.dialect.name == "postgresql":
+        db.session.execute(sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": _RECLASSIFY_RELEASE_LOCK})
+    count = db.session.query(ClassificationRevision).filter(
+        ClassificationRevision.state == "pending", ClassificationRevision.error_category == RECLASSIFY_QUEUED,
+        ClassificationRevision.started_at.is_(None)).update(
+        {"state": "superseded", "error_category": None, "updated_at": utc_now()}, synchronize_session="fetch")
+    db.session.commit()
+    return count
 
 
 @celery_app.task(name="tasks.classify_item", queue="classification")

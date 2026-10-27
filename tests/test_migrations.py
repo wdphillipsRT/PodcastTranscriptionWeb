@@ -55,7 +55,7 @@ def test_initial_migration_upgrade_schema_and_downgrade(app_factory, tmp_path):
             assert db.metadata.tables["content_items"].c.remote_media_url.type.compile(
                 dialect=dialect) == "VARCHAR(4096)"
         with db.engine.connect() as connection:
-            assert connection.scalar(sa.text("select version_num from alembic_version")) == "0004_router_classification"
+            assert connection.scalar(sa.text("select version_num from alembic_version")) == "0005_block_provider_failures"
             retained = connection.execute(sa.text("SELECT status, transcript_s3_key, transcript_sha256, segments_s3_key, segments_sha256, active_classification_revision_id FROM content_items WHERE id = 1")).one()
             assert tuple(retained) == ("completed", "transcript.json", "a" * 64, "segments.json", "a" * 64, None)
             assert connection.scalar(sa.text("SELECT count(*) FROM source_items WHERE item_id = 1")) == 1
@@ -169,7 +169,7 @@ def test_knowledge_export_migration_keeps_rows_and_reverses(app_factory, tmp_pat
     result = runner.invoke(args=["db", "upgrade"])
     assert result.exit_code == 0, result.output + repr(result.exception)
     with app.app_context(), db.engine.connect() as connection:
-        assert connection.scalar(sa.text("select version_num from alembic_version")) == "0004_router_classification"
+        assert connection.scalar(sa.text("select version_num from alembic_version")) == "0005_block_provider_failures"
         assert tuple(connection.execute(sa.text(
             "SELECT feed_hosts, admin_hosts, hosts_updated_at FROM content_sources WHERE id = 1")).one()) == (None, None, None)
         assert tuple(connection.execute(sa.text(
@@ -220,7 +220,9 @@ def test_router_classification_migration_adds_and_removes_the_block_key_generati
         guest = {column["name"]: column for column in sa.inspect(connection).get_columns("guest_extractions")}
         assert guest["router_failures"]["nullable"] is False
         assert str(guest["router_failures"]["default"]).strip("'\"") == "0"
-        assert connection.scalar(sa.text("select version_num from alembic_version")) == "0004_router_classification"
+        provider = {c["name"]: c for c in sa.inspect(connection).get_columns("classification_blocks")}["provider_failures"]
+        assert provider["nullable"] is False and str(provider["default"]).strip("'\"") == "0"
+        assert connection.scalar(sa.text("select version_num from alembic_version")) == "0005_block_provider_failures"
         context = MigrationContext.configure(connection, opts={"compare_type": True, "compare_server_default": True})
         assert compare_metadata(context, db.metadata) == []
     result = runner.invoke(args=["db", "downgrade", "0003_knowledge_export"])
@@ -249,3 +251,19 @@ def test_router_classification_migration_renders_postgresql():
     assert "ALTER TABLE classification_blocks DROP COLUMN request_generation_started_at" in statements
     assert "ALTER TABLE guest_extractions ADD COLUMN router_failures INTEGER DEFAULT '0' NOT NULL" in statements
     assert "ALTER TABLE guest_extractions DROP COLUMN router_failures" in statements
+
+
+def test_block_provider_failures_migration_renders_postgresql():
+    path = Path(__file__).resolve().parents[1] / "migrations/versions/0005_block_provider_failures.py"
+    specification = importlib.util.spec_from_file_location("provider_failures_migration", path)
+    migration = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(migration)
+    assert (migration.revision, migration.down_revision) == ("0005_block_provider_failures", "0004_router_classification")
+    sql = StringIO()
+    context = MigrationContext.configure(dialect_name="postgresql", opts={"as_sql": True, "output_buffer": sql})
+    with Operations.context(context):
+        migration.upgrade()
+        migration.downgrade()
+    statements = sql.getvalue()
+    assert "ALTER TABLE classification_blocks ADD COLUMN provider_failures INTEGER DEFAULT '0' NOT NULL" in statements
+    assert "ALTER TABLE classification_blocks DROP COLUMN provider_failures" in statements

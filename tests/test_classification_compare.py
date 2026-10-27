@@ -136,6 +136,32 @@ def test_invalid_model_output_is_counted_and_the_run_continues(worker):  # noqa:
     assert (total["invalid_output"], total["blocks"], total["items"]) == (1, 0, 1)
 
 
+def test_a_slow_provider_failure_is_the_model_failing_on_the_input_and_is_not_retried(worker):  # noqa: F811
+    env = worker.env
+    classified(env, "provider-slow")
+    clock = [0.0]
+    env.classifier.error = ClassifierError("router_busy", reason="provider_unavailable", advance_key=True)
+    env.classifier.on_call = lambda: clock.__setitem__(0, clock[0] + 61)
+    env.classifier.calls.clear()
+    waits = []
+    report = compare(env, sample=1, sleep=waits.append, monotonic=lambda: clock[0])
+    total = report["total"]
+    assert len(env.classifier.calls) == 1 and waits == []
+    assert (total["provider_unavailable"], total["busy_skipped"], total["blocks"], total["items"]) == (1, 0, 0, 1)
+    assert report["episodes"][0]["provider_unavailable"] == 1 and "skipped" not in report["episodes"][0]
+
+
+def test_a_fast_provider_failure_stays_busy_and_is_retried(worker):  # noqa: F811
+    env = worker.env
+    classified(env, "provider-fast")
+    env.classifier.error = ClassifierError("router_busy", reason="provider_unavailable", advance_key=True)
+    env.classifier.calls.clear()
+    waits = []
+    report = compare(env, sample=1, sleep=waits.append)
+    assert waits == [30, 60, 120, 240, 480] and len(env.classifier.calls) == 6
+    assert (report["total"]["provider_unavailable"], report["total"]["busy_skipped"]) == (0, 1)
+
+
 def test_the_command_prints_json_and_stops_on_a_permanent_router_error(worker):  # noqa: F811
     env = worker.env
     classified(env, "cli-one")

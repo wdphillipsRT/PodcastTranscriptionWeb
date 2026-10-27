@@ -201,3 +201,14 @@ def test_status_shows_busy_revisions_and_the_oldest_busy_block(worker):
     assert result.exit_code == 0, result.output
     assert (f"router_busy=1 oldest_busy_key_sent={sent.isoformat()} oldest_busy_updated={updated.isoformat()}"
             in result.output)
+
+
+def test_reclassify_cancel_prints_the_number_of_cancelled_revisions(worker):
+    worker.app.config["CLASSIFICATION_ENABLED"] = False
+    add_item(worker.env, external_id="second")
+    assert invoke(worker, "reclassify-all", "--limit", "1").exit_code == 0
+    result = invoke(worker, "reclassify-cancel")
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "cancelled=0"
+    assert invoke(worker, "reclassify-all").exit_code == 0
+    assert invoke(worker, "reclassify-cancel").output.strip() == "cancelled=1"

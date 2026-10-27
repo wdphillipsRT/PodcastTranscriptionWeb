@@ -226,8 +226,9 @@ limited, timed out, unreachable, or no eligible model) stops the run without a
 record, so the item is tried again next hour. A router failure reported by the
 router itself (for example a 504 model timeout on an input the model never
 finishes, or a model server that is down) is recorded as `failed` with
-category `router_busy` and stops the run. That input is retried on later runs,
-after every input never tried, so it cannot block them, and is given up after
+category `router_busy` and stops the run; the client reasons `router_failure`
+and `provider_unavailable` are both recorded this way. That input is retried on
+later runs, after every input never tried, so it cannot block them, and is given up after
 three router failures (`MAX_ROUTER_FAILURES`, counted in
 `guest_extractions.router_failures`). Authentication, configuration and
 model-mismatch errors stop the run without a record. Before each call the run
@@ -571,10 +572,25 @@ Router failures become closed categories:
 | Router response | Category | Effect |
 | --- | --- | --- |
 | 429, 202 (still running), 500, 503, 504, other 502, timeout, refused or reset connection, Celery soft time limit | `router_busy` | Block back to pending, revision `retrying`; retried after 30 s doubling to 10 min; never counts as a failed attempt |
-| 502 `MODEL_OUTPUT_INVALID`, or output failing the Python checks | `model_invalid_output` | Retried; counts toward the five attempts |
+| A router 5xx `MODEL_PROVIDER_UNAVAILABLE` (client reason `provider_unavailable`) after the claim ran `INPUT_FAILURE_MIN_SECONDS` (60 s) or more, the third time on the same block (`MAX_BLOCK_PROVIDER_FAILURES`) | `model_unavailable` | Revision fails; `classification retry --item-id <id>` after the cause is fixed. Other coded 5xx (reason `router_failure`) and faster failures stay `router_busy` |
+| 502 `MODEL_OUTPUT_INVALID`, or output failing the Python checks | `model_invalid_output` | Retried once under a new key (temperature 0 replays the same answer); the revision fails once its counted failures reach 2 (`MAX_INVALID_OUTPUT_ATTEMPTS`). Other failures still count toward `MAX_CLASSIFICATION_ATTEMPTS` (5) |
 | 401, 403, certificate verification failure or TLS alert, unusable token | `model_auth` | Revision fails |
 | Other 4xx, request too large | `model_config` | Revision fails |
 | `selected_model` not `ROUTER_EXPECTED_MODEL` | `model_mismatch` | Revision fails |
+
+The classifier prompt (`commercial-segment-classifier/v2`) asks the model to list
+only the target segments that are not plain editorial content. Every target
+segment it does not list is recorded as editorial (decision source `model`,
+confidence 0.80 `IMPLIED_EDITORIAL_CONFIDENCE`, reason `substantive_content`);
+an empty list means the whole block is editorial, except stretches inside a
+classifier signal's range, which get 0.50. Ranges must be in order and must not
+overlap. A target segment inside the range of a classifier signal that the
+model leaves out gets confidence 0.50 (`IMPLIED_SIGNALLED_CONFIDENCE`),
+so the threshold stores it as `uncertain` with `model_label` `editorial` and
+review is required. Under prompt v2, 0.80 and 0.50 are how implied decisions
+are recognised in stored artifacts; the model can also emit those values, so
+this is a heuristic. Claude-era policies keep `commercial-segment-classifier/v1`
+and stay valid.
 
 Each block call uses the idempotency key
 `podcast.classification:rev-<revision>:block-<ordinal>:g<generation>`. The
@@ -590,8 +606,14 @@ so time spent waiting for a busy router does not count. The classifier runs one
 task at a time, so the application never has more than one router request in
 flight.
 
-Busy retries never end by design: a revision waiting on a busy router stays
-`retrying` with `router_busy` until the router answers. To spot them, run
+Busy retries end only for one case: a block on which the model itself fails
+slowly three times (`classification_blocks.provider_failures`) fails as
+`model_unavailable`, so one bad input cannot stall the queue or keep tripping the
+shared Forge circuit breaker. The 60-second rule is a heuristic: a call that fails fast is
+treated as an outage and stays busy, while a Forge outage that fails after 60 seconds or more
+counts against the block too; after the outage, recover the item with
+`classification retry --item-id <id>`. Otherwise they never end by design: a revision
+waiting on a busy router stays `retrying` with `router_busy` until the router answers. To spot them, run
 `docker compose exec classifier flask --app app:create_app classification status`
 and read `router_busy=<count>`, `oldest_busy_key_sent=` and
 `oldest_busy_updated=`; the item page shows "Model router busy". A 503
@@ -695,15 +717,35 @@ it is retried, that episode cannot be exported (the exporter needs its latest
 revision), while the record already exported for it stays live. Retry it with
 `classification retry --item-id <id>`.
 
+`classification reclassify-cancel` (stop `classifier` first) supersedes every
+held revision (`reclassify_queued`) and prints `cancelled=<n>`; the episodes
+keep their current revision and export as before. After a prompt or model
+change, cancel the old queue, then run `reclassify-all` again: it queues under
+the new classifier's key prefix. Notes:
+
+- Under the same classifier provenance `reclassify-all` skips cancelled items
+  (their key still matches) and `classification retry` does not apply, because
+  the revision is superseded, not failed. A changed prompt, model or route
+  gives a new key prefix, and `reclassify-all` queues them again (restoring
+  prompt v1 is such a change).
+- Before running `reclassify-all` under a new provenance, let any released or
+  running revision finish, or accept that it will be superseded.
+- Cancelled items export normally again on the next nightly run (they have no
+  newer held revision) until `reclassify-all` holds them again.
+
 ### Upgrading from Claude classification
 
 Upgrading an existing deployment applies migration `0004_router_classification`,
 which only adds columns (`classification_blocks.request_generation`,
-`request_generation_started_at` and `guest_extractions.router_failures`). Its
-`ALTER TABLE` needs an exclusive lock, so stop the writers (`web`, `worker`,
-`beat`, `classifier`, `exporter`) before migrating. The operator script
+`request_generation_started_at` and `guest_extractions.router_failures`), and
+`0005_block_provider_failures`, which adds
+`classification_blocks.provider_failures`. Their `ALTER TABLE` statements need
+an exclusive lock, so stop the writers (`web`, `worker`, `beat`, `classifier`,
+`exporter`) before migrating. The operator script
 `~/Bezalel/knowledge-intake-work/podcast-router-upgrade.sh` performs the
-backup, build, migration, startup and smoke checks.
+backup, build, migration, startup and smoke checks. A revision that failed as
+`model_unavailable` is retried with `classification retry --item-id <id>` once
+the model or the input problem is fixed.
 
 Run `classification reclassify-all` (or keep the exporter stopped)
 before the next nightly export after the upgrade. The episode record now carries
@@ -720,16 +762,26 @@ router-classified episodes fail validation on the review page and in the
 exporter. The previous code has no command that reclassifies an episode whose
 active revision the router produced. The documented rollback is therefore to
 restore the PostgreSQL backup taken before the upgrade (the upgrade script
-writes it to `~/PodcastTranscriptionWeb-backups/postgres-<stamp>-*.dump`),
+writes it to `~/PodcastTranscriptionWeb-backups/postgres-<stamp>-*.dump`; use the
+dump from the router upgrade, not the one named `-pre7c-`),
 losing every change since. In this order:
 
 1. Stop the writers.
-2. Downgrade migration `0004` with the current image, which is the only one that
-   has it. This drops the three columns.
+2. Downgrade migrations `0005` and `0004` with the current image, which is the
+   only one that has them. This drops the four columns.
 3. Restore the pre-upgrade backup as described in
    [PostgreSQL backup and restore](#postgresql-backup-and-restore).
-4. Check out the previous revision, rebuild the images, and start the services.
-5. Restore `.runtime/claude` from the archive the upgrade script suggested
+4. Check out the previous revision and restore the image. The upgrade script
+   tagged the pre-upgrade image `podcast-transcription:pre-router`; if
+   `docker image inspect podcast-transcription:pre-router` still finds it, run
+   `docker tag podcast-transcription:pre-router podcast-transcription:local`
+   instead of rebuilding. Otherwise rebuild the images.
+5. Recreate the Compose network before starting. The current Compose file pins
+   `podcasttranscriptionweb_default` to `192.168.144.0/20`; the previous
+   revision's file does not, so run `docker compose down --remove-orphans`
+   (never `-v`, which deletes the database volume) and let Compose create the
+   network again. Then start the services.
+6. Restore `.runtime/claude` from the archive the upgrade script suggested
    (`~/PodcastTranscriptionWeb-backups/claude-runtime-<stamp>.tar.gz`), or
    authenticate the Claude CLI again, because the previous classifier needs it.
 
@@ -738,13 +790,29 @@ docker compose stop web worker beat classifier exporter
 docker compose run --rm --no-deps migrate flask --app app:create_app db downgrade 0003_knowledge_export
 # Restore the pre-upgrade backup, then:
 git checkout <previous revision>
-docker compose build
+docker image inspect podcast-transcription:pre-router >/dev/null &&
+  docker tag podcast-transcription:pre-router podcast-transcription:local ||
+  docker compose build
+docker compose down --remove-orphans   # never -v
 (umask 077 && tar -C .runtime -xzf ~/PodcastTranscriptionWeb-backups/claude-runtime-<stamp>.tar.gz)
 ```
 
-Upgrading again recreates `request_generation` as 0 for every block, so keys
+After rolling back past `0004`, upgrading again recreates `request_generation` as 0 for every block, so keys
 from generation `g0` repeat and the router may replay the outcome it stored for
 them earlier; a replayed failure advances the key and counts as one attempt.
+
+### Rolling back Plan 7c
+
+Plan 7c adds migration `0005_block_provider_failures` and writes policies with
+`prompt_version` `commercial-segment-classifier/v2`, which the 7b code rejects
+because it accepts only v1. Rolling back 7c to 7b therefore also needs a
+restore, in this order: stop the writers; run
+`db downgrade 0004_router_classification` with the 7c image; restore the
+pre-7c backup (the 7c upgrade script writes
+`~/PodcastTranscriptionWeb-backups/postgres-<stamp>-pre7c-*.dump`); check out
+the 7b revision and rebuild, or tag the saved image with
+`docker tag podcast-transcription:pre-7c podcast-transcription:local`; then
+start the services.
 
 ## Build, migrate, start, and provision the administrator
 
@@ -1011,7 +1079,7 @@ Use no existing application volume, router credential directory, or administrato
 Override the classifier's credential bind with a unique private disposable host
 directory (owned by 1000:1000, mode 700), even when testing its failure without
 credentials. Never reuse the deployed router bundle. Verify migration head
-`0004_router_classification`, provision a temporary sole admin, and record
+`0005_block_provider_failures`, provision a temporary sole admin, and record
 all sixteen table counts: `admins`, `content_sources`, `content_items`,
 `source_items`, `backfill_requests`, `discovery_runs`, `discovery_candidates`,
 `processing_jobs`, `classification_revisions`, `classification_blocks`,

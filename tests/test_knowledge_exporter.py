@@ -147,6 +147,18 @@ def test_a_new_classification_revision_supersedes_the_exported_one(ready):
     assert segments[0]["attributes"]["segment_ids"] == [segment.id for segment in ready.transcript.segments]
 
 
+def test_an_export_recorded_under_pre_upgrade_facts_is_superseded_once_then_unchanged(ready):
+    export(ready)
+    row = m.KnowledgeItemExport.query.one()
+    first = row.episode_record_id
+    row.payload_sha256 = "0" * 64  # what a pre-7b exporter left: same revision, different facts
+    db.session.commit()
+    report = export(ready, now=NOW + timedelta(days=1))
+    episode = batch_records(ready, report.batches[0])[0]
+    assert episode["record_id"] == first[:-2] + "e2" and episode["supersedes"] == first
+    assert export(ready, now=NOW + timedelta(days=2)).batches == []
+
+
 def test_items_without_a_host_or_awaiting_guests_wait(ready):
     ready.source.feed_hosts = None
     db.session.commit()
@@ -200,6 +212,19 @@ def test_unavailable_projection_skips_the_item_without_reading_raw_text(ready):
     report = export(ready)
     assert report.skipped == {"projection_unavailable": 1} and report.batches == []
     assert not any(key.endswith(".txt") for key, _ in ready.storage.reads)
+
+
+def test_a_cancelled_reclassification_no_longer_blocks_the_export(ready):
+    import tasks
+    held = ready.service.ensure_revision(ready.item.id, "policy_upgrade", idempotency_key="reclassify:test")
+    db.session.execute(sa.update(m.ClassificationRevision).where(m.ClassificationRevision.id == held)
+                       .values(error_category="reclassify_queued"))
+    db.session.commit()
+    assert export(ready).skipped == {"projection_unavailable": 1}
+    assert tasks.cancel_reclassification() == 1
+    report = export(ready)
+    assert not report.skipped and len(report.batches) == 1
+    assert batch_records(ready, report.batches[0])[0]["attributes"]["item_id"] == ready.item.id
 
 
 @pytest.mark.parametrize("artifact, old, new", [("projection_s3_key", b"First editorial", b"Tampered editorial"),

@@ -80,6 +80,7 @@ REASONS = frozenset({
     "transport",         # refused or dropped connection
     "proxy",             # 5xx without a router error body (Caddy)
     "no_candidate",      # 503 MODEL_NO_ELIGIBLE_CANDIDATE
+    "provider_unavailable",  # 5xx MODEL_PROVIDER_UNAVAILABLE: the provider failed the generation
     "router_failure",    # any other 5xx with a router error body
     "output_invalid",    # 502 MODEL_OUTPUT_INVALID
     "malformed_output",  # 200 without usable output, or an oversized response
@@ -375,6 +376,7 @@ class RouterClient:
         if 500 <= status <= 599:
             if code is None:
                 _fail("router_busy", "proxy", advance_key=False)
-            _fail("router_busy", "no_candidate" if code == "MODEL_NO_ELIGIBLE_CANDIDATE" else "router_failure")
+            _fail("router_busy", {"MODEL_NO_ELIGIBLE_CANDIDATE": "no_candidate",
+                                  "MODEL_PROVIDER_UNAVAILABLE": "provider_unavailable"}.get(code, "router_failure"))
         # The router's only 409 is an idempotency key reused with a different body.
         _fail("model_config", "conflict" if status == 409 and code == "LAMAD_IDEMPOTENCY_CONFLICT" else "rejected")
