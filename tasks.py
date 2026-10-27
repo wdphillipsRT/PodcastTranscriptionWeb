@@ -981,9 +981,10 @@ def _busy_delay(block_attempts):
 def _classification_failed(revision_id, phase, ordinal, category, reason=None):
     """Caller holds the item lock; revision attempts count failed calls only.
 
-    A revision gets MAX_CLASSIFICATION_ATTEMPTS counted failures, but only
-    MAX_INVALID_OUTPUT_ATTEMPTS for `model_invalid_output`: calls run at
-    temperature 0, so a new key replays the same invalid answer.
+    A revision gets MAX_CLASSIFICATION_ATTEMPTS counted failures, but an invalid
+    output fails the revision once its counted failures reach
+    MAX_INVALID_OUTPUT_ATTEMPTS (the counter is shared across categories):
+    calls run at temperature 0, so a new key replays the same invalid answer.
 
     A busy router is not a failure: the attempt budget is untouched, the block
     returns to pending, and the same block is retried after a back-off that

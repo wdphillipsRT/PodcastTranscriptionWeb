@@ -125,16 +125,13 @@ def test_invalid_model_output_gets_two_attempts_because_temperature_zero_replays
     assert (revision.state, revision.error_category, revision.attempts) == ("failed", "model_invalid_output", 2)
 
 
-@pytest.mark.parametrize("category", ["storage_transient"])
-def test_transient_errors_exhaust_at_five_persisted_failures(worker, category):
+def test_transient_errors_exhaust_at_five_persisted_failures(worker):
+    category = "storage_transient"
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
     worker.sent.clear()
-    if category == "storage_transient":
-        from s3_utils import StorageTransientError
-        worker.env.classifier.error = StorageTransientError("private storage payload")
-    else:
-        worker.env.classifier.error = ClassifierError(category)
+    from s3_utils import StorageTransientError
+    worker.env.classifier.error = StorageTransientError("private storage payload")
     for attempt in range(1, 6):
         task().run(identity, "block", 1)
         revision = db.session.get(m.ClassificationRevision, identity)
