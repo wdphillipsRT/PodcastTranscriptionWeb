@@ -21,7 +21,10 @@ POLICY_SCHEMA = "commercial-segment-policy-artifact/v1"
 PROJECTION_SCHEMA = "learning-transcript-projection/v1"
 PROMOTIONAL_SCHEMA = "promotional-analysis-projection/v1"
 KNOWLEDGE_SCHEMA = "knowledge-transcript-projection/v1"
-PROMPT_VERSION = "commercial-segment-classifier/v1"
+PROMPT_VERSION = "commercial-segment-classifier/v2"
+# v1: the Claude-era prompt (every target decided). v2: non-editorial ranges only,
+# unlisted target segments are editorial. Stored v1 provenance stays valid.
+PROMPT_VERSIONS = ("commercial-segment-classifier/v1", PROMPT_VERSION)
 TARGET_SEGMENTS_PER_BLOCK = 80
 CONTEXT_SEGMENTS_PER_SIDE = 3
 MAX_BLOCK_TEXT_CHARS = 40_000
@@ -117,7 +120,7 @@ class ClassifierProvenance:
     def __post_init__(self):
         for value in (self.cli_version, self.requested_model, self.resolved_model, self.prompt_version):
             _public_text(value)
-        if self.prompt_version != PROMPT_VERSION:
+        if self.prompt_version not in PROMPT_VERSIONS:
             _invalid()
         _digest(self.prompt_sha256)
 
