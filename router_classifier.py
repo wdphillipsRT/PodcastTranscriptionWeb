@@ -219,13 +219,19 @@ IMPLIED_SIGNALLED_CONFIDENCE = 0.5
 IMPLIED_EDITORIAL_REASONS = ("substantive_content",)
 
 
-def _implied_editorial(window, first, last):
-    """Editorial decisions for the omitted target indexes first..last; runs inside a signal's range are not auto-accepted."""
+def _signalled_targets(window):
+    """Indexes of the target segments inside any signal's range; a signal may touch context segments, and ordinals are
+    consecutive across the window."""
     signalled = set()
-    for signal in window.signals:  # A signal may touch context segments; ordinals are consecutive across the window.
+    for signal in window.signals:
         start, end = int(signal.first_segment_id[4:10]), int(signal.last_segment_id[4:10])
         signalled.update(index for index, segment in enumerate(window.target_segments)
                          if start <= int(segment.id[4:10]) <= end)
+    return signalled
+
+
+def _implied_editorial(window, signalled, first, last):
+    """Editorial decisions for the omitted target indexes first..last; runs inside a signal's range are not auto-accepted."""
     runs, run_start = [], first
     for index in range(first, last + 2):
         if index > last or (index in signalled) != (run_start in signalled):
@@ -244,6 +250,7 @@ def _decisions(parsed, window):
         if not isinstance(ranges, list) or not 0 <= len(ranges) <= TARGET_SEGMENTS_PER_BLOCK:
             _fail()
         positions = {segment.id: index for index, segment in enumerate(window.target_segments)}
+        signalled = _signalled_targets(window)
         decisions, cursor = [], 0
         for entry in ranges:
             if (not isinstance(entry, dict)
@@ -265,12 +272,12 @@ def _decisions(parsed, window):
                     or len(set(reasons)) != len(reasons)):
                 _fail()
             if first > cursor:
-                decisions.extend(_implied_editorial(window, cursor, first - 1))
+                decisions.extend(_implied_editorial(window, signalled, cursor, first - 1))
             decisions.append(BlockDecision(entry["first_segment_id"], entry["last_segment_id"], label,
                                            float(confidence), tuple(reasons)))
             cursor = last + 1
         if cursor < len(window.target_segments):
-            decisions.extend(_implied_editorial(window, cursor, len(window.target_segments) - 1))
+            decisions.extend(_implied_editorial(window, signalled, cursor, len(window.target_segments) - 1))
         return tuple(decisions)
     except ClassifierError:
         raise

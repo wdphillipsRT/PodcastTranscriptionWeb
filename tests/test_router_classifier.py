@@ -11,7 +11,7 @@ from commercial_policy import (EDITORIAL_AUTO_THRESHOLD, PROMPT_VERSION, Classif
 from commercial_signals import ClassifierWindow, Signal
 from config import load_settings
 import router_classifier
-from router_classifier import (OUTPUT_SCHEMA, SYSTEM_PROMPT, ClassifierError, ClassifierExample,
+from router_classifier import (IMPLIED_SIGNALLED_CONFIDENCE, OUTPUT_SCHEMA, SYSTEM_PROMPT, ClassifierError, ClassifierExample,
                                RouterClassifier, expected_provenance, fitted_messages)
 from router_client import CLASSIFICATION_CONTEXT_TOKENS, RouterClient, estimated_context_tokens
 from tests.router_fake import MODEL, FakeRouter, fake_router  # noqa: F401
@@ -129,13 +129,12 @@ def test_unlisted_target_segments_are_implied_editorial(fake_router, classifier)
     ids = [s.id for s in win.target_segments]
     fake_router.output = {"ranges": [entry(ids[1], ids[2], "paid_commercial", 0.97, ("sponsor_transition",))]}
     assert _rows(classifier.classify(win)) == [
-        _implied(ids[0], ids[0], 0.5),  # inside the helper's signal (targets 1-2)
+        _implied(ids[0], ids[0], IMPLIED_SIGNALLED_CONFIDENCE),  # inside the helper's signal (targets 1-2)
         (ids[1], ids[2], "paid_commercial", 0.97, ("sponsor_transition",)),
         _implied(ids[3], ids[4])]
 
 
 def test_omitted_targets_inside_a_signal_are_implied_at_the_below_threshold_confidence(fake_router, classifier):  # noqa: F811
-    from router_classifier import IMPLIED_SIGNALLED_CONFIDENCE
     win = window(targets=(2, 3, 4, 5, 6), before=(1,), after=(7,))
     ids = [s.id for s in win.target_segments]
     # The helper's signal covers targets 2-3; a second one runs from the context into target 6.
@@ -154,7 +153,7 @@ def test_an_empty_list_means_the_whole_block_is_editorial(fake_router, classifie
     win = window(targets=(2, 3, 4), after=(5,))
     fake_router.output = {"ranges": []}
     ids = [s.id for s in win.target_segments]
-    assert _rows(classifier.classify(win)) == [_implied(ids[0], ids[1], 0.5), _implied(ids[2], ids[2])]
+    assert _rows(classifier.classify(win)) == [_implied(ids[0], ids[1], IMPLIED_SIGNALLED_CONFIDENCE), _implied(ids[2], ids[2])]
 
 
 def test_explicit_editorial_ranges_and_full_coverage_still_work(fake_router, classifier):  # noqa: F811
