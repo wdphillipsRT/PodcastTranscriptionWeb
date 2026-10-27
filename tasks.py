@@ -1189,6 +1189,29 @@ def release_reclassification():
     return dispatch
 
 
+def cancel_reclassification():
+    """Supersede every held reclassification revision in one transaction; returns how many.
+
+    Only held revisions change (`pending`, `reclassify_queued`, never started). They were never
+    prepared, so they have no blocks and nothing in flight, and they are never an item's active
+    revision, so items keep what they export and show. Released, running and finished revisions
+    are untouched. Under the same classifier provenance a cancelled item is not queued again:
+    its superseded revision still carries the key `queue_reclassification` checks. A new model pin,
+    router route or prompt gives a new key prefix, which makes every cancelled item a candidate again.
+    """
+    import sqlalchemy as sa
+    from extensions import db
+    from models import ClassificationRevision, utc_now
+    if db.engine.dialect.name == "postgresql":
+        db.session.execute(sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": _RECLASSIFY_RELEASE_LOCK})
+    count = db.session.query(ClassificationRevision).filter(
+        ClassificationRevision.state == "pending", ClassificationRevision.error_category == RECLASSIFY_QUEUED,
+        ClassificationRevision.started_at.is_(None)).update(
+        {"state": "superseded", "error_category": None, "updated_at": utc_now()}, synchronize_session="fetch")
+    db.session.commit()
+    return count
+
+
 @celery_app.task(name="tasks.classify_item", queue="classification")
 def classify_item(revision_id, phase, block_ordinal=None):
     _classification_phase(revision_id, phase, block_ordinal)

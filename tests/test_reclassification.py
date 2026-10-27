@@ -304,3 +304,31 @@ def test_a_failing_input_check_falls_through_to_the_hand_off(worker, monkeypatch
     task().run(stale, "prepare")
     assert db.session.get(m.ClassificationRevision, stale).state == "superseded"
     assert m.ClassificationRevision.query.filter_by(request_reason="policy_upgrade").count() == 1
+
+
+def test_cancel_supersedes_only_held_revisions_and_requeues_only_under_a_new_provenance(worker):  # noqa: F811
+    env = worker.env
+    for name in ("a", "b"):
+        published(env, name, datetime(2026, 1, 1, tzinfo=timezone.utc))
+    active_before = {item.id: item.active_classification_revision_id for item in m.ContentItem.query}
+    with worker.app.app_context():
+        counts = tasks.queue_reclassification()
+        released = tasks.release_reclassification()
+        assert counts["queued"] == 3 and released is not None
+        assert tasks.cancel_reclassification() == 2
+        assert tasks.cancel_reclassification() == 0
+    revisions = m.ClassificationRevision.query.all()
+    assert m.ClassificationRevision.query.filter_by(state="pending", error_category="reclassify_queued").count() == 0
+    survivor = db.session.get(m.ClassificationRevision, released.revision_id)
+    assert (survivor.state, survivor.error_category) == ("pending", "dispatch_pending")
+    cancelled = [r for r in revisions if r.id != survivor.id]
+    assert len(cancelled) == 2 and {(r.state, r.error_category) for r in cancelled} == {("superseded", None)}
+    assert all(r.started_at is None and not r.blocks for r in cancelled)
+    assert {item.id: item.active_classification_revision_id for item in m.ContentItem.query} == active_before
+    # The same provenance finds the cancelled keys again, so nothing is re-queued; a new pin queues all three
+    # items anew (the released one too: its revision belongs to the old pin).
+    with worker.app.app_context():
+        assert tasks.queue_reclassification()["queued"] == 0
+    env.service.settings = env.classifier.settings = replace(env.settings, ROUTER_EXPECTED_MODEL="bonsai2:27b-q4_0")
+    with worker.app.app_context():
+        assert tasks.queue_reclassification()["queued"] == 3

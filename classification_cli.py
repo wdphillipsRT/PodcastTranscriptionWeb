@@ -176,6 +176,18 @@ def reclassify_all(limit):
                + f" released={int(released)}")
 
 
+@classification_cli.command("reclassify-cancel")
+@_safe
+def reclassify_cancel():
+    """Supersede every held (not yet released) reclassification revision; items keep their active revision.
+
+    Stop the classifier first. Rerunning reclassify-all under the same classifier provenance does not
+    queue the cancelled items again; after a new model pin, route or prompt it queues them all.
+    """
+    from tasks import cancel_reclassification
+    click.echo(f"cancelled={cancel_reclassification()}")
+
+
 def _wrong_client_cert_smoke(settings, window):
     """The suite never exercises TLS, so this proves against the real router that a client certificate
     it did not issue is refused and mapped to model_auth. Prints only the category and reason."""
