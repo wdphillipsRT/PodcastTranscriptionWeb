@@ -226,7 +226,8 @@ limited, timed out, unreachable, or no eligible model) stops the run without a
 record, so the item is tried again next hour. A router failure reported by the
 router itself (for example a 504 model timeout on an input the model never
 finishes, or a model server that is down) is recorded as `failed` with
-category `router_busy` and stops the run. That input is retried on later runs,
+category `router_busy` and stops the run; the client reasons `router_failure`
+and `provider_unavailable` are both recorded this way. That input is retried on later runs,
 after every input never tried, so it cannot block them, and is given up after
 three router failures (`MAX_ROUTER_FAILURES`, counted in
 `guest_extractions.router_failures`). Authentication, configuration and
@@ -571,10 +572,24 @@ Router failures become closed categories:
 | Router response | Category | Effect |
 | --- | --- | --- |
 | 429, 202 (still running), 500, 503, 504, other 502, timeout, refused or reset connection, Celery soft time limit | `router_busy` | Block back to pending, revision `retrying`; retried after 30 s doubling to 10 min; never counts as a failed attempt |
-| 502 `MODEL_OUTPUT_INVALID`, or output failing the Python checks | `model_invalid_output` | Retried; counts toward the five attempts |
+| A router 5xx `MODEL_PROVIDER_UNAVAILABLE` (client reason `provider_unavailable`) after the claim ran `INPUT_FAILURE_MIN_SECONDS` (60 s) or more, the third time on the same block (`MAX_BLOCK_PROVIDER_FAILURES`) | `model_unavailable` | Revision fails; `classification retry --item-id <id>` after the cause is fixed. Other coded 5xx (reason `router_failure`) and faster failures stay `router_busy` |
+| 502 `MODEL_OUTPUT_INVALID`, or output failing the Python checks | `model_invalid_output` | Retried once under a new key (temperature 0 replays the same answer); the revision fails once its counted failures reach 2 (`MAX_INVALID_OUTPUT_ATTEMPTS`). Other failures still count toward `MAX_CLASSIFICATION_ATTEMPTS` (5) |
 | 401, 403, certificate verification failure or TLS alert, unusable token | `model_auth` | Revision fails |
 | Other 4xx, request too large | `model_config` | Revision fails |
 | `selected_model` not `ROUTER_EXPECTED_MODEL` | `model_mismatch` | Revision fails |
+
+The classifier prompt (`commercial-segment-classifier/v2`) asks the model to list
+only the target segments that are not plain editorial content. Every target
+segment it does not list is recorded as editorial (decision source `model`,
+confidence 0.80 `IMPLIED_EDITORIAL_CONFIDENCE`, reason `substantive_content`);
+an empty list means the whole block is editorial. Ranges must be in order and
+must not overlap. A target segment inside the range of a classifier signal
+that the model leaves out gets confidence 0.50 (`IMPLIED_SIGNALLED_CONFIDENCE`),
+so the threshold stores it as `uncertain` with `model_label` `editorial` and
+review is required. Under prompt v2, 0.80 and 0.50 are how implied decisions
+are recognised in stored artifacts; the model can also emit those values, so
+this is a heuristic. Claude-era policies keep `commercial-segment-classifier/v1`
+and stay valid.
 
 Each block call uses the idempotency key
 `podcast.classification:rev-<revision>:block-<ordinal>:g<generation>`. The
@@ -590,7 +605,10 @@ so time spent waiting for a busy router does not count. The classifier runs one
 task at a time, so the application never has more than one router request in
 flight.
 
-Busy retries never end by design: a revision waiting on a busy router stays
+Busy retries end only for one case: a block on which the model itself fails
+slowly three times (`classification_blocks.provider_failures`) fails as
+`model_unavailable`, so one bad input cannot stall the queue or keep tripping the
+shared Forge circuit breaker. Otherwise they never end by design: a revision waiting on a busy router stays
 `retrying` with `router_busy` until the router answers. To spot them, run
 `docker compose exec classifier flask --app app:create_app classification status`
 and read `router_busy=<count>`, `oldest_busy_key_sent=` and
@@ -695,15 +713,33 @@ it is retried, that episode cannot be exported (the exporter needs its latest
 revision), while the record already exported for it stays live. Retry it with
 `classification retry --item-id <id>`.
 
+`classification reclassify-cancel` (stop `classifier` first) supersedes every
+held revision (`reclassify_queued`) and prints `cancelled=<n>`; the episodes
+keep their current revision and export as before. After a prompt or model
+change, cancel the old queue, then run `reclassify-all` again: it queues under
+the new classifier's key prefix. Notes:
+
+- Under the same classifier provenance a cancelled item is not queued again by
+  `reclassify-all` (its key still matches). Only a new provenance (prompt,
+  model or route change) queues it again, so restoring prompt v1 later needs
+  `classification retry --item-id <id>` per item.
+- Before running `reclassify-all` under a new provenance, let any released or
+  running revision finish, or accept that it will be superseded.
+- Cancelled items export normally again on the next nightly run (they have no
+  newer held revision) until `reclassify-all` holds them again.
+
 ### Upgrading from Claude classification
 
 Upgrading an existing deployment applies migration `0004_router_classification`,
 which only adds columns (`classification_blocks.request_generation`,
-`request_generation_started_at` and `guest_extractions.router_failures`). Its
-`ALTER TABLE` needs an exclusive lock, so stop the writers (`web`, `worker`,
+`request_generation_started_at` and `guest_extractions.router_failures`), and
+`0005_block_provider_failures`, which adds `classification_blocks.provider_failures`.
+Their `ALTER TABLE` statements need an exclusive lock, so stop the writers (`web`, `worker`,
 `beat`, `classifier`, `exporter`) before migrating. The operator script
 `~/Bezalel/knowledge-intake-work/podcast-router-upgrade.sh` performs the
-backup, build, migration, startup and smoke checks.
+backup, build, migration, startup and smoke checks. A revision that failed as
+`model_unavailable` is retried with `classification retry --item-id <id>` once
+the model or the input problem is fixed.
 
 Run `classification reclassify-all` (or keep the exporter stopped)
 before the next nightly export after the upgrade. The episode record now carries
@@ -724,8 +760,8 @@ writes it to `~/PodcastTranscriptionWeb-backups/postgres-<stamp>-*.dump`),
 losing every change since. In this order:
 
 1. Stop the writers.
-2. Downgrade migration `0004` with the current image, which is the only one that
-   has it. This drops the three columns.
+2. Downgrade migrations `0005` and `0004` with the current image, which is the
+   only one that has them. This drops the four columns.
 3. Restore the pre-upgrade backup as described in
    [PostgreSQL backup and restore](#postgresql-backup-and-restore).
 4. Check out the previous revision, rebuild the images, and start the services.
