@@ -147,6 +147,18 @@ def test_a_new_classification_revision_supersedes_the_exported_one(ready):
     assert segments[0]["attributes"]["segment_ids"] == [segment.id for segment in ready.transcript.segments]
 
 
+def test_an_export_recorded_under_pre_upgrade_facts_is_superseded_once_then_unchanged(ready):
+    export(ready)
+    row = m.KnowledgeItemExport.query.one()
+    first = row.episode_record_id
+    row.payload_sha256 = "0" * 64  # what a pre-7b exporter left: same revision, different facts
+    db.session.commit()
+    report = export(ready, now=NOW + timedelta(days=1))
+    episode = batch_records(ready, report.batches[0])[0]
+    assert episode["record_id"] == first[:-2] + "e2" and episode["supersedes"] == first
+    assert export(ready, now=NOW + timedelta(days=2)).batches == []
+
+
 def test_items_without_a_host_or_awaiting_guests_wait(ready):
     ready.source.feed_hosts = None
     db.session.commit()
