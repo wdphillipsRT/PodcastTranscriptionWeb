@@ -469,6 +469,34 @@ def test_slow_provider_failures_on_one_block_fail_the_revision_on_the_third(work
     assert worker.env.classifier.keys == [prefix + "0", prefix + "1", prefix + "2"]
 
 
+def test_the_real_60_second_rule_counts_a_provider_failure_after_a_61_second_call(worker, monkeypatch):
+    assert tasks.INPUT_FAILURE_MIN_SECONDS == 60
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    offset = [timedelta(0)]
+    real_now = m.utc_now
+    monkeypatch.setattr(m, "utc_now", lambda: real_now() + offset[0])  # tasks imports it per call
+    # The claim token includes started_at, so the clock moves instead of the stored timestamp.
+    worker.env.classifier.on_call = lambda: offset.__setitem__(0, timedelta(seconds=61))
+    worker.env.classifier.error = ClassifierError("router_busy", reason="provider_unavailable", advance_key=True)
+    task().run(identity, "block", 1)
+    block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+    assert block.provider_failures == 1
+
+
+def test_a_revision_created_under_the_previous_prompt_is_superseded_and_handed_off(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    db.session.execute(sa.update(m.ClassificationRevision).where(m.ClassificationRevision.id == identity)
+        .values(prompt_version="commercial-segment-classifier/v1", prompt_sha256="1" * 64))
+    db.session.commit()
+    sent = len(worker.sent)
+    task().run(identity, "prepare")
+    assert db.session.get(m.ClassificationRevision, identity).state == "superseded"
+    handoff = m.ClassificationRevision.query.filter(m.ClassificationRevision.id > identity).one()
+    assert handoff.request_reason == "policy_upgrade" and handoff.prompt_sha256 != "1" * 64
+    assert worker.sent[sent][1] == [handoff.id, "prepare", None]
+
+
 def test_fast_provider_failures_stay_busy_and_are_not_counted(worker):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
