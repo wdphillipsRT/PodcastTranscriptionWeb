@@ -37,6 +37,7 @@ CLASSIFICATION_FAILURES = {"router_busy": "Model router busy", "model_invalid_ou
     "model_mismatch": "Classifier configuration", "storage_transient": "Storage unavailable",
     "worker_timeout": "Worker timeout", "invalid_canonical": "Transcript unavailable",
     "invalid_policy": "Policy unavailable", "revision_budget_exhausted": "Classification budget reached",
+    "model_unavailable": "Model failed on this input",
     "dispatch_pending": "Awaiting dispatch", "reclassify_queued": "Queued for reclassification",
     # Claude-era categories stay readable on stored rows.
     "claude_timeout": "Classifier timeout", "claude_unavailable": "Classifier unavailable",

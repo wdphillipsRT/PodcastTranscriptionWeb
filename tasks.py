@@ -963,6 +963,12 @@ def _classification_delay(attempts):
     return min(3600, 30 * 2 ** (attempts - 1)) + random.uniform(1, 30)
 
 
+# A router-stored 5xx (reason router_failure) after the model ran this long is
+# attributed to the block's input; a Forge outage fails faster and stays busy.
+INPUT_FAILURE_MIN_SECONDS = 60
+MAX_BLOCK_PROVIDER_FAILURES = 3
+
+
 def _busy_delay(block_attempts):
     """30 seconds, doubling per busy claim of the block, capped at 10 minutes."""
     return min(600, 30 * 2 ** (min(max(block_attempts, 1), 6) - 1))
@@ -975,6 +981,11 @@ def _classification_failed(revision_id, phase, ordinal, category, reason=None):
     returns to pending, and the same block is retried after a back-off that
     doubles from 30 seconds to 10 minutes. A key conflict (`model_config` with
     reason `conflict`) is a counted failure retried under the block's next key.
+
+    A `router_busy` with reason `router_failure` that arrives after the claim ran
+    at least INPUT_FAILURE_MIN_SECONDS is counted on the block; the third becomes
+    the permanent `model_unavailable`, which counts one attempt and fails the
+    revision and block without a retry. Faster failures stay busy and uncounted.
     """
     from classification_service import (RETRYABLE_CLASSIFICATION_ERRORS, PERMANENT_CLASSIFICATION_ERRORS,
                                          key_conflict)
@@ -986,6 +997,13 @@ def _classification_failed(revision_id, phase, ordinal, category, reason=None):
     if revision.state in {"completed", "superseded"}:
         db.session.commit()
         return None, None, None
+    if category == "router_busy" and reason == "router_failure" and ordinal is not None:
+        counted = db.session.query(ClassificationBlock).filter_by(revision_id=revision_id, ordinal=ordinal).one_or_none()
+        if (counted is not None and counted.started_at is not None
+                and (utc_now() - counted.started_at).total_seconds() >= INPUT_FAILURE_MIN_SECONDS):
+            counted.provider_failures += 1
+            if counted.provider_failures >= MAX_BLOCK_PROVIDER_FAILURES:
+                category = "model_unavailable"
     busy = category == "router_busy"
     if not busy:
         revision.attempts += 1

@@ -1011,7 +1011,7 @@ Use no existing application volume, router credential directory, or administrato
 Override the classifier's credential bind with a unique private disposable host
 directory (owned by 1000:1000, mode 700), even when testing its failure without
 credentials. Never reuse the deployed router bundle. Verify migration head
-`0004_router_classification`, provision a temporary sole admin, and record
+`0005_block_provider_failures`, provision a temporary sole admin, and record
 all sixteen table counts: `admins`, `content_sources`, `content_items`,
 `source_items`, `backfill_requests`, `discovery_runs`, `discovery_candidates`,
 `processing_jobs`, `classification_revisions`, `classification_blocks`,

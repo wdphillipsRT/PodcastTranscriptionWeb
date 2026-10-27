@@ -36,7 +36,8 @@ from transcripts import canonical_json, parse_canonical_transcript, TranscriptVa
 RETRYABLE_CLASSIFICATION_ERRORS = frozenset({"router_busy", "model_invalid_output",
     "storage_transient", "dispatch_pending", "worker_timeout"})
 PERMANENT_CLASSIFICATION_ERRORS = frozenset({"model_auth", "model_config", "model_mismatch",
-    "invalid_canonical", "invalid_policy", "revision_budget_exhausted"})
+    "invalid_canonical", "invalid_policy", "revision_budget_exhausted",
+    "model_unavailable"})
 # Claude-era rows keep these stored names; they are displayed, never produced. Retry
 # decisions read them through current_error_category, so a row that was retrying
 # under Claude keeps retrying under its router-era equivalent.
