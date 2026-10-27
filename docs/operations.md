@@ -227,8 +227,8 @@ record, so the item is tried again next hour. A router failure reported by the
 router itself (for example a 504 model timeout on an input the model never
 finishes, or a model server that is down) is recorded as `failed` with
 category `router_busy` and stops the run; the client reasons `router_failure`
-and `provider_unavailable` are both recorded this way. That input is retried on later runs,
-after every input never tried, so it cannot block them, and is given up after
+and `provider_unavailable` are both recorded this way. That input is retried on
+later runs, after every input never tried, so it cannot block them, and is given up after
 three router failures (`MAX_ROUTER_FAILURES`, counted in
 `guest_extractions.router_failures`). Authentication, configuration and
 model-mismatch errors stop the run without a record. Before each call the run
@@ -582,9 +582,10 @@ The classifier prompt (`commercial-segment-classifier/v2`) asks the model to lis
 only the target segments that are not plain editorial content. Every target
 segment it does not list is recorded as editorial (decision source `model`,
 confidence 0.80 `IMPLIED_EDITORIAL_CONFIDENCE`, reason `substantive_content`);
-an empty list means the whole block is editorial. Ranges must be in order and
-must not overlap. A target segment inside the range of a classifier signal
-that the model leaves out gets confidence 0.50 (`IMPLIED_SIGNALLED_CONFIDENCE`),
+an empty list means the whole block is editorial, except stretches inside a
+classifier signal's range, which get 0.50. Ranges must be in order and must not
+overlap. A target segment inside the range of a classifier signal that the
+model leaves out gets confidence 0.50 (`IMPLIED_SIGNALLED_CONFIDENCE`),
 so the threshold stores it as `uncertain` with `model_label` `editorial` and
 review is required. Under prompt v2, 0.80 and 0.50 are how implied decisions
 are recognised in stored artifacts; the model can also emit those values, so
@@ -608,8 +609,8 @@ flight.
 Busy retries end only for one case: a block on which the model itself fails
 slowly three times (`classification_blocks.provider_failures`) fails as
 `model_unavailable`, so one bad input cannot stall the queue or keep tripping the
-shared Forge circuit breaker. Otherwise they never end by design: a revision waiting on a busy router stays
-`retrying` with `router_busy` until the router answers. To spot them, run
+shared Forge circuit breaker. Otherwise they never end by design: a revision
+waiting on a busy router stays `retrying` with `router_busy` until the router answers. To spot them, run
 `docker compose exec classifier flask --app app:create_app classification status`
 and read `router_busy=<count>`, `oldest_busy_key_sent=` and
 `oldest_busy_updated=`; the item page shows "Model router busy". A 503
@@ -719,10 +720,11 @@ keep their current revision and export as before. After a prompt or model
 change, cancel the old queue, then run `reclassify-all` again: it queues under
 the new classifier's key prefix. Notes:
 
-- Under the same classifier provenance a cancelled item is not queued again by
-  `reclassify-all` (its key still matches). Only a new provenance (prompt,
-  model or route change) queues it again, so restoring prompt v1 later needs
-  `classification retry --item-id <id>` per item.
+- Under the same classifier provenance `reclassify-all` skips cancelled items
+  (their key still matches) and `classification retry` does not apply, because
+  the revision is superseded, not failed. A changed prompt, model or route
+  gives a new key prefix, and `reclassify-all` queues them again (restoring
+  prompt v1 is such a change).
 - Before running `reclassify-all` under a new provenance, let any released or
   running revision finish, or accept that it will be superseded.
 - Cancelled items export normally again on the next nightly run (they have no
@@ -733,9 +735,10 @@ the new classifier's key prefix. Notes:
 Upgrading an existing deployment applies migration `0004_router_classification`,
 which only adds columns (`classification_blocks.request_generation`,
 `request_generation_started_at` and `guest_extractions.router_failures`), and
-`0005_block_provider_failures`, which adds `classification_blocks.provider_failures`.
-Their `ALTER TABLE` statements need an exclusive lock, so stop the writers (`web`, `worker`,
-`beat`, `classifier`, `exporter`) before migrating. The operator script
+`0005_block_provider_failures`, which adds
+`classification_blocks.provider_failures`. Their `ALTER TABLE` statements need
+an exclusive lock, so stop the writers (`web`, `worker`, `beat`, `classifier`,
+`exporter`) before migrating. The operator script
 `~/Bezalel/knowledge-intake-work/podcast-router-upgrade.sh` performs the
 backup, build, migration, startup and smoke checks. A revision that failed as
 `model_unavailable` is retried with `classification retry --item-id <id>` once
