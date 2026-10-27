@@ -968,6 +968,9 @@ def _classification_delay(attempts):
 # outage fails faster and stays busy.
 INPUT_FAILURE_MIN_SECONDS = 60
 MAX_BLOCK_PROVIDER_FAILURES = 3
+MAX_CLASSIFICATION_ATTEMPTS = 5
+# Temperature 0: a new key regenerates the same invalid answer, so one confirmation is enough.
+MAX_INVALID_OUTPUT_ATTEMPTS = 2
 
 
 def _busy_delay(block_attempts):
@@ -977,6 +980,10 @@ def _busy_delay(block_attempts):
 
 def _classification_failed(revision_id, phase, ordinal, category, reason=None):
     """Caller holds the item lock; revision attempts count failed calls only.
+
+    A revision gets MAX_CLASSIFICATION_ATTEMPTS counted failures, but only
+    MAX_INVALID_OUTPUT_ATTEMPTS for `model_invalid_output`: calls run at
+    temperature 0, so a new key replays the same invalid answer.
 
     A busy router is not a failure: the attempt budget is untouched, the block
     returns to pending, and the same block is retried after a back-off that
@@ -1008,7 +1015,8 @@ def _classification_failed(revision_id, phase, ordinal, category, reason=None):
     busy = category == "router_busy"
     if not busy:
         revision.attempts += 1
-    retry = busy or (category in RETRYABLE_CLASSIFICATION_ERRORS or key_conflict(category, reason)) and revision.attempts < 5
+    limit = MAX_INVALID_OUTPUT_ATTEMPTS if category == "model_invalid_output" else MAX_CLASSIFICATION_ATTEMPTS
+    retry = busy or (category in RETRYABLE_CLASSIFICATION_ERRORS or key_conflict(category, reason)) and revision.attempts < limit
     revision.state = "retrying" if retry else "failed"
     revision.error_category = "dispatch_pending" if retry else category
     revision.heartbeat_at = utc_now()

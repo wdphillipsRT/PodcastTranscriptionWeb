@@ -114,7 +114,18 @@ def test_fast_worker_cannot_be_overwritten_by_publication_cleanup(worker, monkey
     assert revision.celery_task_id.endswith("-finalize")
 
 
-@pytest.mark.parametrize("category", ["model_invalid_output", "storage_transient"])
+def test_invalid_model_output_gets_two_attempts_because_temperature_zero_replays_it(worker):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    worker.env.classifier.error = ClassifierError("model_invalid_output", advance_key=True)
+    task().run(identity, "block", 1)
+    assert db.session.get(m.ClassificationRevision, identity).state == "retrying"
+    task().run(identity, "block", 1)
+    revision = db.session.get(m.ClassificationRevision, identity)
+    assert (revision.state, revision.error_category, revision.attempts) == ("failed", "model_invalid_output", 2)
+
+
+@pytest.mark.parametrize("category", ["storage_transient"])
 def test_transient_errors_exhaust_at_five_persisted_failures(worker, category):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
@@ -349,7 +360,8 @@ def test_queued_message_delivered_during_disabled_rollout_remains_recoverable(wo
 def test_fast_retry_same_task_id_cannot_lose_new_outbox(worker, monkeypatch):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
-    worker.env.classifier.error = ClassifierError("model_invalid_output")
+    from s3_utils import StorageTransientError
+    worker.env.classifier.error = StorageTransientError("private storage payload")
     sending = []
     def fast(name, *, args, **options):
         worker.send(name, args=args, **options)
