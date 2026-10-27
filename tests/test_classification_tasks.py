@@ -503,7 +503,6 @@ def test_a_stale_claims_provider_failure_changes_nothing(worker, monkeypatch):
     revision = db.session.get(m.ClassificationRevision, identity)
     block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
     assert block.provider_failures == 0
-    assert (revision.state, revision.error_category, revision.attempts) != ("failed", "model_unavailable", 1)
     assert revision.state not in {"failed", "retrying"} and block.state == "running" and not worker.sent
 
 

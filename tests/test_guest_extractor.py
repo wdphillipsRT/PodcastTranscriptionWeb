@@ -311,6 +311,22 @@ def test_router_failures_are_retried_after_fresh_items_and_abandoned_after_three
     assert extract(ready)["scanned"] == 0 and len(ready.extractor.calls) == 4
 
 
+def test_a_provider_unavailable_failure_is_recorded_and_abandoned_after_three(ready):
+    """MODEL_PROVIDER_UNAVAILABLE is a router failure too: recorded, retried, abandoned, never a silent block."""
+    newer = newer_item(ready)
+    provider = RouterError("router_busy", reason="provider_unavailable")
+    ready.extractor.errors = [provider]
+    assert extract(ready) == {"scanned": 1, "extracted": 0, "failed": 1, "stopped": "router_busy"}
+    assert m.GuestExtraction.query.filter_by(item_id=newer.id).one().router_failures == 1
+    ready.extractor.errors = [None, provider]
+    assert extract(ready) == {"scanned": 2, "extracted": 1, "failed": 1, "stopped": "router_busy"}
+    ready.extractor.errors = [provider]
+    extract(ready)
+    row = m.GuestExtraction.query.filter_by(item_id=newer.id).one()
+    assert row.router_failures == guest_extractor.MAX_ROUTER_FAILURES
+    assert extract(ready)["scanned"] == 0
+
+
 def test_a_busy_router_neither_spends_nor_skips_a_retry(ready):
     newer = newer_item(ready)
     ready.extractor.errors = [router_failure()]
