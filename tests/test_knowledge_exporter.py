@@ -214,6 +214,19 @@ def test_unavailable_projection_skips_the_item_without_reading_raw_text(ready):
     assert not any(key.endswith(".txt") for key, _ in ready.storage.reads)
 
 
+def test_a_cancelled_reclassification_no_longer_blocks_the_export(ready):
+    import tasks
+    held = ready.service.ensure_revision(ready.item.id, "policy_upgrade", idempotency_key="reclassify:test")
+    db.session.execute(sa.update(m.ClassificationRevision).where(m.ClassificationRevision.id == held)
+                       .values(error_category="reclassify_queued"))
+    db.session.commit()
+    assert export(ready).skipped == {"projection_unavailable": 1}
+    assert tasks.cancel_reclassification() == 1
+    report = export(ready)
+    assert not report.skipped and len(report.batches) == 1
+    assert batch_records(ready, report.batches[0])[0]["attributes"]["item_id"] == ready.item.id
+
+
 @pytest.mark.parametrize("artifact, old, new", [("projection_s3_key", b"First editorial", b"Tampered editorial"),
                                                  ("policy_s3_key", b'"paid_commercial"', b'"editorial"')])
 def test_tampered_stored_artifacts_fail_closed_and_nothing_is_exported(ready, artifact, old, new):
