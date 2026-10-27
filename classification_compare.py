@@ -47,7 +47,7 @@ BUSY_ATTEMPTS = 6  # Waits 30, 60, 120, 240, 480 s between them: at most 15.5 mi
 MAX_CONSECUTIVE_BUSY = 3  # Busy-skipped episodes in a row before the whole run stops.
 _COUNTS = ("blocks", "segments", "editorial_to_excluded", "excluded_to_editorial", "raw_editorial_to_excluded",
            "raw_excluded_to_editorial", "model_uncertain", "raw_model_uncertain", "threshold_to_uncertain",
-           "invalid_output", "busy_skipped")
+           "invalid_output", "provider_unavailable", "busy_skipped")
 _AGREEMENTS = ("agreement", "raw_agreement")
 
 
@@ -92,7 +92,9 @@ def select_sample(session, *, sample, seed):
 
 
 def _classify(service, window, examples, key_prefix, report, *, sleep, monotonic):
-    """One window, retried on a busy router with the worker's back-off; None for invalid output."""
+    """One window, retried on a busy router with the worker's back-off; None for invalid output or for a provider
+    failure after tasks.INPUT_FAILURE_MIN_SECONDS (the model failing on this input; a faster one stays busy)."""
+    from tasks import INPUT_FAILURE_MIN_SECONDS
     generation = 0
     for attempt in range(BUSY_ATTEMPTS):
         if attempt:
@@ -104,6 +106,10 @@ def _classify(service, window, examples, key_prefix, report, *, sleep, monotonic
         except ClassifierError as error:
             if error.advance_key:
                 generation += 1
+            if (error.category == "router_busy" and error.reason == "provider_unavailable"
+                    and monotonic() - started >= INPUT_FAILURE_MIN_SECONDS):
+                report["provider_unavailable"] += 1
+                return None, None
             if error.category == "router_busy":
                 continue
             if error.category == "model_invalid_output":
