@@ -767,8 +767,17 @@ losing every change since. In this order:
    only one that has them. This drops the four columns.
 3. Restore the pre-upgrade backup as described in
    [PostgreSQL backup and restore](#postgresql-backup-and-restore).
-4. Check out the previous revision, rebuild the images, and start the services.
-5. Restore `.runtime/claude` from the archive the upgrade script suggested
+4. Check out the previous revision and restore the image. The upgrade script
+   tagged the pre-upgrade image `podcast-transcription:pre-router`; if
+   `docker image inspect podcast-transcription:pre-router` still finds it, run
+   `docker tag podcast-transcription:pre-router podcast-transcription:local`
+   instead of rebuilding. Otherwise rebuild the images.
+5. Recreate the Compose network before starting. The current Compose file pins
+   `podcasttranscriptionweb_default` to `192.168.144.0/20`; the previous
+   revision's file does not, so run `docker compose down --remove-orphans`
+   (never `-v`, which deletes the database volume) and let Compose create the
+   network again. Then start the services.
+6. Restore `.runtime/claude` from the archive the upgrade script suggested
    (`~/PodcastTranscriptionWeb-backups/claude-runtime-<stamp>.tar.gz`), or
    authenticate the Claude CLI again, because the previous classifier needs it.
 
@@ -777,9 +786,25 @@ docker compose stop web worker beat classifier exporter
 docker compose run --rm --no-deps migrate flask --app app:create_app db downgrade 0003_knowledge_export
 # Restore the pre-upgrade backup, then:
 git checkout <previous revision>
-docker compose build
+docker image inspect podcast-transcription:pre-router &&
+  docker tag podcast-transcription:pre-router podcast-transcription:local ||
+  docker compose build
+docker compose down --remove-orphans   # never -v
 (umask 077 && tar -C .runtime -xzf ~/PodcastTranscriptionWeb-backups/claude-runtime-<stamp>.tar.gz)
 ```
+
+### Rolling back Plan 7c
+
+Plan 7c adds migration `0005_block_provider_failures` and writes policies with
+`prompt_version` `commercial-segment-classifier/v2`, which the 7b code rejects
+because it accepts only v1. Rolling back 7c to 7b therefore also needs a
+restore, in this order: stop the writers; run
+`db downgrade 0004_router_classification` with the 7c image; restore the
+pre-7c backup (the 7c upgrade script writes
+`~/PodcastTranscriptionWeb-backups/postgres-<stamp>-pre7c-*.dump`); check out
+the 7b revision and rebuild, or tag the saved image with
+`docker tag podcast-transcription:pre-7c podcast-transcription:local`; then
+start the services.
 
 Upgrading again recreates `request_generation` as 0 for every block, so keys
 from generation `g0` repeat and the router may replay the outcome it stored for
