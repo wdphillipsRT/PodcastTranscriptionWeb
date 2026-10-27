@@ -74,7 +74,7 @@ def test_a_repeated_key_replays_instead_of_generating_twice(fake_router):  # noq
     (503, FakeRouter.error("MODEL_NO_ELIGIBLE_CANDIDATE"), "router_busy", "no_candidate", True),
     (504, FakeRouter.error("MODEL_TIMEOUT"), "router_busy", "router_failure", True),
     (500, FakeRouter.error("MODEL_ROUTER_INTERNAL"), "router_busy", "router_failure", True),
-    (502, FakeRouter.error("MODEL_PROVIDER_UNAVAILABLE"), "router_busy", "router_failure", True),
+    (502, FakeRouter.error("MODEL_PROVIDER_UNAVAILABLE"), "router_busy", "provider_unavailable", True),
     (502, b"", "router_busy", "proxy", False),
     (503, b"<html>proxy</html>", "router_busy", "proxy", False),
     (502, FakeRouter.error("MODEL_OUTPUT_INVALID"), "model_invalid_output", "output_invalid", True),

@@ -825,23 +825,25 @@ class ClassificationService:
                 failure = ClassificationServiceError("router_busy", reason="timeout")
             else:
                 failure = ClassificationServiceError("invalid_policy")
-            if failure.record:
-                self._record_failure(revision_id, failure, block_ordinal, claim)
+            if failure.record and not self._record_failure(revision_id, failure, block_ordinal, claim):
+                # A stale claim or a finished revision: the task layer must change nothing either.
+                failure.record = False
             raise failure from None
 
     def _record_failure(self, revision_id, failure, ordinal, claim):
+        """True when the failure was recorded, False when the claim was stale or the revision finished."""
         with self._transaction():
             _, revision = self._revision_lock(revision_id)
             if revision.state in {"completed", "superseded"}:
-                return
+                return False
             blocks = self._blocks(revision_id)
             block = next((block for block in blocks if block.ordinal == ordinal), None)
             if claim and claim.get("token") is not None:
                 if (block is None or block.state != "running"
                         or (block.attempts, block.started_at) != claim["token"]):
-                    return
+                    return False
             elif any(block.state == "running" for block in blocks):
-                return
+                return False
             revision.state = "retrying" if failure.retryable else "failed"
             revision.error_category = failure.category
             if block is not None and block.state not in {"completed", "superseded"}:
@@ -860,6 +862,7 @@ class ClassificationService:
                     # uses a new key.
                     block.request_generation += 1
                     block.request_generation_started_at = None
+        return True
 
     def _stuck_in_progress(self, failure, block):
         """A 202 for a key first sent longer ago than any router call can take."""

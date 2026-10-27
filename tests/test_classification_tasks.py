@@ -446,7 +446,7 @@ def test_slow_provider_failures_on_one_block_fail_the_revision_on_the_third(work
     monkeypatch.setattr(tasks, "INPUT_FAILURE_MIN_SECONDS", 0)
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
-    worker.env.classifier.error = ClassifierError("router_busy", reason="router_failure", advance_key=True)
+    worker.env.classifier.error = ClassifierError("router_busy", reason="provider_unavailable", advance_key=True)
     for attempt in (1, 2, 3):
         task().run(identity, "block", 1)
         revision = db.session.get(m.ClassificationRevision, identity)
@@ -463,7 +463,7 @@ def test_slow_provider_failures_on_one_block_fail_the_revision_on_the_third(work
 def test_fast_provider_failures_stay_busy_and_are_not_counted(worker):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
-    worker.env.classifier.error = ClassifierError("router_busy", reason="router_failure", advance_key=True)
+    worker.env.classifier.error = ClassifierError("router_busy", reason="provider_unavailable", advance_key=True)
     for _ in range(5):
         task().run(identity, "block", 1)
     revision = db.session.get(m.ClassificationRevision, identity)
@@ -471,7 +471,7 @@ def test_fast_provider_failures_stay_busy_and_are_not_counted(worker):
     assert (revision.state, revision.error_category, block.provider_failures) == ("retrying", "router_busy", 0)
 
 
-@pytest.mark.parametrize("reason", ["rate_limited", "in_progress", "timeout", "transport", "proxy", "no_candidate"])
+@pytest.mark.parametrize("reason", ["rate_limited", "in_progress", "timeout", "transport", "proxy", "no_candidate", "router_failure"])
 def test_other_busy_outcomes_never_count_as_provider_failures(worker, monkeypatch, reason):
     monkeypatch.setattr(tasks, "INPUT_FAILURE_MIN_SECONDS", 0)
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
@@ -482,6 +482,29 @@ def test_other_busy_outcomes_never_count_as_provider_failures(worker, monkeypatc
     block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
     assert block.provider_failures == 0
     assert db.session.get(m.ClassificationRevision, identity).state == "retrying"
+
+
+def test_a_stale_claims_provider_failure_changes_nothing(worker, monkeypatch):
+    monkeypatch.setattr(tasks, "INPUT_FAILURE_MIN_SECONDS", 0)
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    error = ClassifierError("router_busy", reason="provider_unavailable", advance_key=True)
+
+    def superseded(*args, **kwargs):
+        # Another claim takes the block mid-call, so this claim's token no longer matches.
+        block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+        block.attempts += 1
+        db.session.commit()
+        raise error
+
+    monkeypatch.setattr(worker.env.classifier, "classify", superseded)
+    worker.sent.clear()
+    task().run(identity, "block", 1)
+    revision = db.session.get(m.ClassificationRevision, identity)
+    block = m.ClassificationBlock.query.filter_by(revision_id=identity, ordinal=1).one()
+    assert block.provider_failures == 0
+    assert (revision.state, revision.error_category, revision.attempts) != ("failed", "model_unavailable", 1)
+    assert revision.state not in {"failed", "retrying"} and block.state == "running" and not worker.sent
 
 
 def test_a_busy_router_retries_the_same_block_with_doubling_back_off(worker):

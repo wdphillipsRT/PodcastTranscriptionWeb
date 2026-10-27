@@ -498,7 +498,8 @@ class ClassificationBlock(Timestamps, db.Model):
     request_generation = db.Column(db.Integer, nullable=False, default=0, server_default="0")
     # When the current generation's key was first sent; a 202 long after it means a stuck key.
     request_generation_started_at = db.Column(UTCDateTime())
-    # Router-stored 5xx outcomes that arrived after the model ran a minute or more on this input.
+    # Router-stored MODEL_PROVIDER_UNAVAILABLE outcomes that arrived after the claim ran at
+    # least tasks.INPUT_FAILURE_MIN_SECONDS on this input.
     provider_failures = db.Column(db.Integer, nullable=False, default=0, server_default="0")
     target_first_segment_id = db.Column(db.String(27), nullable=False)
     target_last_segment_id = db.Column(db.String(27), nullable=False)
