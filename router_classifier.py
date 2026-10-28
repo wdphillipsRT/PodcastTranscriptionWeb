@@ -9,13 +9,15 @@ thresholds it to uncertain. Stored v1 provenance from the Claude era, where
 every target was decided, stays valid.
 The route answers with OUTPUT_SCHEMA, which uses only the router's schema
 subset. The checks that subset cannot express are made here and fail as
-model_invalid_output: segment ID format, IDs inside the window, unique reason
-codes, and ranges in order without overlap. To fit the route's
-32,768-token context with 8,192 output tokens reserved (about 98,000
-characters of content), the last (oldest) examples are dropped first, then the
-outermost context segments. Fitting uses router_client's copy of the router's
-own estimate (schema contract included) and keeps FIT_MARGIN_TOKENS spare. A
-window that still cannot fit is model_config.
+model_invalid_output: segment ID format, IDs inside the window, ranges not
+reversed, and unique reason codes. Ranges are trimmed to the target segments
+(one wholly in the context is dropped) and taken in segment order; segments
+covered by ranges with different labels become uncertain (ambiguous_boundary).
+To fit the route's 32,768-token context with 8,192 output tokens reserved
+(about 98,000 characters of content), the last (oldest) examples are dropped
+first, then the outermost context segments. Fitting uses router_client's copy
+of the router's own estimate (schema contract included) and keeps
+FIT_MARGIN_TOKENS spare. A window that still cannot fit is model_config.
 
 The request is a pure function of the window, the examples and the settings
 (no clock, randomness or unordered iteration), so a block that reuses its
@@ -242,6 +244,20 @@ def _implied_editorial(window, signalled, first, last):
                           IMPLIED_EDITORIAL_REASONS) for a, b in runs]
 
 
+CONFLICT_REASONS = ("ambiguous_boundary",)
+
+
+def _covered(window, first, last, entries):
+    """One decision for target indexes first..last, covered by the same entries; entries that disagree make it uncertain."""
+    labels = {entry["label"] for entry in entries}
+    confidence = float(min(entry["confidence"] for entry in entries))
+    if len(labels) > 1:
+        label, reasons = "uncertain", CONFLICT_REASONS
+    else:
+        label, reasons = labels.pop(), tuple(dict.fromkeys(code for entry in entries for code in entry["reason_codes"]))[:4]
+    return BlockDecision(window.target_segments[first].id, window.target_segments[last].id, label, confidence, reasons)
+
+
 def _decisions(parsed, window):
     try:
         if not isinstance(parsed, dict) or set(parsed) != {"ranges"}:
@@ -249,10 +265,12 @@ def _decisions(parsed, window):
         ranges = parsed["ranges"]
         if not isinstance(ranges, list) or not 0 <= len(ranges) <= TARGET_SEGMENTS_PER_BLOCK:
             _fail()
-        positions = {segment.id: index for index, segment in enumerate(window.target_segments)}
-        signalled = _signalled_targets(window)
-        decisions, cursor = [], 0
-        for entry in ranges:
+        # Window positions relative to the first target: context before is negative, context after is past the end.
+        offset, targets = len(window.context_before), len(window.target_segments)
+        positions = {segment.id: index - offset for index, segment in
+                     enumerate((*window.context_before, *window.target_segments, *window.context_after))}
+        cover = [[] for _ in range(targets)]
+        for order, entry in enumerate(ranges):
             if (not isinstance(entry, dict)
                     or set(entry) != {"first_segment_id", "last_segment_id", "label", "confidence", "reason_codes"}):
                 _fail()
@@ -260,7 +278,7 @@ def _decisions(parsed, window):
                 if not isinstance(entry[name], str) or not re.fullmatch(r"seg-[0-9]{6}-[a-f0-9]{16}", entry[name]):
                     _fail()
             first, last = positions.get(entry["first_segment_id"]), positions.get(entry["last_segment_id"])
-            if first is None or last is None or first < cursor or last < first:
+            if first is None or last is None or last < first:
                 _fail()
             label, confidence, reasons = entry["label"], entry["confidence"], entry["reason_codes"]
             if not isinstance(label, str) or label not in LABELS:
@@ -271,13 +289,20 @@ def _decisions(parsed, window):
                     or any(not isinstance(code, str) or code not in REASON_CODES for code in reasons)
                     or len(set(reasons)) != len(reasons)):
                 _fail()
-            if first > cursor:
-                decisions.extend(_implied_editorial(window, signalled, cursor, first - 1))
-            decisions.append(BlockDecision(entry["first_segment_id"], entry["last_segment_id"], label,
-                                           float(confidence), tuple(reasons)))
-            cursor = last + 1
-        if cursor < len(window.target_segments):
-            decisions.extend(_implied_editorial(window, signalled, cursor, len(window.target_segments) - 1))
+            # Trimmed to the targets; a range wholly in the context covers nothing.
+            for index in range(max(first, 0), min(last, targets - 1) + 1):
+                cover[index].append(order)
+        signalled = _signalled_targets(window)
+        decisions, start = [], 0
+        while start < targets:
+            end = start
+            while end + 1 < targets and cover[end + 1] == cover[start]:
+                end += 1
+            if cover[start]:
+                decisions.append(_covered(window, start, end, [ranges[order] for order in cover[start]]))
+            else:
+                decisions.extend(_implied_editorial(window, signalled, start, end))
+            start = end + 1
         return tuple(decisions)
     except ClassifierError:
         raise
