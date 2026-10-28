@@ -739,3 +739,38 @@ def test_the_backlog_counts_messages_on_the_classification_queue(worker, monkeyp
             assert tasks._classification_backlog() == 0  # The memory transport keeps an empty declared queue.
         finally:
             connection.default_channel.queue_delete("classification")  # Memory broker state is process-wide.
+
+
+def queued_delivery(worker, state, seconds=2161):
+    """A revision whose message was published but not yet delivered, last updated `seconds` ago."""
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    if state == "retrying":
+        task().run(identity, "prepare")
+    revision = db.session.get(m.ClassificationRevision, identity)
+    revision.state, revision.error_category = state, "router_busy" if state == "retrying" else None
+    revision.updated_at = m.utc_now() - timedelta(seconds=seconds)
+    db.session.commit()
+    worker.sent.clear()
+    return revision
+
+
+@pytest.mark.parametrize("state", ["retrying", "pending"])
+def test_a_queued_delivery_is_not_republished_behind_queued_work(worker, monkeypatch, state):
+    revision = queued_delivery(worker, state)
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: 3)
+    reconcile()
+    assert (revision.state, revision.attempts, revision.error_category) == (
+        state, 0, "router_busy" if state == "retrying" else None)
+    assert not [entry for entry in worker.sent if entry[0] == "tasks.classify_item"]
+
+
+@pytest.mark.parametrize("state", ["retrying", "pending"])
+@pytest.mark.parametrize("backlog, seconds", [(None, 2161), (0, 2161), (3, tasks.MAX_QUEUED_WAIT_SECONDS + 60)])
+def test_a_queued_delivery_is_republished_when_the_queue_is_empty_unknown_or_past_the_cap(
+        worker, monkeypatch, state, backlog, seconds):
+    revision = queued_delivery(worker, state, seconds)
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: backlog)
+    reconcile()
+    assert revision.attempts == 0
+    assert [entry[1] for entry in worker.sent if entry[0] == "tasks.classify_item"] == [
+        [revision.id, "block", 1] if state == "retrying" else [revision.id, "prepare", None]]

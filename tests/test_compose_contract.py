@@ -88,6 +88,7 @@ def test_classifier_has_exclusive_router_credentials_queue_and_bounded_tmpfs(com
     assert classifier["volumes"] == [{"type": "bind", "source": "${ROUTER_CREDENTIALS_HOST_PATH:-./.runtime/router}",
                                       "target": "/router", "read_only": True, "bind": {"create_host_path": False}}]
     assert classifier["tmpfs"] == ["/tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1770"]
+    assert classifier["stop_grace_period"] == "60s"  # Warm shutdown finishes the running block.
     for name, service in services.items():
         if name != "classifier":
             assert "classification" not in repr(service.get("command", []))

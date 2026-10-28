@@ -1257,7 +1257,7 @@ def _missing_classification_query():
 
 
 def _classification_backlog():
-    """Messages waiting on the classification queue, or None when the broker cannot say."""
+    """Messages waiting on the classification queue; None when it is empty (Redis drops empty lists) or the broker cannot say."""
     try:
         with celery_app.connection_for_read() as connection:
             connection.ensure_connection(max_retries=0)  # One attempt: kombu sleeps 2 s before any retry.
@@ -1295,6 +1295,10 @@ def _reconcile_revision(revision_id, item_id, cutoff, backlog=None, max_wait_cut
         if revision.error_category != "dispatch_pending":
             delivered_at = revision.updated_at or revision.created_at
             if delivered_at is None or delivered_at >= cutoff:
+                db.session.commit()
+                return None, None, None
+            if backlog and max_wait_cutoff is not None and delivered_at >= max_wait_cutoff:
+                # Published and plausibly queued behind the messages still waiting; republishing would duplicate it.
                 db.session.commit()
                 return None, None, None
         dispatch = _revision_dispatch(revision)
@@ -1347,10 +1351,12 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
         stale_running = sa.and_(ClassificationRevision.state == "running", heartbeat < cutoff)
         if backlog:
             stale_running = sa.and_(stale_running, heartbeat < max_wait_cutoff)
+        delivered = sa.func.coalesce(ClassificationRevision.updated_at, ClassificationRevision.created_at)
         stale_delivery = sa.and_(sa.or_(ClassificationRevision.state == "retrying",
             sa.and_(ClassificationRevision.state == "pending", ClassificationRevision.started_at.is_(None),
-                ClassificationRevision.heartbeat_at.is_(None))),
-            sa.func.coalesce(ClassificationRevision.updated_at, ClassificationRevision.created_at) < cutoff)
+                ClassificationRevision.heartbeat_at.is_(None))), delivered < cutoff)
+        if backlog:
+            stale_delivery = sa.and_(stale_delivery, delivered < max_wait_cutoff)
         stale_block = sa.exists().where(ClassificationBlock.revision_id == ClassificationRevision.id,
             ClassificationBlock.state == "running",
             sa.func.coalesce(ClassificationBlock.heartbeat_at, ClassificationBlock.started_at) < cutoff)
