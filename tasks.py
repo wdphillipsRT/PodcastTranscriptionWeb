@@ -1194,7 +1194,7 @@ def release_reclassification():
 
 
 def cancel_reclassification():
-    """Supersede every held reclassification revision in one transaction; returns how many.
+    """Supersede all held reclassifications and retries in one transaction; returns how many.
 
     Only held revisions change (`pending`, `reclassify_queued`, never started). They were never
     prepared, so they have no blocks and nothing in flight, and they are never an item's active
