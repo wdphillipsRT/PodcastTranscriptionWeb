@@ -969,6 +969,9 @@ def _classification_delay(attempts):
 INPUT_FAILURE_MIN_SECONDS = 60
 MAX_BLOCK_PROVIDER_FAILURES = 3
 MAX_CLASSIFICATION_ATTEMPTS = 5
+# A revision between phases waits for free while the classification queue holds messages, but no longer than this:
+# well past the nightly 21:45-06:00 pause plus the morning drain.
+MAX_QUEUED_WAIT_SECONDS = 24 * 3600
 # Temperature 0: a new key regenerates the same invalid answer (121 of 121 blocks in the Plan 7c run).
 MAX_INVALID_OUTPUT_ATTEMPTS = 1
 
@@ -1262,7 +1265,7 @@ def _classification_backlog():
         return None
 
 
-def _reconcile_revision(revision_id, item_id, cutoff, backlog=None):
+def _reconcile_revision(revision_id, item_id, cutoff, backlog=None, max_wait_cutoff=None):
     """Separate aged delivery replays and queued waits from proven abandoned running work."""
     from extensions import db
     from models import ClassificationRevision, ClassificationBlock
@@ -1280,9 +1283,9 @@ def _reconcile_revision(revision_id, item_id, cutoff, backlog=None):
             if heartbeat is None or heartbeat >= cutoff:
                 db.session.commit()
                 return None, None, None
-            if block is None and backlog:
-                # Between phases with messages still queued: waiting its turn, not abandoned.
-                # A lost message is recovered on a pass that finds the queue empty.
+            if block is None and backlog and max_wait_cutoff is not None and heartbeat >= max_wait_cutoff:
+                # Between phases with messages still queued: waiting its turn, not abandoned. A lost message is
+                # recovered on a pass that finds the queue empty, or once the wait passes MAX_QUEUED_WAIT_SECONDS.
                 db.session.commit()
                 return None, None, None
             dispatch = _revision_dispatch(revision)
@@ -1335,9 +1338,14 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
         after_revision_id=after_revision_id, after_item_id=after_item_id)
     enabled = current_app.config["CLASSIFICATION_ENABLED"]
     cutoff = utc_now() - timedelta(seconds=celeryconfig.task_time_limit + 300)
+    max_wait_cutoff = utc_now() - timedelta(seconds=MAX_QUEUED_WAIT_SECONDS)
     if enabled and not create_only:
-        stale_running = sa.and_(ClassificationRevision.state == "running",
-            sa.func.coalesce(ClassificationRevision.heartbeat_at, ClassificationRevision.started_at) < cutoff)
+        # Asked once per page, before the query: revisions waiting behind queued work must not fill the page.
+        backlog = _classification_backlog()
+        heartbeat = sa.func.coalesce(ClassificationRevision.heartbeat_at, ClassificationRevision.started_at)
+        stale_running = sa.and_(ClassificationRevision.state == "running", heartbeat < cutoff)
+        if backlog:
+            stale_running = sa.and_(stale_running, heartbeat < max_wait_cutoff)
         stale_delivery = sa.and_(sa.or_(ClassificationRevision.state == "retrying",
             sa.and_(ClassificationRevision.state == "pending", ClassificationRevision.started_at.is_(None),
                 ClassificationRevision.heartbeat_at.is_(None))),
@@ -1351,11 +1359,10 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
             sa.or_(ClassificationRevision.error_category == "dispatch_pending", stale_running, stale_delivery, stale_block))
             .order_by(ClassificationRevision.id).limit(bound)))
         db.session.commit()
-        backlog = _classification_backlog() if candidates else None
         for identity, item_id in candidates:
             counts["scanned"] += 1
             counts["after_revision_id"] = identity
-            dispatch, countdown, category = _reconcile_revision(identity, item_id, cutoff, backlog)
+            dispatch, countdown, category = _reconcile_revision(identity, item_id, cutoff, backlog, max_wait_cutoff)
             counts["published"] += int(_publish_classification(dispatch, countdown=countdown, restore_category=category))
     remaining = bound - counts["scanned"]
     if remaining:
