@@ -1252,8 +1252,18 @@ def _missing_classification_query():
     return sa.select(ContentItem.id).where(ContentItem.status == "completed", ~current)
 
 
-def _reconcile_revision(revision_id, item_id, cutoff):
-    """Separate aged delivery replays from proven abandoned running work."""
+def _classification_backlog():
+    """Messages waiting on the classification queue, or None when the broker cannot say."""
+    try:
+        with celery_app.connection_for_read() as connection:
+            connection.ensure_connection(max_retries=0)  # One attempt: kombu sleeps 2 s before any retry.
+            return connection.default_channel.queue_declare(queue="classification", passive=True).message_count
+    except Exception:
+        return None
+
+
+def _reconcile_revision(revision_id, item_id, cutoff, backlog=None):
+    """Separate aged delivery replays and queued waits from proven abandoned running work."""
     from extensions import db
     from models import ClassificationRevision, ClassificationBlock
     with _item_lock(item_id) as acquired:
@@ -1268,6 +1278,11 @@ def _reconcile_revision(revision_id, item_id, cutoff):
         heartbeat = (block.heartbeat_at or block.started_at) if block else revision.heartbeat_at or revision.started_at
         if block is not None or revision.state == "running" and revision.error_category != "dispatch_pending":
             if heartbeat is None or heartbeat >= cutoff:
+                db.session.commit()
+                return None, None, None
+            if block is None and backlog:
+                # Between phases with messages still queued: waiting its turn, not abandoned.
+                # A lost message is recovered on a pass that finds the queue empty.
                 db.session.commit()
                 return None, None, None
             dispatch = _revision_dispatch(revision)
@@ -1336,10 +1351,11 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
             sa.or_(ClassificationRevision.error_category == "dispatch_pending", stale_running, stale_delivery, stale_block))
             .order_by(ClassificationRevision.id).limit(bound)))
         db.session.commit()
+        backlog = _classification_backlog() if candidates else None
         for identity, item_id in candidates:
             counts["scanned"] += 1
             counts["after_revision_id"] = identity
-            dispatch, countdown, category = _reconcile_revision(identity, item_id, cutoff)
+            dispatch, countdown, category = _reconcile_revision(identity, item_id, cutoff, backlog)
             counts["published"] += int(_publish_classification(dispatch, countdown=countdown, restore_category=category))
     remaining = bound - counts["scanned"]
     if remaining:

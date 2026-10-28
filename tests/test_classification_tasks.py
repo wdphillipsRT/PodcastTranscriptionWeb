@@ -628,3 +628,49 @@ def test_aged_claude_era_retry_replays_with_its_current_category(worker, legacy,
     reconcile()
     assert (revision.state, revision.attempts, revision.error_category) == ("retrying", 2, current)
     assert len(worker.sent) == 1 and worker.sent[-1][2]["countdown"] > 0
+
+
+def waiting_for_block(worker, seconds=2161):
+    """A prepared revision whose block-1 message is queued but unclaimed, silent for `seconds`."""
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    revision = db.session.get(m.ClassificationRevision, identity)
+    assert revision.state == "running" and m.ClassificationBlock.query.one().state == "pending"
+    revision.heartbeat_at = m.utc_now() - timedelta(seconds=seconds)
+    db.session.commit()
+    worker.sent.clear()
+    return revision
+
+
+def test_a_revision_waiting_behind_queued_work_keeps_its_attempts(worker, monkeypatch):
+    revision = waiting_for_block(worker)
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: 3)
+    reconcile()
+    assert (revision.state, revision.attempts, revision.error_category) == ("running", 0, None)
+    assert not [entry for entry in worker.sent if entry[0] == "tasks.classify_item"]
+
+
+@pytest.mark.parametrize("backlog", [0, None])
+def test_a_stale_waiting_revision_is_recovered_once_the_queue_is_empty_or_unknown(worker, monkeypatch, backlog):
+    revision = waiting_for_block(worker)
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: backlog)
+    reconcile()
+    assert (revision.attempts, revision.state, revision.error_category) == (1, "retrying", "worker_timeout")
+    assert worker.sent[-1][1] == [revision.id, "block", 1]
+
+
+def test_a_stale_running_block_is_charged_even_behind_queued_work(worker, monkeypatch):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    revision = db.session.get(m.ClassificationRevision, identity)
+    block = m.ClassificationBlock.query.one()
+    block.state, revision.error_category = "running", None
+    block.started_at = block.heartbeat_at = revision.heartbeat_at = m.utc_now() - timedelta(seconds=2161)
+    db.session.commit()
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: 3)
+    reconcile()
+    assert (revision.attempts, revision.state, revision.error_category) == (1, "retrying", "worker_timeout")
+
+
+def test_the_backlog_is_unknown_without_a_broker(worker):
+    assert tasks._classification_backlog() is None
