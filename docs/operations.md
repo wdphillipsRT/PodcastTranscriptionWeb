@@ -573,7 +573,8 @@ Router failures become closed categories:
 | --- | --- | --- |
 | 429, 202 (still running), 500, 503, 504, other 502, timeout, refused or reset connection, Celery soft time limit | `router_busy` | Block back to pending, revision `retrying`; retried after 30 s doubling to 10 min; never counts as a failed attempt |
 | A router 5xx `MODEL_PROVIDER_UNAVAILABLE` (client reason `provider_unavailable`) after the claim ran `INPUT_FAILURE_MIN_SECONDS` (60 s) or more, the third time on the same block (`MAX_BLOCK_PROVIDER_FAILURES`) | `model_unavailable` | Revision fails; `classification retry --item-id <id>` after the cause is fixed. Other coded 5xx (reason `router_failure`) and faster failures stay `router_busy` |
-| 502 `MODEL_OUTPUT_INVALID`, or output failing the Python checks | `model_invalid_output` | Revision fails on the first attempt (`MAX_INVALID_OUTPUT_ATTEMPTS` is 1): calls run at temperature 0, so a new key replays the same answer. `classification retry-invalid` retries them. Other failures count toward `MAX_CLASSIFICATION_ATTEMPTS` (5) |
+| 502 `MODEL_OUTPUT_INVALID`, or output failing the Python checks | `model_invalid_output` | Revision fails on the first attempt (`MAX_INVALID_OUTPUT_ATTEMPTS` is 1): calls run at temperature 0, so a new key replays the same answer. `classification retry-invalid` queues retries for them. Other failures count toward `MAX_CLASSIFICATION_ATTEMPTS` (5) |
+| No response: the reconciler finds a claimed block, or a revision between phases, silent for `task_time_limit` + 300 s (2,160 s) | `worker_timeout` | One attempt counted, message republished; the fifth fails the revision. A revision between phases is not charged while the `classification` queue holds messages (see below). `classification retry-failed --category worker_timeout` queues retries for failed ones |
 | 401, 403, certificate verification failure or TLS alert, unusable token | `model_auth` | Revision fails |
 | Other 4xx, request too large | `model_config` | Revision fails |
 | `selected_model` not `ROUTER_EXPECTED_MODEL` | `model_mismatch` | Revision fails |
@@ -640,6 +641,30 @@ and read `router_busy=<count>`, `oldest_busy_key_sent=` and
 `router_busy`: the block retries at most every 10 minutes, and the router stores
 a failed invocation for each try (each try uses a new key generation), so fix
 the model on the router rather than waiting it out.
+
+The reconciler is scheduled every `CLASSIFICATION_RECONCILE_INTERVAL_SECONDS`
+(300 s), but it runs on the classifier's own queue: it waits behind queued work
+and does not run while the classifier is stopped, so it runs at most that
+often. It treats work silent for `task_time_limit` + 300 s (2,160 s) as lost. A
+claimed block whose worker died is charged `worker_timeout` (one attempt) and
+republished. A revision waiting between phases (no running block) is usually
+just queued: the classifier runs one task at a time, so its next message can
+sit behind many others. While the `classification` queue holds messages, such a
+revision is not charged and not republished, and the reconciler leaves it out
+of its query, so waiting revisions do not fill its pages. It is charged and
+republished as `worker_timeout` on a pass that finds the queue empty or cannot
+ask the broker, or once it has waited more than 24 hours
+(`MAX_QUEUED_WAIT_SECONDS`). Published deliveries are gated the same way: a
+`retrying` revision, or a `pending` one that never started, is not republished
+while the queue holds messages, up to the same 24-hour cap, because
+republishing a queued message would duplicate its chain. A revision whose
+publication is still owed (`dispatch_pending`) is always republished.
+
+The classifier service has `stop_grace_period: 60s`, so
+`docker compose stop classifier` (and `up -d`) lets Celery's warm shutdown
+finish the running block, and usually nothing is charged. A block still running
+after 60 s is cut off, and only the revision whose block was running is charged
+once (`worker_timeout`), not the revisions waiting behind it.
 
 Classifier startup runs
 `system check --services database,redis,s3,claude_absent,router`.
@@ -710,10 +735,11 @@ creates, newest first, a `policy_upgrade` revision for every completed episode
 without a revision from the current classifier, including episodes already
 exported. Old revisions stay for history. New revisions wait as `pending` with
 error category `reclassify_queued`. The reconciler never publishes them. The
-classifier releases the oldest one whenever no other revision is pending,
-running or retrying. Rerunning queues nothing twice: an episode that already
-has its reclassification revision, in any state, is not a candidate, so reruns
-and `--limit` move on to episodes not yet queued. It prints
+classifier releases held retries first, then the oldest held reclassification,
+one at a time, whenever no other revision is pending, running or retrying.
+Rerunning queues nothing twice: an episode that already has its
+reclassification revision, in any state, is not a candidate, so reruns and
+`--limit` move on to episodes not yet queued. It prints
 `candidates= queued= existing= busy= failed= released=`; `queued` counts only
 revisions newly held by this run, and `existing` counts candidates that were
 classified or queued by something else while the command waited for them.
@@ -737,10 +763,10 @@ revision), while the record already exported for it stays live. Retry it with
 `classification retry --item-id <id>`.
 
 `classification reclassify-cancel` (stop `classifier` first) supersedes every
-held revision (`reclassify_queued`) and prints `cancelled=<n>`; the episodes
-keep their current revision and export as before. After a prompt or model
-change, cancel the old queue, then run `reclassify-all` again: it queues under
-the new classifier's key prefix. Notes:
+held revision (`reclassify_queued`), held retries included, and prints
+`cancelled=<n>`; the episodes keep their current revision and export as before.
+After a prompt or model change, cancel the old queue, then run `reclassify-all`
+again: it queues under the new classifier's key prefix. Notes:
 
 - Under the same classifier provenance `reclassify-all` skips cancelled items
   (their key still matches) and `classification retry` does not apply, because
@@ -751,24 +777,43 @@ the new classifier's key prefix. Notes:
   running revision finish, or accept that it will be superseded.
 - Cancelled items export normally again on the next nightly run (they have no
   newer held revision) until `reclassify-all` holds them again.
+- A cancelled retry is not queued again: `retry-failed` skips the episode (its
+  newest revision is the superseded retry, not a failure) and
+  `classification retry --item-id <id>` prints `published=0` (its key still
+  matches the superseded retry). Under the same provenance, `reclassify-all`
+  queues the episode again only if it never had a reclassification revision
+  (for example, a failed backfill or a retry of one); otherwise only a new
+  provenance does.
 
-`classification retry-invalid [--limit N]` retries the episodes that failed on
-invalid model output. It selects each completed episode whose newest revision
-failed with `model_invalid_output` on its current transcript under the current
-classifier (same model, classifier CLI version and prompt digest), and requests
-a `manual_retry` for each, newest episode first, as `classification retry` does.
-It prints
-`candidates=<n> requested=<n> published=<n> busy=<n> failed=<n>`; `busy` counts
-episodes that were locked or changed since the query, and `failed` those whose
-retry could not be prepared (for example a transcript or storage error). Busy
-and failed episodes are left for a rerun. Rerunning is safe: a repeated request
-for the same failed revision is a no-op, and an episode whose newest revision is
-now the retry is no longer a candidate, but an episode whose retry failed again
-is retried again. The router replays nothing, because each retry is a new
-revision with new keys; at temperature 0 the model gives the same answer, which
-the current range rules then accept or reject again.
+`classification retry-failed --category model_invalid_output|worker_timeout
+[--limit N]` retries the episodes that failed with that category. It selects
+each completed episode whose newest revision failed with it on its current
+transcript under the current classifier (same model, classifier CLI version and
+prompt digest), newest episode first, and holds a `manual_retry` for each in
+the reclassification queue (`reclassify_queued`). `classification retry-invalid
+[--limit N]` is `retry-failed --category model_invalid_output`. Held retries
+are released one at a time, before held reclassifications, once nothing else is
+in flight: the command releases one itself, a chain that ends releases the
+next, and each reconciler pass (at most every 5 minutes; see the reconciler
+note above) releases one if none is in flight.
+`status`'s `reclassify_queued=` includes held retries, and `reclassify-cancel`
+cancels them too. It prints
+`candidates=<n> requested=<n> queued=<n> busy=<n> failed=<n> released=<0|1>`;
+`queued` counts retries newly held by this run, `busy` counts episodes that were
+locked or changed since the query, `failed` those whose retry could not be
+prepared (for example a transcript or storage error), and `released` whether
+the command itself released a held revision. Busy and failed episodes are left
+for a rerun. Rerunning is safe: a repeated request for the same failed revision
+is a no-op, and an episode whose newest revision is now the retry is no longer
+a candidate. An invalid-output failure that was itself a retry is skipped: it
+was already retried under the current range rules, and at temperature 0 the
+model gives the same answer. A `worker_timeout` failure of a retry is retried
+again. The router replays nothing, because each retry is a new revision with
+new keys. `classification retry --item-id <id>` is unchanged: it publishes its
+retry at once, without holding it.
 
 ```bash
+docker compose exec classifier flask --app app:create_app classification retry-failed --category worker_timeout
 docker compose exec classifier flask --app app:create_app classification retry-invalid
 docker compose exec classifier flask --app app:create_app classification status
 ```

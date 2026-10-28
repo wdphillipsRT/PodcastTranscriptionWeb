@@ -969,6 +969,9 @@ def _classification_delay(attempts):
 INPUT_FAILURE_MIN_SECONDS = 60
 MAX_BLOCK_PROVIDER_FAILURES = 3
 MAX_CLASSIFICATION_ATTEMPTS = 5
+# A revision between phases waits for free while the classification queue holds messages, but no longer than this:
+# well past the nightly 21:45-06:00 pause plus the morning drain.
+MAX_QUEUED_WAIT_SECONDS = 24 * 3600
 # Temperature 0: a new key regenerates the same invalid answer (121 of 121 blocks in the Plan 7c run).
 MAX_INVALID_OUTPUT_ATTEMPTS = 1
 
@@ -1169,7 +1172,7 @@ def queue_reclassification(*, limit=None):
 
 
 def release_reclassification():
-    """Dispatch the oldest held revision once no other revision is pending, running or retrying."""
+    """Dispatch the next held revision (retries first, then oldest) once no other revision is pending, running or retrying."""
     import sqlalchemy as sa
     from extensions import db
     from models import ClassificationRevision
@@ -1179,7 +1182,8 @@ def release_reclassification():
         ClassificationRevision.state.in_(("pending", "running", "retrying")), _not_held()))
     held = None if in_flight else db.session.scalar(sa.select(ClassificationRevision).where(
         ClassificationRevision.state == "pending", ClassificationRevision.error_category == RECLASSIFY_QUEUED)
-        .order_by(ClassificationRevision.id).limit(1))
+        .order_by(sa.case((ClassificationRevision.request_reason == "manual_retry", 0), else_=1),
+                  ClassificationRevision.id).limit(1))
     if held is None:
         db.session.commit()
         return None
@@ -1190,13 +1194,15 @@ def release_reclassification():
 
 
 def cancel_reclassification():
-    """Supersede every held reclassification revision in one transaction; returns how many.
+    """Supersede all held reclassifications and retries in one transaction; returns how many.
 
     Only held revisions change (`pending`, `reclassify_queued`, never started). They were never
     prepared, so they have no blocks and nothing in flight, and they are never an item's active
     revision, so items keep what they export and show. Released, running and finished revisions
-    are untouched. Under the same classifier provenance a cancelled item is not queued again:
-    its superseded revision still carries the key `queue_reclassification` checks. A new model pin,
+    are untouched. Under the same classifier provenance a cancelled reclassification is not queued
+    again: its superseded revision still carries the key `queue_reclassification` checks. A cancelled
+    retry carries a `manual_retry:` key instead, so its item is queued again unless it already has
+    that provenance's reclassification revision. A new model pin,
     router route or prompt gives a new key prefix, which makes every cancelled item a candidate again.
     """
     import sqlalchemy as sa
@@ -1252,8 +1258,18 @@ def _missing_classification_query():
     return sa.select(ContentItem.id).where(ContentItem.status == "completed", ~current)
 
 
-def _reconcile_revision(revision_id, item_id, cutoff):
-    """Separate aged delivery replays from proven abandoned running work."""
+def _classification_backlog():
+    """Messages waiting on the classification queue; None when it is empty (Redis drops empty lists) or the broker cannot say."""
+    try:
+        with celery_app.connection_for_read() as connection:
+            connection.ensure_connection(max_retries=0)  # One attempt: kombu sleeps 2 s before any retry.
+            return connection.default_channel.queue_declare(queue="classification", passive=True).message_count
+    except Exception:
+        return None
+
+
+def _reconcile_revision(revision_id, item_id, cutoff, backlog=None, max_wait_cutoff=None):
+    """Separate aged delivery replays and queued waits from proven abandoned running work."""
     from extensions import db
     from models import ClassificationRevision, ClassificationBlock
     with _item_lock(item_id) as acquired:
@@ -1270,12 +1286,21 @@ def _reconcile_revision(revision_id, item_id, cutoff):
             if heartbeat is None or heartbeat >= cutoff:
                 db.session.commit()
                 return None, None, None
+            if block is None and backlog and max_wait_cutoff is not None and heartbeat >= max_wait_cutoff:
+                # Between phases with messages still queued: waiting its turn, not abandoned. A lost message is
+                # recovered on a pass that finds the queue empty, or once the wait passes MAX_QUEUED_WAIT_SECONDS.
+                db.session.commit()
+                return None, None, None
             dispatch = _revision_dispatch(revision)
             phase, ordinal = ("block", block.ordinal) if block else (dispatch.phase, dispatch.block_ordinal)
             return _classification_failed(revision_id, phase, ordinal, "worker_timeout")
         if revision.error_category != "dispatch_pending":
             delivered_at = revision.updated_at or revision.created_at
             if delivered_at is None or delivered_at >= cutoff:
+                db.session.commit()
+                return None, None, None
+            if backlog and max_wait_cutoff is not None and delivered_at >= max_wait_cutoff:
+                # Published and plausibly queued behind the messages still waiting; republishing would duplicate it.
                 db.session.commit()
                 return None, None, None
         dispatch = _revision_dispatch(revision)
@@ -1320,13 +1345,20 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
         after_revision_id=after_revision_id, after_item_id=after_item_id)
     enabled = current_app.config["CLASSIFICATION_ENABLED"]
     cutoff = utc_now() - timedelta(seconds=celeryconfig.task_time_limit + 300)
+    max_wait_cutoff = utc_now() - timedelta(seconds=MAX_QUEUED_WAIT_SECONDS)
     if enabled and not create_only:
-        stale_running = sa.and_(ClassificationRevision.state == "running",
-            sa.func.coalesce(ClassificationRevision.heartbeat_at, ClassificationRevision.started_at) < cutoff)
+        # Asked once per page, before the query: revisions waiting behind queued work must not fill the page.
+        backlog = _classification_backlog()
+        heartbeat = sa.func.coalesce(ClassificationRevision.heartbeat_at, ClassificationRevision.started_at)
+        stale_running = sa.and_(ClassificationRevision.state == "running", heartbeat < cutoff)
+        if backlog:
+            stale_running = sa.and_(stale_running, heartbeat < max_wait_cutoff)
+        delivered = sa.func.coalesce(ClassificationRevision.updated_at, ClassificationRevision.created_at)
         stale_delivery = sa.and_(sa.or_(ClassificationRevision.state == "retrying",
             sa.and_(ClassificationRevision.state == "pending", ClassificationRevision.started_at.is_(None),
-                ClassificationRevision.heartbeat_at.is_(None))),
-            sa.func.coalesce(ClassificationRevision.updated_at, ClassificationRevision.created_at) < cutoff)
+                ClassificationRevision.heartbeat_at.is_(None))), delivered < cutoff)
+        if backlog:
+            stale_delivery = sa.and_(stale_delivery, delivered < max_wait_cutoff)
         stale_block = sa.exists().where(ClassificationBlock.revision_id == ClassificationRevision.id,
             ClassificationBlock.state == "running",
             sa.func.coalesce(ClassificationBlock.heartbeat_at, ClassificationBlock.started_at) < cutoff)
@@ -1339,7 +1371,7 @@ def reconcile_classification_batch(*, limit=None, after_revision_id=0, after_ite
         for identity, item_id in candidates:
             counts["scanned"] += 1
             counts["after_revision_id"] = identity
-            dispatch, countdown, category = _reconcile_revision(identity, item_id, cutoff)
+            dispatch, countdown, category = _reconcile_revision(identity, item_id, cutoff, backlog, max_wait_cutoff)
             counts["published"] += int(_publish_classification(dispatch, countdown=countdown, restore_category=category))
     remaining = bound - counts["scanned"]
     if remaining:

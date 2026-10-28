@@ -82,6 +82,8 @@ services:
     <<: *app
     entrypoint: [/app/scripts/start-classifier.sh]
     command: [celery, -A, tasks.celery_app, worker, --loglevel=info, --queues, classification, --concurrency, "1", --hostname, "classifier@%h"]
+    # Celery's warm shutdown finishes the running block before stop or up -d cuts it off.
+    stop_grace_period: 60s
     # Platform Model Router client bundle (client.crt, client.key, router-ca.crt,
     # token, token.expires_at), read-only; only the classifier holds it.
     volumes:

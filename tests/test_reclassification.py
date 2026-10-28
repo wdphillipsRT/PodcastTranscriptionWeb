@@ -332,3 +332,16 @@ def test_cancel_supersedes_only_held_revisions_and_requeues_only_under_a_new_pro
     env.service.settings = env.classifier.settings = replace(env.settings, ROUTER_EXPECTED_MODEL="bonsai2:27b-q4_0")
     with worker.app.app_context():
         assert tasks.queue_reclassification()["queued"] == 3
+
+
+def test_a_held_retry_is_released_before_held_reclassifications(worker):  # noqa: F811
+    env = worker.env
+    published(env, "second", datetime(2026, 1, 1, tzinfo=timezone.utc))
+    with worker.app.app_context():
+        assert tasks.queue_reclassification()["queued"] == 2   # Two held policy_upgrade revisions, none released.
+    retry = db.session.get(m.ClassificationRevision, env.service.ensure_revision(
+        env.item.id, "manual_retry", idempotency_key="held-retry"))
+    retry.error_category = tasks.RECLASSIFY_QUEUED
+    db.session.commit()
+    assert m.ClassificationRevision.query.filter_by(error_category=tasks.RECLASSIFY_QUEUED).count() == 3
+    assert tasks.release_reclassification().revision_id == retry.id

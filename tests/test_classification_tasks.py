@@ -628,3 +628,149 @@ def test_aged_claude_era_retry_replays_with_its_current_category(worker, legacy,
     reconcile()
     assert (revision.state, revision.attempts, revision.error_category) == ("retrying", 2, current)
     assert len(worker.sent) == 1 and worker.sent[-1][2]["countdown"] > 0
+
+
+def waiting_for_block(worker, seconds=2161, item_id=None):
+    """A prepared revision whose block-1 message is queued but unclaimed, silent for `seconds`."""
+    identity = worker.env.service.ensure_revision(item_id or worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    revision = db.session.get(m.ClassificationRevision, identity)
+    assert revision.state == "running" and m.ClassificationBlock.query.filter_by(revision_id=identity).one().state == "pending"
+    revision.heartbeat_at = m.utc_now() - timedelta(seconds=seconds)
+    db.session.commit()
+    worker.sent.clear()
+    return revision
+
+
+def test_a_revision_waiting_behind_queued_work_keeps_its_attempts(worker, monkeypatch):
+    revision = waiting_for_block(worker)
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: 3)
+    reconcile()
+    assert (revision.state, revision.attempts, revision.error_category) == ("running", 0, None)
+    assert not [entry for entry in worker.sent if entry[0] == "tasks.classify_item"]
+
+
+@pytest.mark.parametrize("backlog", [0, None])
+def test_a_stale_waiting_revision_is_recovered_once_the_queue_is_empty_or_unknown(worker, monkeypatch, backlog):
+    revision = waiting_for_block(worker)
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: backlog)
+    reconcile()
+    assert (revision.attempts, revision.state, revision.error_category) == (1, "retrying", "worker_timeout")
+    assert worker.sent[-1][1] == [revision.id, "block", 1]
+
+
+def test_a_stale_running_block_is_charged_even_behind_queued_work(worker, monkeypatch):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    revision = db.session.get(m.ClassificationRevision, identity)
+    block = m.ClassificationBlock.query.one()
+    block.state, revision.error_category = "running", None
+    block.started_at = block.heartbeat_at = revision.heartbeat_at = m.utc_now() - timedelta(seconds=2161)
+    db.session.commit()
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: 3)
+    reconcile()
+    assert (revision.attempts, revision.state, revision.error_category) == (1, "retrying", "worker_timeout")
+
+
+def test_the_backlog_is_unknown_without_a_broker(worker):
+    assert tasks._classification_backlog() is None
+
+
+def test_a_revision_waiting_for_finalize_behind_queued_work_keeps_its_attempts(worker, monkeypatch):
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    task().run(identity, "prepare")
+    task().run(*worker.sent[-1][1])
+    assert worker.sent[-1][1] == [identity, "finalize", None]
+    revision = db.session.get(m.ClassificationRevision, identity)
+    assert revision.state == "running" and m.ClassificationBlock.query.one().state == "completed"
+    revision.heartbeat_at = m.utc_now() - timedelta(seconds=2161)
+    db.session.commit()
+    worker.sent.clear()
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: 3)
+    reconcile()
+    assert (revision.state, revision.attempts, revision.error_category) == ("running", 0, None)
+    assert not [entry for entry in worker.sent if entry[0] == "tasks.classify_item"]
+
+
+def test_a_revision_waiting_past_the_queued_wait_cap_is_charged(worker, monkeypatch):
+    revision = waiting_for_block(worker, seconds=tasks.MAX_QUEUED_WAIT_SECONDS + 60)
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: 3)
+    reconcile()
+    assert (revision.attempts, revision.state, revision.error_category) == (1, "retrying", "worker_timeout")
+    assert worker.sent[-1][1] == [revision.id, "block", 1]
+
+
+def test_waiting_revisions_do_not_fill_the_reconcile_page(worker, monkeypatch):
+    waiting = [waiting_for_block(worker)] + [waiting_for_block(worker, item_id=add_item(worker.env,
+        external_id=f"waiting-{number}")[0].id) for number in range(2)]
+    missing = add_item(worker.env, external_id="missing")[0].id
+    worker.app.config["CLASSIFICATION_RECONCILE_BATCH_SIZE"] = 2
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: 3)
+    result = reconcile()
+    assert (result["scanned"], result["created"]) == (1, 1)
+    assert m.ClassificationRevision.query.filter_by(item_id=missing).count() == 1
+    assert not [entry for entry in worker.sent if entry[0] == "tasks.reconcile_classifications"]
+    assert [(row.state, row.attempts) for row in waiting] == [("running", 0)] * 3
+
+
+def test_the_broker_is_asked_once_per_batch(worker, monkeypatch):
+    for number in range(3):
+        waiting_for_block(worker, item_id=None if number == 0 else add_item(worker.env,
+            external_id=f"asked-{number}")[0].id)
+    calls = []
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: calls.append(1) or 0)
+    result = reconcile()
+    assert result["scanned"] == 3 and len(calls) == 1
+
+
+def test_the_backlog_counts_messages_on_the_classification_queue(worker, monkeypatch):
+    import kombu
+    monkeypatch.setattr(tasks.celery_app, "connection_for_read", lambda: kombu.Connection("memory://"))
+    assert tasks._classification_backlog() is None  # Undeclared: the memory transport raises, as redis does when empty.
+    queue = kombu.Queue("classification", kombu.Exchange("classification"), routing_key="classification")
+    with kombu.Connection("memory://") as connection:
+        try:
+            with connection.Producer() as producer:
+                for number in range(3):
+                    producer.publish({"n": number}, exchange=queue.exchange, routing_key="classification",
+                                     declare=[queue])
+            assert tasks._classification_backlog() == 3
+            connection.default_channel.queue_purge("classification")
+            assert tasks._classification_backlog() == 0  # The memory transport keeps an empty declared queue.
+        finally:
+            connection.default_channel.queue_delete("classification")  # Memory broker state is process-wide.
+
+
+def queued_delivery(worker, state, seconds=2161):
+    """A revision whose message was published but not yet delivered, last updated `seconds` ago."""
+    identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
+    if state == "retrying":
+        task().run(identity, "prepare")
+    revision = db.session.get(m.ClassificationRevision, identity)
+    revision.state, revision.error_category = state, "router_busy" if state == "retrying" else None
+    revision.updated_at = m.utc_now() - timedelta(seconds=seconds)
+    db.session.commit()
+    worker.sent.clear()
+    return revision
+
+
+@pytest.mark.parametrize("state", ["retrying", "pending"])
+def test_a_queued_delivery_is_not_republished_behind_queued_work(worker, monkeypatch, state):
+    revision = queued_delivery(worker, state)
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: 3)
+    reconcile()
+    assert (revision.state, revision.attempts, revision.error_category) == (
+        state, 0, "router_busy" if state == "retrying" else None)
+    assert not [entry for entry in worker.sent if entry[0] == "tasks.classify_item"]
+
+
+@pytest.mark.parametrize("state", ["retrying", "pending"])
+@pytest.mark.parametrize("backlog, seconds", [(None, 2161), (0, 2161), (3, tasks.MAX_QUEUED_WAIT_SECONDS + 60)])
+def test_a_queued_delivery_is_republished_when_the_queue_is_empty_unknown_or_past_the_cap(
+        worker, monkeypatch, state, backlog, seconds):
+    revision = queued_delivery(worker, state, seconds)
+    monkeypatch.setattr(tasks, "_classification_backlog", lambda: backlog)
+    reconcile()
+    assert revision.attempts == 0
+    assert [entry[1] for entry in worker.sent if entry[0] == "tasks.classify_item"] == [
+        [revision.id, "block", 1] if state == "retrying" else [revision.id, "prepare", None]]
