@@ -599,12 +599,13 @@ itself). Ranges are taken in segment order, not the order listed. Target
 segments covered by overlapping ranges with different labels become `uncertain`
 with reason `ambiguous_boundary` and the lowest of their confidences, so they go
 to review; where the overlapping ranges agree, the label stands with the lowest
-confidence and their reasons merged (first seen, at most four). Segments no
-range covers are implied editorial as above. An answer with in-order,
-non-overlapping ranges inside the targets gives the same decisions as before.
-Still invalid (`model_invalid_output`): a segment ID that is malformed or
-outside the window, a range whose last segment comes before its first, an
-unknown label or reason code, a repeated reason code, a confidence outside 0
+confidence and their reasons merged (in the order the ranges were listed, at
+most four). Segments no range covers are implied editorial as above. An answer
+with in-order, non-overlapping ranges inside the targets gives the same
+decisions as before. Still invalid (`model_invalid_output`): a segment ID that
+is malformed or outside the window, a range whose last segment comes before its
+first, an unknown label or reason code, an empty reason list or more than four
+reason codes, a repeated reason code, a confidence that is not a number from 0
 to 1, missing or extra keys, and more than 80 ranges
 (`TARGET_SEGMENTS_PER_BLOCK`). These checks are not part of the classifier
 provenance (route, model, prompt version and digest), so changing them makes no
