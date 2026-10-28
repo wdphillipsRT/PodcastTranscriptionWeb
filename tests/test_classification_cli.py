@@ -291,7 +291,8 @@ def test_retry_invalid_counts_a_locked_item_as_busy(worker):
 
 
 @pytest.mark.parametrize("state,category,released", [("completed", None, 0), ("pending", "reclassify_queued", 1),
-                                                     ("superseded", None, 0), ("failed", "model_unavailable", 0)])
+                                                     ("superseded", None, 0), ("failed", "model_unavailable", 0),
+                                                     ("retrying", "dispatch_pending", 0), ("running", None, 0)])
 def test_retry_invalid_skips_an_item_whose_newest_revision_is_not_the_invalid_failure(worker, state, category,
                                                                                       released):
     env = worker.env
@@ -383,6 +384,29 @@ def test_retry_failed_worker_timeout_counts_an_item_it_cannot_prepare_and_carrie
     assert result.output.strip().splitlines()[-1] == "candidates=2 requested=1 queued=1 busy=0 failed=1 released=1"
     assert held == [items[0]] and not retries(items[1]) and retries(items[0]) and len(worker.sent) == 1
 
+
+def test_a_held_retry_that_fails_after_its_insert_leaves_nothing_behind(worker, monkeypatch):
+    from classification_service import ClassificationServiceError
+    invalid, _ = invalid_failures(worker)
+    service = worker.env.service
+    ensure = service.ensure_revision
+
+    def inserted_then_failing(item_id, *args, **kwargs):
+        identity = ensure(item_id, *args, **kwargs)
+        if item_id == invalid[1]:
+            db.session.flush()
+            assert db.session.get(m.ClassificationRevision, identity) is not None  # The row was inserted.
+            raise ClassificationServiceError("invalid_canonical")
+        return identity
+    monkeypatch.setattr(service, "ensure_revision", inserted_then_failing)
+    from classification_cli import _manual_retry
+    with pytest.raises(ClassificationServiceError):
+        _manual_retry(invalid[1], hold=True)
+    assert not retries(invalid[1])  # The hold block rolled back its own insert before re-raising.
+    result = invoke(worker, "retry-invalid")
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1] == "candidates=2 requested=1 queued=1 busy=0 failed=1 released=1"
+    assert not retries(invalid[1]) and retries(invalid[0]) and len(worker.sent) == 1
 
 def test_retry_invalid_skips_a_failure_that_was_itself_a_retry(worker):
     row = db.session.get(m.ClassificationRevision, failed_revision(worker.env, worker.env.item.id))
