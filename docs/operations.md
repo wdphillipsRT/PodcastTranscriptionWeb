@@ -573,7 +573,7 @@ Router failures become closed categories:
 | --- | --- | --- |
 | 429, 202 (still running), 500, 503, 504, other 502, timeout, refused or reset connection, Celery soft time limit | `router_busy` | Block back to pending, revision `retrying`; retried after 30 s doubling to 10 min; never counts as a failed attempt |
 | A router 5xx `MODEL_PROVIDER_UNAVAILABLE` (client reason `provider_unavailable`) after the claim ran `INPUT_FAILURE_MIN_SECONDS` (60 s) or more, the third time on the same block (`MAX_BLOCK_PROVIDER_FAILURES`) | `model_unavailable` | Revision fails; `classification retry --item-id <id>` after the cause is fixed. Other coded 5xx (reason `router_failure`) and faster failures stay `router_busy` |
-| 502 `MODEL_OUTPUT_INVALID`, or output failing the Python checks | `model_invalid_output` | Retried once under a new key (temperature 0 replays the same answer); the revision fails once its counted failures reach 2 (`MAX_INVALID_OUTPUT_ATTEMPTS`). Other failures still count toward `MAX_CLASSIFICATION_ATTEMPTS` (5) |
+| 502 `MODEL_OUTPUT_INVALID`, or output failing the Python checks | `model_invalid_output` | Revision fails on the first attempt (`MAX_INVALID_OUTPUT_ATTEMPTS` is 1): calls run at temperature 0, so a new key replays the same answer. `classification retry-invalid` retries them. Other failures count toward `MAX_CLASSIFICATION_ATTEMPTS` (5) |
 | 401, 403, certificate verification failure or TLS alert, unusable token | `model_auth` | Revision fails |
 | Other 4xx, request too large | `model_config` | Revision fails |
 | `selected_model` not `ROUTER_EXPECTED_MODEL` | `model_mismatch` | Revision fails |
@@ -583,14 +583,33 @@ only the target segments that are not plain editorial content. Every target
 segment it does not list is recorded as editorial (decision source `model`,
 confidence 0.80 `IMPLIED_EDITORIAL_CONFIDENCE`, reason `substantive_content`);
 an empty list means the whole block is editorial, except stretches inside a
-classifier signal's range, which get 0.50. Ranges must be in order and must not
-overlap. A target segment inside the range of a classifier signal that the
+classifier signal's range, which get 0.50. A target segment inside the range of a classifier signal that the
 model leaves out gets confidence 0.50 (`IMPLIED_SIGNALLED_CONFIDENCE`),
 so the threshold stores it as `uncertain` with `model_label` `editorial` and
 review is required. Under prompt v2, 0.80 and 0.50 are how implied decisions
 are recognised in stored artifacts; the model can also emit those values, so
 this is a heuristic. Claude-era policies keep `commercial-segment-classifier/v1`
 and stay valid.
+
+The model often runs a range into the context segments or lists ranges out of
+order or overlapping, so the ranges are repaired rather than rejected. Each
+range is trimmed to the target segments, and a range lying wholly in the context
+is ignored (context segments belong to the neighbouring block, which labels them
+itself). Ranges are taken in segment order, not the order listed. Target
+segments covered by overlapping ranges with different labels become `uncertain`
+with reason `ambiguous_boundary` and the lowest of their confidences, so they go
+to review; where the overlapping ranges agree, the label stands with the lowest
+confidence and their reasons merged (in the order the ranges were listed, at
+most four). Segments no range covers are implied editorial as above. An answer
+with in-order, non-overlapping ranges inside the targets gives the same
+decisions as before. Still invalid (`model_invalid_output`): a segment ID that
+is malformed or outside the window, a range whose last segment comes before its
+first, an unknown label or reason code, an empty reason list or more than four
+reason codes, a repeated reason code, a confidence that is not a number from 0
+to 1, missing or extra keys, and more than 80 ranges
+(`TARGET_SEGMENTS_PER_BLOCK`). These checks are not part of the classifier
+provenance (route, model, prompt version and digest), so changing them makes no
+completed revision non-current and queues nothing again.
 
 Each block call uses the idempotency key
 `podcast.classification:rev-<revision>:block-<ordinal>:g<generation>`. The
@@ -732,6 +751,27 @@ the new classifier's key prefix. Notes:
   running revision finish, or accept that it will be superseded.
 - Cancelled items export normally again on the next nightly run (they have no
   newer held revision) until `reclassify-all` holds them again.
+
+`classification retry-invalid [--limit N]` retries the episodes that failed on
+invalid model output. It selects each completed episode whose newest revision
+failed with `model_invalid_output` on its current transcript under the current
+classifier (same model, classifier CLI version and prompt digest), and requests
+a `manual_retry` for each, newest episode first, as `classification retry` does.
+It prints
+`candidates=<n> requested=<n> published=<n> busy=<n> failed=<n>`; `busy` counts
+episodes that were locked or changed since the query, and `failed` those whose
+retry could not be prepared (for example a transcript or storage error). Busy
+and failed episodes are left for a rerun. Rerunning is safe: a repeated request
+for the same failed revision is a no-op, and an episode whose newest revision is
+now the retry is no longer a candidate, but an episode whose retry failed again
+is retried again. The router replays nothing, because each retry is a new
+revision with new keys; at temperature 0 the model gives the same answer, which
+the current range rules then accept or reject again.
+
+```bash
+docker compose exec classifier flask --app app:create_app classification retry-invalid
+docker compose exec classifier flask --app app:create_app classification status
+```
 
 ### Upgrading from Claude classification
 

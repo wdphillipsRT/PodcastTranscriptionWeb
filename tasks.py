@@ -969,8 +969,8 @@ def _classification_delay(attempts):
 INPUT_FAILURE_MIN_SECONDS = 60
 MAX_BLOCK_PROVIDER_FAILURES = 3
 MAX_CLASSIFICATION_ATTEMPTS = 5
-# Temperature 0: a new key regenerates the same invalid answer, so one confirmation is enough.
-MAX_INVALID_OUTPUT_ATTEMPTS = 2
+# Temperature 0: a new key regenerates the same invalid answer (121 of 121 blocks in the Plan 7c run).
+MAX_INVALID_OUTPUT_ATTEMPTS = 1
 
 
 def _busy_delay(block_attempts):
@@ -982,9 +982,8 @@ def _classification_failed(revision_id, phase, ordinal, category, reason=None):
     """Caller holds the item lock; revision attempts count failed calls only.
 
     A revision gets MAX_CLASSIFICATION_ATTEMPTS counted failures, but an invalid
-    output fails the revision once its counted failures reach
-    MAX_INVALID_OUTPUT_ATTEMPTS (the counter is shared across categories):
-    calls run at temperature 0, so a new key replays the same invalid answer.
+    output fails the revision at once: calls run at temperature 0, so a new key
+    replays the same invalid answer.
 
     A busy router is not a failure: the attempt budget is untouched, the block
     returns to pending, and the same block is retried after a back-off that

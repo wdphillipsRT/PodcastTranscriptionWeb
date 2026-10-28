@@ -101,9 +101,8 @@ def _bad_outputs():
         {"ranges": [entry(segment(9).id, t3)]},
         {"ranges": [entry(t2, t3, reasons=("substantive_content", "substantive_content"))]},
         {"ranges": [entry(t3, t2)]},
-        {"ranges": [entry(t2, segment(4).id)]},
-        {"ranges": [entry(t2, t3), entry(t3, t3)]},
-        {"ranges": [entry(t3, t3), entry(t2, t2)]},
+        {"ranges": [entry(t2, segment(9).id)]},           # runs past the window, not just the context
+        {"ranges": [entry(segment(4).id, segment(1).id)]},  # reversed across the whole window
     ]
 
 
@@ -164,6 +163,112 @@ def test_explicit_editorial_ranges_and_full_coverage_still_work(fake_router, cla
         (t2, t2, "editorial", 0.99, ("substantive_content",)),
         (t3, t3, "housekeeping", 0.96, ("routine_housekeeping",))]
 
+
+def test_a_range_running_into_the_context_is_trimmed_to_the_targets(fake_router, classifier):  # noqa: F811
+    win = window(targets=(2, 3, 4, 5), before=(1,), after=(6, 7, 8))
+    ids = [s.id for s in win.target_segments]
+    # The live failure shape: targets end at 5, the range ends 3 segments later.
+    fake_router.output = {"ranges": [entry(ids[2], segment(8).id, "paid_commercial", 0.97, ("sponsor_transition",))]}
+    assert _rows(classifier.classify(win)) == [
+        _implied(ids[0], ids[1], IMPLIED_SIGNALLED_CONFIDENCE),  # inside the helper's signal (targets 2-3)
+        (ids[2], ids[3], "paid_commercial", 0.97, ("sponsor_transition",))]
+
+
+def test_a_range_starting_in_the_context_before_is_trimmed(fake_router, classifier):  # noqa: F811
+    win = window(targets=(3, 4, 5), before=(1, 2), after=(6,))
+    ids = [s.id for s in win.target_segments]
+    fake_router.output = {"ranges": [entry(segment(1).id, ids[0], "housekeeping", 0.96, ("routine_housekeeping",))]}
+    assert _rows(classifier.classify(win)) == [
+        (ids[0], ids[0], "housekeeping", 0.96, ("routine_housekeeping",)),
+        _implied(ids[1], ids[1], IMPLIED_SIGNALLED_CONFIDENCE),  # inside the helper's signal (targets 3-4)
+        _implied(ids[2], ids[2])]
+
+
+def test_a_range_wholly_in_the_context_is_dropped(fake_router, classifier):  # noqa: F811
+    win = window(targets=(2, 3), before=(1,), after=(4, 5))
+    t2, t3 = (s.id for s in win.target_segments)
+    fake_router.output = {"ranges": [entry(segment(4).id, segment(5).id, "paid_commercial", 0.97,
+                                           ("sponsor_transition",))]}
+    assert _rows(classifier.classify(win)) == [_implied(t2, t3, IMPLIED_SIGNALLED_CONFIDENCE)]
+
+
+def test_ranges_out_of_order_are_sorted(fake_router, classifier):  # noqa: F811
+    win = window(targets=(2, 3, 4, 5, 6), before=(1,), after=(7,))
+    ids = [s.id for s in win.target_segments]
+    fake_router.output = {"ranges": [entry(ids[4], ids[4], "housekeeping", 0.96, ("routine_housekeeping",)),
+                                     entry(ids[2], ids[2], "uncertain", 0.6, ("ambiguous_boundary",))]}
+    assert _rows(classifier.classify(win)) == [
+        _implied(ids[0], ids[1], IMPLIED_SIGNALLED_CONFIDENCE),
+        (ids[2], ids[2], "uncertain", 0.6, ("ambiguous_boundary",)),
+        _implied(ids[3], ids[3]),
+        (ids[4], ids[4], "housekeeping", 0.96, ("routine_housekeeping",))]
+
+
+def test_segments_given_conflicting_labels_become_uncertain(fake_router, classifier):  # noqa: F811
+    win = window(targets=(2, 3, 4), before=(1,), after=(5,))
+    ids = [s.id for s in win.target_segments]
+    # Like the live shape [119-120 housekeeping, 120 uncertain]: the last target is claimed by two labels.
+    fake_router.output = {"ranges": [entry(ids[1], ids[2], "housekeeping", 0.96, ("routine_housekeeping",)),
+                                     entry(ids[2], ids[2], "paid_commercial", 0.97, ("sponsor_transition",))]}
+    assert _rows(classifier.classify(win)) == [
+        _implied(ids[0], ids[0], IMPLIED_SIGNALLED_CONFIDENCE),
+        (ids[1], ids[1], "housekeeping", 0.96, ("routine_housekeeping",)),
+        (ids[2], ids[2], "uncertain", 0.96, ("ambiguous_boundary",))]
+
+
+def test_overlapping_ranges_that_agree_keep_their_label(fake_router, classifier):  # noqa: F811
+    win = window(targets=(2, 3, 4), before=(1,), after=(5,))
+    ids = [s.id for s in win.target_segments]
+    fake_router.output = {"ranges": [entry(ids[0], ids[1], "paid_commercial", 0.98, ("sponsor_transition",)),
+                                     entry(ids[1], ids[2], "paid_commercial", 0.96, ("promotional_url",))]}
+    assert _rows(classifier.classify(win)) == [
+        (ids[0], ids[0], "paid_commercial", 0.98, ("sponsor_transition",)),
+        (ids[1], ids[1], "paid_commercial", 0.96, ("sponsor_transition", "promotional_url")),
+        (ids[2], ids[2], "paid_commercial", 0.96, ("promotional_url",))]
+
+
+def test_adjacent_identical_ranges_stay_separate_decisions(fake_router, classifier):  # noqa: F811
+    win = window(targets=(2, 3, 4, 5, 6), before=(1,), after=(7,))
+    ids = [s.id for s in win.target_segments]
+    # Two adjacent ranges with identical values stay two decisions, as before.
+    fake_router.output = {"ranges": [entry(ids[1], ids[1], "paid_commercial", 0.97, ("sponsor_transition",)),
+                                     entry(ids[2], ids[3], "paid_commercial", 0.97, ("sponsor_transition",))]}
+    assert _rows(classifier.classify(win)) == [
+        _implied(ids[0], ids[0], IMPLIED_SIGNALLED_CONFIDENCE),
+        (ids[1], ids[1], "paid_commercial", 0.97, ("sponsor_transition",)),
+        (ids[2], ids[3], "paid_commercial", 0.97, ("sponsor_transition",)),
+        _implied(ids[4], ids[4])]
+
+
+def test_a_range_nested_in_a_longer_one_with_the_same_label_splits_it(fake_router, classifier):  # noqa: F811
+    win = window(targets=(2, 3, 4, 5, 6), before=(1,), after=(7,))
+    ids = [s.id for s in win.target_segments]
+    fake_router.output = {"ranges": [entry(ids[0], ids[4], "paid_commercial", 0.97, ("sponsor_transition",)),
+                                     entry(ids[2], ids[2], "paid_commercial", 0.95, ("promotional_url",))]}
+    assert _rows(classifier.classify(win)) == [
+        (ids[0], ids[1], "paid_commercial", 0.97, ("sponsor_transition",)),
+        (ids[2], ids[2], "paid_commercial", 0.95, ("sponsor_transition", "promotional_url")),
+        (ids[3], ids[4], "paid_commercial", 0.97, ("sponsor_transition",))]
+
+
+def test_merged_reasons_keep_the_first_four_seen(fake_router, classifier):  # noqa: F811
+    win = window()
+    t2, t3 = (s.id for s in win.target_segments)
+    fake_router.output = {"ranges": [
+        entry(t2, t3, "paid_commercial", 0.97, ("sponsor_transition", "purchase_instruction", "discount_or_affiliate")),
+        entry(t3, t3, "paid_commercial", 0.96, ("promotional_url", "creator_offer"))]}
+    assert _rows(classifier.classify(win)) == [
+        (t2, t2, "paid_commercial", 0.97, ("sponsor_transition", "purchase_instruction", "discount_or_affiliate")),
+        (t3, t3, "paid_commercial", 0.96,
+         ("sponsor_transition", "purchase_instruction", "discount_or_affiliate", "promotional_url"))]
+
+
+def test_a_range_running_into_both_contexts_covers_every_target_once(fake_router, classifier):  # noqa: F811
+    win = window()
+    t2, t3 = (s.id for s in win.target_segments)
+    fake_router.output = {"ranges": [entry(segment(1).id, segment(4).id, "paid_commercial", 0.97,
+                                           ("sponsor_transition",))]}
+    assert _rows(classifier.classify(win)) == [(t2, t3, "paid_commercial", 0.97, ("sponsor_transition",))]
 
 def test_examples_are_trimmed_until_the_request_fits():
     win = window()
