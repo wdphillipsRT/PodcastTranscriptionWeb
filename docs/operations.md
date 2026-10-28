@@ -642,9 +642,11 @@ and read `router_busy=<count>`, `oldest_busy_key_sent=` and
 a failed invocation for each try (each try uses a new key generation), so fix
 the model on the router rather than waiting it out.
 
-The reconciler (every `CLASSIFICATION_RECONCILE_INTERVAL_SECONDS`, 300 s)
-treats work silent for `task_time_limit` + 300 s (2,160 s) as lost. A claimed
-block whose worker died is charged `worker_timeout` (one attempt) and
+The reconciler is scheduled every `CLASSIFICATION_RECONCILE_INTERVAL_SECONDS`
+(300 s), but it runs on the classifier's own queue: it waits behind queued work
+and does not run while the classifier is stopped, so it runs at most that
+often. It treats work silent for `task_time_limit` + 300 s (2,160 s) as lost. A
+claimed block whose worker died is charged `worker_timeout` (one attempt) and
 republished. A revision waiting between phases (no running block) is usually
 just queued: the classifier runs one task at a time, so its next message can
 sit behind many others. While the `classification` queue holds messages, such a
@@ -652,9 +654,17 @@ revision is not charged and not republished, and the reconciler leaves it out
 of its query, so waiting revisions do not fill its pages. It is charged and
 republished as `worker_timeout` on a pass that finds the queue empty or cannot
 ask the broker, or once it has waited more than 24 hours
-(`MAX_QUEUED_WAIT_SECONDS`). Stopping the classifier overnight therefore costs
-an attempt only to the block that was running when it stopped, not to the
-revisions waiting behind it.
+(`MAX_QUEUED_WAIT_SECONDS`). Published deliveries are gated the same way: a
+`retrying` revision, or a `pending` one that never started, is not republished
+while the queue holds messages, up to the same 24-hour cap, because
+republishing a queued message would duplicate its chain. A revision whose
+publication is still owed (`dispatch_pending`) is always republished.
+
+The classifier service has `stop_grace_period: 60s`, so
+`docker compose stop classifier` (and `up -d`) lets Celery's warm shutdown
+finish the running block, and usually nothing is charged. A block still running
+after 60 s is cut off, and only the revision whose block was running is charged
+once (`worker_timeout`), not the revisions waiting behind it.
 
 Classifier startup runs
 `system check --services database,redis,s3,claude_absent,router`.
@@ -770,8 +780,10 @@ again: it queues under the new classifier's key prefix. Notes:
 - A cancelled retry is not queued again: `retry-failed` skips the episode (its
   newest revision is the superseded retry, not a failure) and
   `classification retry --item-id <id>` prints `published=0` (its key still
-  matches the superseded retry). The episode is classified again only under a
-  new provenance, when `reclassify-all` queues it.
+  matches the superseded retry). Under the same provenance, `reclassify-all`
+  queues the episode again only if it never had a reclassification revision
+  (for example, a failed backfill or a retry of one); otherwise only a new
+  provenance does.
 
 `classification retry-failed --category model_invalid_output|worker_timeout
 [--limit N]` retries the episodes that failed with that category. It selects
@@ -782,7 +794,8 @@ the reclassification queue (`reclassify_queued`). `classification retry-invalid
 [--limit N]` is `retry-failed --category model_invalid_output`. Held retries
 are released one at a time, before held reclassifications, once nothing else is
 in flight: the command releases one itself, a chain that ends releases the
-next, and each reconciler pass (5 minutes) releases one if none is in flight.
+next, and each reconciler pass (at most every 5 minutes; see the reconciler
+note above) releases one if none is in flight.
 `status`'s `reclassify_queued=` includes held retries, and `reclassify-cancel`
 cancels them too. It prints
 `candidates=<n> requested=<n> queued=<n> busy=<n> failed=<n> released=<0|1>`;

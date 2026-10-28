@@ -1199,8 +1199,10 @@ def cancel_reclassification():
     Only held revisions change (`pending`, `reclassify_queued`, never started). They were never
     prepared, so they have no blocks and nothing in flight, and they are never an item's active
     revision, so items keep what they export and show. Released, running and finished revisions
-    are untouched. Under the same classifier provenance a cancelled item is not queued again:
-    its superseded revision still carries the key `queue_reclassification` checks. A new model pin,
+    are untouched. Under the same classifier provenance a cancelled reclassification is not queued
+    again: its superseded revision still carries the key `queue_reclassification` checks. A cancelled
+    retry carries a `manual_retry:` key instead, so its item is queued again unless it already has
+    that provenance's reclassification revision. A new model pin,
     router route or prompt gives a new key prefix, which makes every cancelled item a candidate again.
     """
     import sqlalchemy as sa
