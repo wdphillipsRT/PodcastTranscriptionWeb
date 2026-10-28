@@ -1172,7 +1172,7 @@ def queue_reclassification(*, limit=None):
 
 
 def release_reclassification():
-    """Dispatch the oldest held revision once no other revision is pending, running or retrying."""
+    """Dispatch the next held revision (retries first, then oldest) once no other revision is pending, running or retrying."""
     import sqlalchemy as sa
     from extensions import db
     from models import ClassificationRevision
@@ -1182,7 +1182,8 @@ def release_reclassification():
         ClassificationRevision.state.in_(("pending", "running", "retrying")), _not_held()))
     held = None if in_flight else db.session.scalar(sa.select(ClassificationRevision).where(
         ClassificationRevision.state == "pending", ClassificationRevision.error_category == RECLASSIFY_QUEUED)
-        .order_by(ClassificationRevision.id).limit(1))
+        .order_by(sa.case((ClassificationRevision.request_reason == "manual_retry", 0), else_=1),
+                  ClassificationRevision.id).limit(1))
     if held is None:
         db.session.commit()
         return None

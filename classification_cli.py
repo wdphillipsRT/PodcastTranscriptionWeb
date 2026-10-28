@@ -83,14 +83,16 @@ def enqueue_backlog(limit):
     click.echo(" ".join(f"{name}={counts[name]}" for name in ("scanned", "created", "published", "failed")))
 
 
-def _manual_retry(identity, newest=None):
+def _manual_retry(identity, newest=None, *, hold=False):
     """A manual_retry revision for the item's newest failed revision; True when its task was published.
 
+    With hold, the new revision waits in the reclassification queue instead; True when it was newly held.
     With `newest`, that failed revision must still be the item's newest revision once its lock is held."""
     import sqlalchemy as sa
     from extensions import db
     from models import ContentItem, ClassificationRevision
-    from tasks import _item_lock, get_classification_service, _revision_dispatch, _publish_classification
+    from tasks import (RECLASSIFY_QUEUED, _item_lock, get_classification_service, _revision_dispatch,
+                       _publish_classification)
     with _item_lock(identity) as acquired:
         if not acquired:
             raise click.ClickException("Classification work is busy")
@@ -106,7 +108,20 @@ def _manual_retry(identity, newest=None):
             raise click.ClickException("Classification changed")
         key = f"manual_retry:{failed.id}"
         db.session.commit()
-        revision_id = get_classification_service().ensure_revision(identity, "manual_retry", idempotency_key=key)
+        service = get_classification_service()
+        if hold:
+            # Held in the same transaction that creates it, as queue_reclassification does.
+            request = service.prepare_revision_request(identity)
+            revision_id = service.ensure_revision(identity, "manual_retry", idempotency_key=key,
+                                                  prepared_request=request, commit=False)
+            revision = db.session.get(ClassificationRevision, revision_id)
+            fresh = (revision.state == "pending" and revision.started_at is None
+                     and revision.error_category == "dispatch_pending")
+            if fresh:
+                revision.error_category = RECLASSIFY_QUEUED
+            db.session.commit()
+            return fresh
+        revision_id = service.ensure_revision(identity, "manual_retry", idempotency_key=key)
         revision = db.session.get(ClassificationRevision, revision_id)
         dispatch = _revision_dispatch(revision) if revision.error_category == "dispatch_pending" else None
         db.session.commit()

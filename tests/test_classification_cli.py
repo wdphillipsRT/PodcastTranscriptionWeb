@@ -350,3 +350,32 @@ def test_retry_invalid_counts_an_item_it_cannot_prepare_and_carries_on(worker, m
     assert result.exit_code == 0, result.output
     assert result.output.strip().splitlines()[-1] == "candidates=2 requested=1 published=1 busy=0 failed=1"
     assert not retries(invalid[1]) and retries(invalid[0]) and len(worker.sent) == 1
+
+
+def test_manual_retry_can_hold_the_retry_in_the_reclassification_queue(worker):
+    import tasks
+    from classification_cli import _manual_retry
+    from tests.test_classification_tasks import reconcile
+    env = worker.env
+    failed_revision(env, env.item.id)
+    upgrade = env.service.ensure_revision(add_item(env, external_id="upgrade")[0].id, "policy_upgrade",
+                                          idempotency_key="held-upgrade")
+    db.session.get(m.ClassificationRevision, upgrade).error_category = tasks.RECLASSIFY_QUEUED
+    blocker = env.service.ensure_revision(add_item(env, external_id="blocker")[0].id, "backfill")
+    db.session.commit()
+    assert _manual_retry(env.item.id, hold=True) is True
+    [row] = retries(env.item.id)
+    assert (row.state, row.error_category, row.started_at) == ("pending", tasks.RECLASSIFY_QUEUED, None)
+    assert not worker.sent
+    assert _manual_retry(env.item.id, hold=True) is False   # The same request again is a no-op.
+    # Held like a reclassification: the reconciler never publishes it while other work is in flight...
+    reconcile()
+    assert row.id not in [entry[1][0] for entry in worker.sent]
+    assert db.session.get(m.ClassificationRevision, row.id).error_category == tasks.RECLASSIFY_QUEUED
+    # ...and releases it, ahead of the older held reclassification, once nothing else is.
+    finished = db.session.get(m.ClassificationRevision, blocker)
+    finished.state, finished.error_category = "failed", "model_unavailable"
+    db.session.commit()
+    reconcile()
+    assert worker.sent[-1][1] == [row.id, "prepare", None]
+    assert db.session.get(m.ClassificationRevision, upgrade).error_category == tasks.RECLASSIFY_QUEUED
