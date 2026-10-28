@@ -244,7 +244,7 @@ def test_retry_invalid_requests_a_retry_for_each_invalid_output_failure(worker):
     invalid, others = invalid_failures(worker)
     result = invoke(worker, "retry-invalid")
     assert result.exit_code == 0, result.output
-    assert result.output.strip().splitlines()[-1] == "candidates=2 requested=2 published=2 busy=0"
+    assert result.output.strip().splitlines()[-1] == "candidates=2 requested=2 published=2 busy=0 failed=0"
     for item_id in invalid:
         failed = m.ClassificationRevision.query.filter_by(item_id=item_id, state="failed").one()
         assert [row.idempotency_key for row in retries(item_id)] == [f"manual_retry:{failed.id}"]
@@ -257,7 +257,7 @@ def test_retry_invalid_is_safe_to_rerun(worker):
     assert invoke(worker, "retry-invalid").exit_code == 0
     result = invoke(worker, "retry-invalid")
     assert result.exit_code == 0, result.output
-    assert result.output.strip().splitlines()[-1] == "candidates=0 requested=0 published=0 busy=0"
+    assert result.output.strip().splitlines()[-1] == "candidates=0 requested=0 published=0 busy=0 failed=0"
     assert m.ClassificationRevision.query.filter_by(request_reason="manual_retry").count() == 2
 
 
@@ -265,7 +265,7 @@ def test_retry_invalid_honours_the_limit(worker):
     invalid, _ = invalid_failures(worker)
     result = invoke(worker, "retry-invalid", "--limit", "1")
     assert result.exit_code == 0, result.output
-    assert result.output.strip().splitlines()[-1] == "candidates=1 requested=1 published=1 busy=0"
+    assert result.output.strip().splitlines()[-1] == "candidates=1 requested=1 published=1 busy=0 failed=0"
     assert [bool(retries(item_id)) for item_id in invalid] == [False, True]  # Newest item first.
 
 
@@ -282,7 +282,7 @@ def test_retry_invalid_counts_a_locked_item_as_busy(worker):
         assert acquired
         result = invoke(worker, "retry-invalid")
     assert result.exit_code == 0, result.output
-    assert result.output.strip().splitlines()[-1] == "candidates=2 requested=1 published=1 busy=1"
+    assert result.output.strip().splitlines()[-1] == "candidates=2 requested=1 published=1 busy=1 failed=0"
     assert not retries(invalid[0]) and retries(invalid[1])
 
 
@@ -301,7 +301,7 @@ def test_retry_invalid_skips_an_item_whose_newest_revision_is_not_the_invalid_fa
         db.session.commit()
     result = invoke(worker, "retry-invalid")
     assert result.exit_code == 0, result.output
-    assert result.output.strip().splitlines()[-1] == "candidates=0 requested=0 published=0 busy=0"
+    assert result.output.strip().splitlines()[-1] == "candidates=0 requested=0 published=0 busy=0 failed=0"
     assert m.ClassificationRevision.query.count() == 2 and not worker.sent
 
 
@@ -320,5 +320,33 @@ def test_retry_invalid_rechecks_the_newest_revision_under_the_item_lock(worker, 
     monkeypatch.setattr(tasks, "_item_lock", racing)
     result = invoke(worker, "retry-invalid")
     assert result.exit_code == 0, result.output
-    assert result.output.strip().splitlines()[-1] == "candidates=1 requested=0 published=0 busy=1"
+    assert result.output.strip().splitlines()[-1] == "candidates=1 requested=0 published=0 busy=1 failed=0"
     assert [row.idempotency_key for row in retries(env.item.id)] == ["racing"]
+
+
+@pytest.mark.parametrize("column", ["requested_model", "classifier_cli_version", "transcript_sha256", "prompt_sha256"])
+def test_retry_invalid_excludes_a_failure_under_another_classifier_or_transcript(worker, column):
+    row = db.session.get(m.ClassificationRevision, failed_revision(worker.env, worker.env.item.id))
+    setattr(row, column, "0" * 64 if column.endswith("sha256") else "other")
+    db.session.commit()
+    result = invoke(worker, "retry-invalid")
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1] == "candidates=0 requested=0 published=0 busy=0 failed=0"
+    assert not retries(worker.env.item.id) and not worker.sent
+
+
+def test_retry_invalid_counts_an_item_it_cannot_prepare_and_carries_on(worker, monkeypatch):
+    from classification_service import ClassificationServiceError
+    env = worker.env
+    invalid, _ = invalid_failures(worker)
+    prepare = env.service.prepare_revision_request
+
+    def failing(item_id, *args, **kwargs):
+        if item_id == invalid[1]:
+            raise ClassificationServiceError("invalid_canonical")
+        return prepare(item_id, *args, **kwargs)
+    monkeypatch.setattr(env.service, "prepare_revision_request", failing)
+    result = invoke(worker, "retry-invalid")
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1] == "candidates=2 requested=1 published=1 busy=0 failed=1"
+    assert not retries(invalid[1]) and retries(invalid[0]) and len(worker.sent) == 1

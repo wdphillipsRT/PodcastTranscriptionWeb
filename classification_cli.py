@@ -133,6 +133,7 @@ def retry_invalid(limit):
     import sqlalchemy as sa
     from extensions import db
     from models import ContentItem, ClassificationRevision
+    from classification_service import ClassificationServiceError
     from router_classifier import expected_provenance
     from tasks import get_classification_service
     bound = _integer(limit, maximum=100_000) if limit is not None else None
@@ -150,7 +151,7 @@ def retry_invalid(limit):
              .order_by(ContentItem.id.desc()))
     candidates = list(db.session.execute(query if bound is None else query.limit(bound)))
     db.session.commit()
-    requested = published = busy = 0
+    requested = published = busy = failed_count = 0
     for identity, failed in candidates:
         try:
             published += int(_manual_retry(identity, newest=failed))
@@ -158,7 +159,11 @@ def retry_invalid(limit):
         except click.ClickException:  # Busy, or changed since the query; a rerun picks it up if still failed.
             db.session.rollback()
             busy += 1
-    click.echo(f"candidates={len(candidates)} requested={requested} published={published} busy={busy}")
+        except ClassificationServiceError:  # As queue_reclassification: count it and carry on with the rest.
+            db.session.rollback()
+            failed_count += 1
+    click.echo(f"candidates={len(candidates)} requested={requested} published={published} busy={busy} "
+               f"failed={failed_count}")
 
 
 @classification_cli.command("router-smoke")
