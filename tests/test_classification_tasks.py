@@ -114,15 +114,13 @@ def test_fast_worker_cannot_be_overwritten_by_publication_cleanup(worker, monkey
     assert revision.celery_task_id.endswith("-finalize")
 
 
-def test_invalid_model_output_gets_two_attempts_because_temperature_zero_replays_it(worker):
+def test_invalid_model_output_fails_on_the_first_attempt_because_temperature_zero_replays_it(worker):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
     worker.env.classifier.error = ClassifierError("model_invalid_output", advance_key=True)
     task().run(identity, "block", 1)
-    assert db.session.get(m.ClassificationRevision, identity).state == "retrying"
-    task().run(identity, "block", 1)
     revision = db.session.get(m.ClassificationRevision, identity)
-    assert (revision.state, revision.error_category, revision.attempts) == ("failed", "model_invalid_output", 2)
+    assert (revision.state, revision.error_category, revision.attempts) == ("failed", "model_invalid_output", 1)
 
 
 def test_transient_errors_exhaust_at_five_persisted_failures(worker):
@@ -568,7 +566,7 @@ def test_only_stored_outcomes_change_the_block_key_and_only_real_failures_count(
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
     for error in (ClassifierError("router_busy"), ClassifierError("router_busy", advance_key=False),
-                  ClassifierError("model_invalid_output"), None):
+                  ClassifierError("model_config", reason="conflict"), None):
         worker.env.classifier.error = error
         task().run(identity, "block", 1)
     prefix = f"podcast.classification:rev-{identity}:block-1:g"
