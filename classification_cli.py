@@ -83,14 +83,14 @@ def enqueue_backlog(limit):
     click.echo(" ".join(f"{name}={counts[name]}" for name in ("scanned", "created", "published", "failed")))
 
 
-@classification_cli.command("retry")
-@click.option("--item-id", required=True)
-@_safe
-def retry(item_id):
+def _manual_retry(identity, newest=None):
+    """A manual_retry revision for the item's newest failed revision; True when its task was published.
+
+    With `newest`, that failed revision must still be the item's newest revision once its lock is held."""
+    import sqlalchemy as sa
     from extensions import db
     from models import ContentItem, ClassificationRevision
     from tasks import _item_lock, get_classification_service, _revision_dispatch, _publish_classification
-    identity = _integer(item_id)
     with _item_lock(identity) as acquired:
         if not acquired:
             raise click.ClickException("Classification work is busy")
@@ -101,14 +101,64 @@ def retry(item_id):
             transcript_sha256=item.transcript_sha256, state="failed").order_by(ClassificationRevision.id.desc()).first()
         if failed is None:
             raise click.ClickException("Failed classification required")
+        if newest is not None and (failed.id != newest or db.session.scalar(sa.select(sa.func.max(
+                ClassificationRevision.id)).where(ClassificationRevision.item_id == identity)) != newest):
+            raise click.ClickException("Classification changed")
         key = f"manual_retry:{failed.id}"
         db.session.commit()
         revision_id = get_classification_service().ensure_revision(identity, "manual_retry", idempotency_key=key)
         revision = db.session.get(ClassificationRevision, revision_id)
         dispatch = _revision_dispatch(revision) if revision.error_category == "dispatch_pending" else None
         db.session.commit()
-    published = _publish_classification(dispatch)
+    return _publish_classification(dispatch)
+
+
+@classification_cli.command("retry")
+@click.option("--item-id", required=True)
+@_safe
+def retry(item_id):
+    published = _manual_retry(_integer(item_id))
     click.echo(f"requested=1 published={int(published)}")
+
+
+@classification_cli.command("retry-invalid")
+@click.option("--limit", default=None, metavar="1-100000")
+@_safe
+def retry_invalid(limit):
+    """Retry each completed item whose newest revision failed on invalid model output under this classifier.
+
+    Newest item first. Rerunning is safe: the manual_retry key makes a repeated request a no-op, and an item whose
+    newest revision is the retry (or anything else not failed this way) is no longer a candidate.
+    """
+    import sqlalchemy as sa
+    from extensions import db
+    from models import ContentItem, ClassificationRevision
+    from router_classifier import expected_provenance
+    from tasks import get_classification_service
+    bound = _integer(limit, maximum=100_000) if limit is not None else None
+    provenance = expected_provenance(get_classification_service().settings)
+    newest = (sa.select(sa.func.max(ClassificationRevision.id)).where(ClassificationRevision.item_id == ContentItem.id)
+              .correlate(ContentItem).scalar_subquery())
+    query = (sa.select(ContentItem.id, ClassificationRevision.id)
+             .join(ClassificationRevision, ClassificationRevision.id == newest)
+             .where(ContentItem.status == "completed", ClassificationRevision.state == "failed",
+                    ClassificationRevision.error_category == "model_invalid_output",
+                    ClassificationRevision.transcript_sha256 == ContentItem.transcript_sha256,
+                    ClassificationRevision.requested_model == provenance.requested_model,
+                    ClassificationRevision.classifier_cli_version == provenance.cli_version,
+                    ClassificationRevision.prompt_sha256 == provenance.prompt_sha256)
+             .order_by(ContentItem.id.desc()))
+    candidates = list(db.session.execute(query if bound is None else query.limit(bound)))
+    db.session.commit()
+    requested = published = busy = 0
+    for identity, failed in candidates:
+        try:
+            published += int(_manual_retry(identity, newest=failed))
+            requested += 1
+        except click.ClickException:  # Busy, or changed since the query; a rerun picks it up if still failed.
+            db.session.rollback()
+            busy += 1
+    click.echo(f"candidates={len(candidates)} requested={requested} published={published} busy={busy}")
 
 
 @classification_cli.command("router-smoke")

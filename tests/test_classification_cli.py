@@ -212,3 +212,113 @@ def test_reclassify_cancel_prints_the_number_of_cancelled_revisions(worker):
     assert result.output.strip() == "cancelled=0"
     assert invoke(worker, "reclassify-all").exit_code == 0
     assert invoke(worker, "reclassify-cancel").output.strip() == "cancelled=1"
+
+
+def failed_revision(env, item_id, category="model_invalid_output", key=None):
+    identity = env.service.ensure_revision(item_id, "backfill", idempotency_key=key)
+    row = db.session.get(m.ClassificationRevision, identity)
+    row.state, row.error_category = "failed", category
+    db.session.commit()
+    return identity
+
+
+def retries(item_id):
+    return m.ClassificationRevision.query.filter_by(item_id=item_id, request_reason="manual_retry").all()
+
+
+def invalid_failures(worker):
+    """Two invalid-output failures under this classifier, one unavailable, one invalid under another prompt."""
+    env = worker.env
+    invalid = [env.item.id, add_item(env, external_id="second")[0].id]
+    for item_id in invalid:
+        failed_revision(env, item_id)
+    unavailable = add_item(env, external_id="unavailable")[0].id
+    failed_revision(env, unavailable, "model_unavailable")
+    other = add_item(env, external_id="other-prompt")[0].id
+    db.session.get(m.ClassificationRevision, failed_revision(env, other)).prompt_sha256 = "0" * 64
+    db.session.commit()
+    return invalid, (unavailable, other)
+
+
+def test_retry_invalid_requests_a_retry_for_each_invalid_output_failure(worker):
+    invalid, others = invalid_failures(worker)
+    result = invoke(worker, "retry-invalid")
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1] == "candidates=2 requested=2 published=2 busy=0"
+    for item_id in invalid:
+        failed = m.ClassificationRevision.query.filter_by(item_id=item_id, state="failed").one()
+        assert [row.idempotency_key for row in retries(item_id)] == [f"manual_retry:{failed.id}"]
+    assert not any(retries(item_id) for item_id in others)
+    assert len(worker.sent) == 2
+
+
+def test_retry_invalid_is_safe_to_rerun(worker):
+    invalid_failures(worker)
+    assert invoke(worker, "retry-invalid").exit_code == 0
+    result = invoke(worker, "retry-invalid")
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1] == "candidates=0 requested=0 published=0 busy=0"
+    assert m.ClassificationRevision.query.filter_by(request_reason="manual_retry").count() == 2
+
+
+def test_retry_invalid_honours_the_limit(worker):
+    invalid, _ = invalid_failures(worker)
+    result = invoke(worker, "retry-invalid", "--limit", "1")
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1] == "candidates=1 requested=1 published=1 busy=0"
+    assert [bool(retries(item_id)) for item_id in invalid] == [False, True]  # Newest item first.
+
+
+@pytest.mark.parametrize("limit", ["0", "100001", "private-value"])
+def test_retry_invalid_rejects_invalid_limit_without_echoing_input(worker, limit):
+    result = invoke(worker, "retry-invalid", "--limit", limit)
+    assert result.exit_code != 0 and "private-value" not in result.output
+
+
+def test_retry_invalid_counts_a_locked_item_as_busy(worker):
+    import tasks
+    invalid, _ = invalid_failures(worker)
+    with tasks._item_lock(invalid[0]) as acquired:
+        assert acquired
+        result = invoke(worker, "retry-invalid")
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1] == "candidates=2 requested=1 published=1 busy=1"
+    assert not retries(invalid[0]) and retries(invalid[1])
+
+
+@pytest.mark.parametrize("state,category", [("completed", None), ("pending", "reclassify_queued"),
+                                            ("superseded", None), ("failed", "model_unavailable")])
+def test_retry_invalid_skips_an_item_whose_newest_revision_is_not_the_invalid_failure(worker, state, category):
+    env = worker.env
+    failed_revision(env, env.item.id)
+    if state == "completed":
+        from tests.test_reclassification import complete_router_revision
+        complete_router_revision(env, env.item.id, "newer")
+    else:
+        newer = db.session.get(m.ClassificationRevision, env.service.ensure_revision(env.item.id, "manual_retry",
+                                                                                     idempotency_key="newer"))
+        newer.state, newer.error_category = state, category
+        db.session.commit()
+    result = invoke(worker, "retry-invalid")
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1] == "candidates=0 requested=0 published=0 busy=0"
+    assert m.ClassificationRevision.query.count() == 2 and not worker.sent
+
+
+def test_retry_invalid_rechecks_the_newest_revision_under_the_item_lock(worker, monkeypatch):
+    from contextlib import contextmanager
+    import tasks
+    env = worker.env
+    failed_revision(env, env.item.id)
+    original = tasks._item_lock
+
+    @contextmanager
+    def racing(item_id):
+        env.service.ensure_revision(item_id, "manual_retry", idempotency_key="racing")
+        with original(item_id) as acquired:
+            yield acquired
+    monkeypatch.setattr(tasks, "_item_lock", racing)
+    result = invoke(worker, "retry-invalid")
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1] == "candidates=1 requested=0 published=0 busy=1"
+    assert [row.idempotency_key for row in retries(env.item.id)] == ["racing"]
