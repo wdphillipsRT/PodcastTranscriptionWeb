@@ -266,6 +266,7 @@ def _decisions(parsed, window):
         if not isinstance(ranges, list) or not 0 <= len(ranges) <= TARGET_SEGMENTS_PER_BLOCK:
             _fail()
         # Window positions relative to the first target: context before is negative, context after is past the end.
+        # This is the unnarrowed window, so an ID from context that fitting dropped still counts and is trimmed anyway.
         offset, targets = len(window.context_before), len(window.target_segments)
         positions = {segment.id: index - offset for index, segment in
                      enumerate((*window.context_before, *window.target_segments, *window.context_after))}
