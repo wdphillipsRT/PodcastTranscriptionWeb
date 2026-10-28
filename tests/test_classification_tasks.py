@@ -117,10 +117,12 @@ def test_fast_worker_cannot_be_overwritten_by_publication_cleanup(worker, monkey
 def test_invalid_model_output_fails_on_the_first_attempt_because_temperature_zero_replays_it(worker):
     identity = worker.env.service.ensure_revision(worker.env.item.id, "backfill")
     task().run(identity, "prepare")
+    worker.sent.clear()
     worker.env.classifier.error = ClassifierError("model_invalid_output", advance_key=True)
     task().run(identity, "block", 1)
     revision = db.session.get(m.ClassificationRevision, identity)
     assert (revision.state, revision.error_category, revision.attempts) == ("failed", "model_invalid_output", 1)
+    assert worker.sent == []
 
 
 def test_transient_errors_exhaust_at_five_persisted_failures(worker):
